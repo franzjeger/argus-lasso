@@ -16,8 +16,10 @@ fn main() {
     let rgba: Vec<u8> = match info.color_type {
         png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
         png::ColorType::Rgb => buf[..info.buffer_size()]
-            .chunks_exact(3)
-            .flat_map(|c| [c[0], c[1], c[2], 0xff])
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b]| [r, g, b, 0xff])
             .collect(),
         other => panic!("unsupported PNG color type: {other:?}"),
     };

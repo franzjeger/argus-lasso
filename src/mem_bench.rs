@@ -425,7 +425,7 @@ fn run_bandwidth(result: Arc<Mutex<BandwidthResult>>, cancel: Arc<AtomicBool>) {
         let mut a7 = 0u64;
         loop {
             // Each iteration steps by 8 u64s = one cache line (64 bytes).
-            for chunk in src.chunks_exact(8) {
+            for chunk in src.as_chunks::<8>().0 {
                 a0 = a0.wrapping_add(chunk[0]);
                 a1 = a1.wrapping_add(chunk[1]);
                 a2 = a2.wrapping_add(chunk[2]);

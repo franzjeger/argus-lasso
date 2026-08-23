@@ -142,9 +142,7 @@ impl AffinityPicker {
                     }
                 });
                 if ui.button("None").clicked() {
-                    for cb in &mut self.checkboxes {
-                        *cb = false;
-                    }
+                    self.checkboxes.fill(false);
                 }
             });
         }

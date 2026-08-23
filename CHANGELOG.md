@@ -7,6 +7,24 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- **Adwaita Dark and Adwaita Light themes.** Two new entries in Settings →
+  Appearance use GNOME's libadwaita palette (#3584e4 accent, softer corner
+  radii) so the window no longer looks like a KDE transplant on GNOME. A
+  fresh install now auto-picks the theme family from the running desktop
+  (`XDG_CURRENT_DESKTOP`): Adwaita on GNOME/Ubuntu/Unity, Breeze elsewhere.
+  Existing configs keep their saved theme.
+
+### Fixed
+
+- **No titlebar on GNOME Wayland.** Mutter never draws server-side window
+  decorations, and the winit build lacked the client-side fallback — the
+  window appeared with no titlebar, border, or close/minimise buttons.
+  winit's `wayland-csd-adwaita` feature is now enabled, so GNOME gets an
+  Adwaita-styled client-side titlebar; KDE/KWin keeps its server-side
+  decorations unchanged.
+
 ## [1.3.0] — 2026-08-15
 
 ### Added

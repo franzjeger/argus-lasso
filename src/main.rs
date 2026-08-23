@@ -40,7 +40,7 @@ struct ArgusLassoTray {
 /// Convert embedded RGBA bytes to ARGB32 network-byte-order as required by D-Bus SNI.
 fn make_tray_icon() -> ksni::Icon {
     let mut data = crate::icon::RGBA.to_vec();
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         pixel.rotate_right(1); // [R,G,B,A] → [A,R,G,B]
     }
     ksni::Icon {
