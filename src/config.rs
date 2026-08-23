@@ -90,7 +90,9 @@ pub struct UiConfig {
     pub start_minimized: bool,
     /// Window opacity 0.1–1.0
     pub opacity: f32,
-    /// "BreezeDark" | "BreezeLight"
+    /// "BreezeDark" | "BreezeLight" | "AdwaitaDark" | "AdwaitaLight".
+    /// Empty (the default) means "auto": pick the family matching the running
+    /// desktop — Adwaita on GNOME, Breeze elsewhere (theme::default_theme).
     pub theme: String,
     pub sort_column: String,
     pub sort_ascending: bool,
@@ -125,7 +127,7 @@ impl Default for UiConfig {
         Self {
             start_minimized: false,
             opacity: 1.0,
-            theme: "BreezeDark".into(),
+            theme: String::new(), // auto-detect from desktop on first run
             sort_column: "cpu_percent".into(),
             sort_ascending: false,
             col_widths: default_col_widths(),

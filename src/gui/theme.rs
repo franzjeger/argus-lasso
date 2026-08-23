@@ -1,4 +1,4 @@
-//! KDE Breeze Dark and Breeze Light colour palettes + egui theme application.
+//! KDE Breeze and GNOME Adwaita colour palettes + egui theme application.
 
 use egui::{Color32, Context, CornerRadius, FontId, Stroke, Style, Visuals};
 
@@ -8,6 +8,8 @@ use egui::{Color32, Context, CornerRadius, FontId, Stroke, Style, Visuals};
 pub enum AppTheme {
     BreezeDark,
     BreezeLight,
+    AdwaitaDark,
+    AdwaitaLight,
 }
 
 impl AppTheme {
@@ -15,6 +17,8 @@ impl AppTheme {
         match self {
             AppTheme::BreezeDark => "Breeze Dark",
             AppTheme::BreezeLight => "Breeze Light",
+            AppTheme::AdwaitaDark => "Adwaita Dark",
+            AppTheme::AdwaitaLight => "Adwaita Light",
         }
     }
 
@@ -23,15 +27,41 @@ impl AppTheme {
         match self {
             AppTheme::BreezeDark => "BreezeDark",
             AppTheme::BreezeLight => "BreezeLight",
+            AppTheme::AdwaitaDark => "AdwaitaDark",
+            AppTheme::AdwaitaLight => "AdwaitaLight",
         }
     }
 
-    /// Parse from config.toml value; unknown → BreezeDark.
+    /// Parse from config.toml value; unknown or empty → the desktop's native
+    /// theme family (see [`default_theme`]), so a fresh install doesn't put a
+    /// Breeze-styled window in the middle of a GNOME session.
     pub fn from_str(s: &str) -> Self {
         match s {
+            "BreezeDark" => AppTheme::BreezeDark,
             "BreezeLight" => AppTheme::BreezeLight,
-            _ => AppTheme::BreezeDark,
+            "AdwaitaDark" => AppTheme::AdwaitaDark,
+            "AdwaitaLight" => AppTheme::AdwaitaLight,
+            _ => default_theme(),
         }
+    }
+}
+
+/// Theme for a config that has never chosen one: Adwaita on GNOME-family
+/// desktops, Breeze everywhere else. Dark in both cases — matching the
+/// desktop's light/dark preference would need a DBus portal round-trip, and
+/// the picker in Settings is one click away.
+pub fn default_theme() -> AppTheme {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    let gnome_like = desktop.split(':').any(|d| {
+        matches!(
+            d.to_ascii_lowercase().as_str(),
+            "gnome" | "ubuntu" | "unity"
+        )
+    });
+    if gnome_like {
+        AppTheme::AdwaitaDark
+    } else {
+        AppTheme::BreezeDark
     }
 }
 
@@ -40,6 +70,8 @@ pub fn window_bg_rgb(theme: &AppTheme) -> (u8, u8, u8) {
     match theme {
         AppTheme::BreezeDark => (0x31, 0x36, 0x3b),
         AppTheme::BreezeLight => (0xef, 0xf0, 0xf1),
+        AppTheme::AdwaitaDark => (0x24, 0x24, 0x24),
+        AppTheme::AdwaitaLight => (0xfa, 0xfa, 0xfa),
     }
 }
 
@@ -74,6 +106,8 @@ pub fn apply_theme(ctx: &Context, native_ppp: f32, theme: &AppTheme) {
     match theme {
         AppTheme::BreezeDark => apply(ctx, native_ppp),
         AppTheme::BreezeLight => apply_light(ctx, native_ppp),
+        AppTheme::AdwaitaDark => apply_adwaita(ctx, native_ppp, true),
+        AppTheme::AdwaitaLight => apply_adwaita(ctx, native_ppp, false),
     }
 }
 
@@ -1111,4 +1145,116 @@ pub fn apply_light(ctx: &Context, native_ppp: f32) {
     ctx.set_global_style(style);
 
     let _ = (button_dis, text_dis); // available for disabled-widget callers
+}
+
+// ── Adwaita themes (GNOME) ────────────────────────────────────────────────────
+//
+// Palette from libadwaita's named colours, so the window blends into a GNOME
+// session instead of standing out as a KDE transplant. The two modes share
+// structure and differ only in colour values, hence one parameterised fn.
+
+pub fn apply_adwaita(ctx: &Context, native_ppp: f32, dark: bool) {
+    ctx.set_pixels_per_point(native_ppp);
+    let mut style = Style::default();
+
+    let mut vis = if dark {
+        Visuals::dark()
+    } else {
+        Visuals::light()
+    };
+
+    // libadwaita: window_bg_color / view_bg_color / headerbar shades.
+    let (window_bg, base, alt_base, panel, text, border, button_bg, button_hov, accent, link) =
+        if dark {
+            (
+                Color32::from_rgb(0x24, 0x24, 0x24), // window_bg_color
+                Color32::from_rgb(0x1e, 0x1e, 0x1e), // view_bg_color
+                Color32::from_rgb(0x2c, 0x2c, 0x2c), // striped row
+                Color32::from_rgb(0x24, 0x24, 0x24),
+                Color32::WHITE,
+                Color32::from_rgb(0x45, 0x45, 0x45), // ~15% white border
+                Color32::from_rgb(0x35, 0x35, 0x35), // button: 8% white on window
+                Color32::from_rgb(0x40, 0x40, 0x40), // hover: ~12% white
+                Color32::from_rgb(0x35, 0x84, 0xe4), // accent_bg_color blue 3
+                Color32::from_rgb(0x78, 0xae, 0xed), // accent_color on dark
+            )
+        } else {
+            (
+                Color32::from_rgb(0xfa, 0xfa, 0xfa), // window_bg_color
+                Color32::from_rgb(0xff, 0xff, 0xff), // view_bg_color
+                Color32::from_rgb(0xf2, 0xf2, 0xf2), // striped row
+                Color32::from_rgb(0xeb, 0xeb, 0xeb), // headerbar shade
+                Color32::from_rgb(0x33, 0x33, 0x33), // ~80% black
+                Color32::from_rgb(0xc9, 0xc9, 0xc9), // ~15% black border
+                Color32::from_rgb(0xff, 0xff, 0xff),
+                Color32::from_rgb(0xef, 0xef, 0xef),
+                Color32::from_rgb(0x35, 0x84, 0xe4), // accent_bg_color blue 3
+                Color32::from_rgb(0x1c, 0x71, 0xd8), // accent_color on light
+            )
+        };
+
+    vis.window_fill = window_bg;
+    vis.panel_fill = panel;
+    vis.faint_bg_color = alt_base;
+    vis.extreme_bg_color = base;
+
+    vis.override_text_color = Some(text);
+
+    // Adwaita rounds corners more generously than Breeze.
+    let rounding = CornerRadius::same(6);
+
+    vis.widgets.noninteractive.bg_fill = window_bg;
+    vis.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, border);
+    vis.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, border);
+    vis.widgets.noninteractive.corner_radius = rounding;
+
+    vis.widgets.inactive.bg_fill = button_bg;
+    vis.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, border);
+    vis.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, text);
+    vis.widgets.inactive.corner_radius = rounding;
+
+    vis.widgets.hovered.bg_fill = button_hov;
+    vis.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, accent);
+    vis.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, text);
+    vis.widgets.hovered.corner_radius = rounding;
+
+    // Pressed: accent fill; white text reads on #3584e4 in both modes.
+    vis.widgets.active.bg_fill = accent;
+    vis.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent);
+    vis.widgets.active.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
+    vis.widgets.active.corner_radius = rounding;
+
+    vis.widgets.open.bg_fill = button_hov;
+    vis.widgets.open.bg_stroke = Stroke::new(1.0_f32, accent);
+    vis.widgets.open.fg_stroke = Stroke::new(1.0_f32, text);
+    vis.widgets.open.corner_radius = rounding;
+
+    vis.selection.bg_fill = tint(accent, 0x66);
+    vis.selection.stroke = Stroke::new(1.0_f32, accent);
+
+    vis.hyperlink_color = link;
+    vis.window_stroke = Stroke::new(1.0_f32, border);
+    vis.window_shadow = egui::epaint::Shadow::NONE;
+    vis.window_corner_radius = CornerRadius::same(6);
+
+    style.visuals = vis;
+
+    style.text_styles = {
+        use egui::TextStyle::*;
+        [
+            (Small, FontId::proportional(12.0)),
+            (Body, FontId::proportional(14.0)),
+            (Button, FontId::proportional(14.0)),
+            (Heading, FontId::proportional(16.0)),
+            (Monospace, FontId::monospace(13.0)),
+        ]
+        .into()
+    };
+
+    style.spacing.interact_size.y = 24.0;
+    style.spacing.item_spacing = egui::vec2(8.0, 4.0);
+    style.spacing.scroll = scroll_style();
+    style.visuals.faint_bg_color = alt_base;
+
+    ctx.set_global_style(style);
 }

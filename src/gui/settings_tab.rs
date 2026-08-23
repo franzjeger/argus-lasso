@@ -327,7 +327,12 @@ impl SettingsTab {
                         egui::ComboBox::from_id_salt("theme_picker")
                             .selected_text(self.theme.label())
                             .show_ui(ui, |ui| {
-                                for t in [AppTheme::BreezeDark, AppTheme::BreezeLight] {
+                                for t in [
+                                    AppTheme::BreezeDark,
+                                    AppTheme::BreezeLight,
+                                    AppTheme::AdwaitaDark,
+                                    AppTheme::AdwaitaLight,
+                                ] {
                                     ui.selectable_value(&mut self.theme, t.clone(), t.label());
                                 }
                             });

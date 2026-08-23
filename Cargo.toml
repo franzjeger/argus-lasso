@@ -23,6 +23,15 @@ eframe      = { version = "0.34", default-features = false, features = [
 ] }
 egui        = "0.34"
 egui_extras = "0.34"
+# GNOME's Mutter never draws server-side window decorations on Wayland, and
+# eframe's "wayland" feature does not enable winit's client-side fallback —
+# so on GNOME the window rendered with no titlebar, border, or close button.
+# Naming winit here (same version eframe resolves) turns that fallback on via
+# feature unification; sctk-adwaita then draws a GNOME-native titlebar.
+# KDE/KWin still provides server-side decorations, so nothing changes there.
+winit = { version = "0.30", default-features = false, features = [
+    "wayland-csd-adwaita",
+] }
 
 # Process enumeration
 procfs = "0.18"
