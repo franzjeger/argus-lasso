@@ -7,6 +7,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-08-23
+
 ### Added
 
 - **Adwaita Dark and Adwaita Light themes.** Two new entries in Settings →
@@ -299,7 +301,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 - Virtualized the process table; dropped per-frame clones and sysfs reads.
 
-[Unreleased]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.3.0...v1.3.1
 [1.2.0]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.0.9...v1.1.0
 [1.0.9]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.0.8...v1.0.9
