@@ -21,7 +21,7 @@ pub enum GamingEvent {
 
 // ── Launcher watch phase ──────────────────────────────────────────────────────
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum WatchPhase {
     Idle,
     Waiting,
@@ -72,6 +72,137 @@ pub(crate) fn post_launch(
         Err(e) => PostLaunch::Failed {
             msg: format!("Failed to launch {prog:?}: {e}"),
             unpark: parked_by_launch,
+        },
+    }
+}
+
+// ── Game-watch state machine (pure, testable) ─────────────────────────────────
+//
+// The launcher spawns the game detached and never keeps the child handle
+// (Steam's `-applaunch` in particular forks the game from the already-running
+// client, so the spawned process is a short-lived wrapper). The game is instead
+// discovered and tracked by scanning /proc for a name match. That scan, the
+// clock, and all side effects live in the caller; `watch_step` is the pure
+// decision in the middle, so the four launch outcomes are unit-testable.
+
+/// Immutable snapshot of the watch state the reducer operates on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WatchState {
+    pub phase: WatchPhase,
+    pub launched_pid: Option<u32>,
+}
+
+/// One input event to the watch state machine.
+pub(crate) enum WatchInput<'a> {
+    /// A poll tick. `matching_pids` is the **sorted-ascending** list of live
+    /// PIDs whose name matches the game; `launched_alive` is whether the
+    /// currently latched PID is still present in /proc at all (name-independent).
+    Poll {
+        matching_pids: &'a [u32],
+        launched_alive: bool,
+        auto_restore: bool,
+        parked: bool,
+    },
+    /// App-initiated cancel (the "Kill game" button).
+    Cancel { auto_restore: bool, parked: bool },
+}
+
+/// Side effects a transition asks the caller to perform. Kept semantic (not log
+/// strings) so the reducer stays pure and fully comparable in tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WatchAction {
+    /// No change, nothing to do.
+    Stay,
+    /// Waiting → Running: latched this PID.
+    Latched(u32),
+    /// Running → Running: the latched PID vanished; re-latched to this one.
+    Relatched(u32),
+    /// Watch ended → Idle. `sigterm` = a PID to SIGTERM (cancel path only);
+    /// `exited_pid` = the PID observed to have exited (poll path only);
+    /// `unpark` = whether to restore parked CPUs (auto_restore && parked).
+    Ended {
+        sigterm: Option<u32>,
+        exited_pid: Option<u32>,
+        unpark: bool,
+    },
+}
+
+/// Pure transition for the game-watch state machine — no I/O, no clock, no
+/// /proc access.
+///
+/// Determinism: `matching_pids` MUST be sorted ascending; the reducer takes the
+/// lowest matching PID. This is an intentional behaviour change from the prior
+/// code, which took the first match in unsorted /proc directory order and was
+/// therefore non-deterministic.
+pub(crate) fn watch_step(state: WatchState, input: &WatchInput) -> (WatchState, WatchAction) {
+    match *input {
+        WatchInput::Cancel {
+            auto_restore,
+            parked,
+        } => {
+            if state.phase == WatchPhase::Idle {
+                return (state, WatchAction::Stay);
+            }
+            (
+                WatchState {
+                    phase: WatchPhase::Idle,
+                    launched_pid: None,
+                },
+                WatchAction::Ended {
+                    sigterm: state.launched_pid,
+                    exited_pid: None,
+                    unpark: auto_restore && parked,
+                },
+            )
+        }
+        WatchInput::Poll {
+            matching_pids,
+            launched_alive,
+            auto_restore,
+            parked,
+        } => match state.phase {
+            WatchPhase::Idle => (state, WatchAction::Stay),
+            WatchPhase::Waiting => match matching_pids.first() {
+                Some(&pid) => (
+                    WatchState {
+                        phase: WatchPhase::Running,
+                        launched_pid: Some(pid),
+                    },
+                    WatchAction::Latched(pid),
+                ),
+                None => (state, WatchAction::Stay),
+            },
+            WatchPhase::Running => {
+                let Some(pid) = state.launched_pid else {
+                    return (state, WatchAction::Stay);
+                };
+                if launched_alive {
+                    return (state, WatchAction::Stay);
+                }
+                match matching_pids.first() {
+                    // Latched PID gone but another still matches (Steam/Proton
+                    // relaunch under a new PID) → re-latch.
+                    Some(&new_pid) => (
+                        WatchState {
+                            phase: WatchPhase::Running,
+                            launched_pid: Some(new_pid),
+                        },
+                        WatchAction::Relatched(new_pid),
+                    ),
+                    // Gone and nothing matches → the game exited.
+                    None => (
+                        WatchState {
+                            phase: WatchPhase::Idle,
+                            launched_pid: None,
+                        },
+                        WatchAction::Ended {
+                            sigterm: None,
+                            exited_pid: Some(pid),
+                            unpark: auto_restore && parked,
+                        },
+                    ),
+                }
+            }
         },
     }
 }
@@ -362,59 +493,80 @@ impl GamingModeTab {
         if self.watch_phase == WatchPhase::Idle {
             return;
         }
-        if self.last_poll.elapsed().as_secs_f32()
-            < if self.watch_phase == WatchPhase::Running {
-                5.0
-            } else {
-                2.0
-            }
-        {
+        let interval = if self.watch_phase == WatchPhase::Running {
+            5.0
+        } else {
+            2.0
+        };
+        if self.last_poll.elapsed().as_secs_f32() < interval {
             return;
         }
         self.last_poll = std::time::Instant::now();
 
-        let pids: Vec<u32> = std::fs::read_dir("/proc")
-            .ok()
-            .map(|d| {
-                d.filter_map(|e| {
-                    e.ok()
-                        .and_then(|e| e.file_name().to_str().and_then(|s| s.parse().ok()))
-                })
-                .collect()
-            })
-            .unwrap_or_default();
-
+        let all_pids = read_proc_pids();
         let name = self.game_name.clone();
+        let mut matching: Vec<u32> = all_pids
+            .iter()
+            .copied()
+            .filter(|&p| proc_name_matches(&name, p))
+            .collect();
+        // Deterministic latch: lowest matching PID wins (see watch_step).
+        matching.sort_unstable();
 
-        if self.watch_phase == WatchPhase::Waiting {
-            for &pid in &pids {
-                if proc_name_matches(&name, pid) {
-                    self.launched_pid = Some(pid);
-                    self.watch_phase = WatchPhase::Running;
-                    self.watch_status = format!("Game running (PID {pid})");
-                    self.append_log(format!("[Launcher] Game process found: PID {pid}"));
-                    return;
-                }
+        let launched_alive = self.launched_pid.is_some_and(|p| all_pids.contains(&p));
+
+        let (next, action) = watch_step(
+            WatchState {
+                phase: self.watch_phase,
+                launched_pid: self.launched_pid,
+            },
+            &WatchInput::Poll {
+                matching_pids: &matching,
+                launched_alive,
+                auto_restore: self.auto_restore,
+                parked: self.parked,
+            },
+        );
+        self.apply_watch(next, action);
+    }
+
+    /// Commit a watch transition and run its side effects. Shared by the poll
+    /// loop and the "Kill game" button so both paths behave identically.
+    fn apply_watch(&mut self, next: WatchState, action: WatchAction) {
+        self.watch_phase = next.phase;
+        self.launched_pid = next.launched_pid;
+        match action {
+            WatchAction::Stay => {}
+            WatchAction::Latched(pid) => {
+                self.watch_status = format!("Game running (PID {pid})");
+                self.append_log(format!("[Launcher] Game process found: PID {pid}"));
             }
-        } else if self.watch_phase == WatchPhase::Running {
-            if let Some(pid) = self.launched_pid {
-                if !pids.contains(&pid) {
-                    // Check for replacement
-                    if let Some(new_pid) =
-                        pids.iter().find(|&&p| proc_name_matches(&name, p)).copied()
-                    {
-                        self.launched_pid = Some(new_pid);
-                        self.append_log(format!("[Launcher] Game PID changed → {new_pid}"));
-                    } else {
-                        self.append_log(format!("[Launcher] Game (PID {pid}) exited."));
-                        if self.auto_restore && self.parked {
-                            self.disable_gaming_mode();
+            WatchAction::Relatched(pid) => {
+                self.append_log(format!("[Launcher] Game PID changed → {pid}"));
+            }
+            WatchAction::Ended {
+                sigterm,
+                exited_pid,
+                unpark,
+            } => {
+                if let Some(pid) = sigterm {
+                    match nix::sys::signal::kill(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGTERM,
+                    ) {
+                        Ok(()) => self.append_log(format!("[Launcher] Sent SIGTERM to PID {pid}")),
+                        Err(e) => {
+                            self.append_log(format!("[Launcher] SIGTERM to PID {pid} failed: {e}"))
                         }
-                        self.watch_phase = WatchPhase::Idle;
-                        self.launched_pid = None;
-                        self.watch_status = String::new();
                     }
                 }
+                if let Some(pid) = exited_pid {
+                    self.append_log(format!("[Launcher] Game (PID {pid}) exited."));
+                }
+                if unpark {
+                    self.disable_gaming_mode();
+                }
+                self.watch_status = String::new();
             }
         }
     }
@@ -786,25 +938,17 @@ impl GamingModeTab {
                             .add_enabled(can_kill, egui::Button::new("Kill game"))
                             .clicked()
                         {
-                            if let Some(pid) = self.launched_pid {
-                                match nix::sys::signal::kill(
-                                    nix::unistd::Pid::from_raw(pid as i32),
-                                    nix::sys::signal::Signal::SIGTERM,
-                                ) {
-                                    Ok(()) => self.append_log(format!(
-                                        "[Launcher] Sent SIGTERM to PID {pid}"
-                                    )),
-                                    Err(e) => self.append_log(format!(
-                                        "[Launcher] SIGTERM to PID {pid} failed: {e}"
-                                    )),
-                                }
-                            }
-                            if self.auto_restore && self.parked {
-                                self.disable_gaming_mode();
-                            }
-                            self.watch_phase = WatchPhase::Idle;
-                            self.launched_pid = None;
-                            self.watch_status = String::new();
+                            let (next, action) = watch_step(
+                                WatchState {
+                                    phase: self.watch_phase,
+                                    launched_pid: self.launched_pid,
+                                },
+                                &WatchInput::Cancel {
+                                    auto_restore: self.auto_restore,
+                                    parked: self.parked,
+                                },
+                            );
+                            self.apply_watch(next, action);
                         }
                         ui.checkbox(&mut self.auto_restore, "Auto-disable when game exits");
                         if !self.watch_status.is_empty() {
@@ -1212,6 +1356,42 @@ fn core_map(
     }
 }
 
+/// Numeric PIDs currently present under /proc, EXCLUDING zombies.
+///
+/// The launcher spawns detached and never reaps the child, so a process that
+/// exits lingers as a `Z` (zombie): its `/proc/<pid>` dir stays, and a naive
+/// listing would still report it present. The watcher's `launched_alive` check
+/// would then read a dead game as alive — exit detection never fires, so
+/// auto-unpark never fires, leaving CPUs confined with nothing in the UI.
+/// Zombies are filtered out here. (Reaping the child at the source is the better
+/// long-term fix but changes the launcher's lifetime model; deferred.)
+fn read_proc_pids() -> Vec<u32> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()))
+        .filter(|pid| {
+            // Keep only PIDs whose stat we can read AND that are not zombies.
+            // A stat we cannot read raced away — not a live process to track.
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|s| is_live_proc_stat(&s))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// Whether a `/proc/<pid>/stat` line describes a live (non-zombie) process.
+///
+/// stat is `"pid (comm) STATE ..."`, and `comm` may itself contain spaces and
+/// parentheses, so STATE is the first non-space char after the LAST `')'`.
+fn is_live_proc_stat(stat: &str) -> bool {
+    stat.rsplit_once(')')
+        .and_then(|(_, rest)| rest.trim_start().chars().next())
+        .map(|state| state != 'Z')
+        .unwrap_or(false)
+}
+
 fn proc_name_matches(game_name: &str, pid: u32) -> bool {
     let norm = |s: &str| -> String {
         s.chars()
@@ -1368,5 +1548,253 @@ mod launch_tests {
         );
         assert!(!tab.parked, "a parse failure must not park");
         assert!(tab.launch_error.is_some());
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+
+    fn running(pid: u32) -> WatchState {
+        WatchState {
+            phase: WatchPhase::Running,
+            launched_pid: Some(pid),
+        }
+    }
+    fn waiting() -> WatchState {
+        WatchState {
+            phase: WatchPhase::Waiting,
+            launched_pid: None,
+        }
+    }
+    fn idle() -> WatchState {
+        WatchState {
+            phase: WatchPhase::Idle,
+            launched_pid: None,
+        }
+    }
+    fn poll(matching: &[u32], launched_alive: bool) -> WatchInput<'_> {
+        WatchInput::Poll {
+            matching_pids: matching,
+            launched_alive,
+            auto_restore: true,
+            parked: true,
+        }
+    }
+
+    #[test]
+    fn idle_poll_is_noop() {
+        let (next, action) = watch_step(idle(), &poll(&[1, 2, 3], false));
+        assert_eq!(next, idle());
+        assert_eq!(action, WatchAction::Stay);
+    }
+
+    // Case: game never appears — stays in Waiting, idempotently.
+    #[test]
+    fn waiting_never_appears_stays() {
+        let (next, action) = watch_step(waiting(), &poll(&[], false));
+        assert_eq!(next, waiting());
+        assert_eq!(action, WatchAction::Stay);
+    }
+
+    #[test]
+    fn waiting_latches_lowest_matching_pid() {
+        // matching_pids arrives sorted; the lowest is chosen deterministically.
+        let (next, action) = watch_step(waiting(), &poll(&[200, 205], false));
+        assert_eq!(
+            next,
+            WatchState {
+                phase: WatchPhase::Running,
+                launched_pid: Some(200)
+            }
+        );
+        assert_eq!(action, WatchAction::Latched(200));
+    }
+
+    #[test]
+    fn running_alive_stays_even_when_others_match() {
+        // Latched PID still alive → no relatch, even though other names match.
+        let (next, action) = watch_step(running(100), &poll(&[100, 150], true));
+        assert_eq!(next, running(100));
+        assert_eq!(action, WatchAction::Stay);
+    }
+
+    // Case: PID changes mid-watch — relatch to the lowest surviving match.
+    #[test]
+    fn running_pid_change_relatches_lowest() {
+        let (next, action) = watch_step(running(100), &poll(&[150, 160], false));
+        assert_eq!(
+            next,
+            WatchState {
+                phase: WatchPhase::Running,
+                launched_pid: Some(150)
+            }
+        );
+        assert_eq!(action, WatchAction::Relatched(150));
+    }
+
+    // Case: game exits normally — end to Idle and unpark when gated.
+    #[test]
+    fn running_exit_unparks_when_gated() {
+        let (next, action) = watch_step(running(100), &poll(&[], false));
+        assert_eq!(next, idle());
+        assert_eq!(
+            action,
+            WatchAction::Ended {
+                sigterm: None,
+                exited_pid: Some(100),
+                unpark: true
+            }
+        );
+    }
+
+    #[test]
+    fn running_exit_does_not_unpark_when_auto_restore_off() {
+        let input = WatchInput::Poll {
+            matching_pids: &[],
+            launched_alive: false,
+            auto_restore: false,
+            parked: true,
+        };
+        let (_next, action) = watch_step(running(100), &input);
+        assert_eq!(
+            action,
+            WatchAction::Ended {
+                sigterm: None,
+                exited_pid: Some(100),
+                unpark: false
+            }
+        );
+    }
+
+    #[test]
+    fn running_exit_does_not_unpark_when_not_parked() {
+        let input = WatchInput::Poll {
+            matching_pids: &[],
+            launched_alive: false,
+            auto_restore: true,
+            parked: false,
+        };
+        let (_next, action) = watch_step(running(100), &input);
+        assert_eq!(
+            action,
+            WatchAction::Ended {
+                sigterm: None,
+                exited_pid: Some(100),
+                unpark: false
+            }
+        );
+    }
+
+    // Case: app-initiated cancel — SIGTERM the latched PID and unpark when gated.
+    #[test]
+    fn cancel_running_sigterms_and_unparks() {
+        let (next, action) = watch_step(
+            running(100),
+            &WatchInput::Cancel {
+                auto_restore: true,
+                parked: true,
+            },
+        );
+        assert_eq!(next, idle());
+        assert_eq!(
+            action,
+            WatchAction::Ended {
+                sigterm: Some(100),
+                exited_pid: None,
+                unpark: true
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_while_waiting_has_no_pid_to_signal() {
+        let (next, action) = watch_step(
+            waiting(),
+            &WatchInput::Cancel {
+                auto_restore: true,
+                parked: true,
+            },
+        );
+        assert_eq!(next, idle());
+        assert_eq!(
+            action,
+            WatchAction::Ended {
+                sigterm: None,
+                exited_pid: None,
+                unpark: true
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_when_idle_is_noop() {
+        let (next, action) = watch_step(
+            idle(),
+            &WatchInput::Cancel {
+                auto_restore: true,
+                parked: true,
+            },
+        );
+        assert_eq!(next, idle());
+        assert_eq!(action, WatchAction::Stay);
+    }
+}
+
+#[cfg(test)]
+mod proc_scan_tests {
+    use super::*;
+
+    #[test]
+    fn is_live_proc_stat_classifies_states() {
+        assert!(is_live_proc_stat("123 (game) R 1 0 0"));
+        assert!(is_live_proc_stat("123 (game) S 1 0 0"));
+        assert!(is_live_proc_stat("123 (game) D 1 0 0"));
+        // A zombie must read as NOT live — this is the whole point of the filter.
+        assert!(!is_live_proc_stat("123 (game) Z 1 0 0"));
+    }
+
+    #[test]
+    fn is_live_proc_stat_handles_comm_with_spaces_and_parens() {
+        // comm can contain spaces and ')'; STATE is after the LAST ')'.
+        assert!(is_live_proc_stat("123 (Total War) S 1 0 0"));
+        assert!(!is_live_proc_stat("123 (weird (name)) Z 1 0 0"));
+        assert!(is_live_proc_stat("123 (has)paren) R 1"));
+    }
+
+    #[test]
+    fn is_live_proc_stat_rejects_garbage() {
+        assert!(!is_live_proc_stat(""));
+        assert!(!is_live_proc_stat("no parens here"));
+    }
+
+    // The behaviour the fix guarantees: a real zombie is excluded from the /proc
+    // scan, so launched_alive can never read true for a dead, unreaped child.
+    #[test]
+    fn read_proc_pids_excludes_a_real_zombie() {
+        // Spawn a child that exits immediately and never reap it → it becomes Z.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn /bin/sh");
+        let pid = child.id();
+        // Bounded wait for it to actually reach the zombie state.
+        let mut became_zombie = false;
+        for _ in 0..400 {
+            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                Ok(s) if !is_live_proc_stat(&s) => {
+                    became_zombie = true;
+                    break;
+                }
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Err(_) => break, // gone unexpectedly
+            }
+        }
+        assert!(became_zombie, "child never reached the zombie state");
+        assert!(
+            !read_proc_pids().contains(&pid),
+            "a zombie PID ({pid}) must be excluded from read_proc_pids()"
+        );
+        let _ = child.wait(); // reap to clean up
     }
 }
