@@ -1566,10 +1566,12 @@ fn extract_vdf_field(text: &str, field: &str) -> Option<String> {
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with(&format!("\"{field}\"")) {
-            let parts: Vec<_> = trimmed.splitn(4, '"').collect();
-            if parts.len() >= 4 {
-                return Some(parts[3].to_string());
-            }
+            // VDF line: "<field>"\t\t"<value>". The value sits between the 3rd and
+            // 4th quote. splitn(4, '"') left the closing quote ON the value — so an
+            // appid came out as `214950"` and the picker built `steam -applaunch
+            // 214950"`, which the launcher then rejects as unbalanced.
+            // split('"').nth(3) returns just the value.
+            return trimmed.split('"').nth(3).map(str::to_string);
         }
     }
     None
@@ -1734,5 +1736,35 @@ fn scan_lutris_library() -> (Vec<(String, String)>, String) {
             (vec![], format!("sqlite3 error: {err}"))
         }
         Err(e) => (vec![], format!("sqlite3 not found: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A real Steam appmanifest_*.acf uses tab-separated "key"\t\t"value" pairs.
+    const ACF: &str = "\"AppState\"\n{\n\t\"appid\"\t\t\"214950\"\n\t\"name\"\t\t\"Total War: ROME II - Emperor Edition\"\n\t\"installdir\"\t\t\"Total War Rome II\"\n}\n";
+
+    #[test]
+    fn extract_vdf_field_strips_the_closing_quote() {
+        // Regression: splitn(4, '"') left the closing quote on the value, so the
+        // picker produced `steam -applaunch 214950"` (unbalanced) and `name` ending
+        // in a stray '"'.
+        assert_eq!(extract_vdf_field(ACF, "appid").as_deref(), Some("214950"));
+        assert_eq!(
+            extract_vdf_field(ACF, "name").as_deref(),
+            Some("Total War: ROME II - Emperor Edition")
+        );
+        assert_eq!(
+            extract_vdf_field(ACF, "installdir").as_deref(),
+            Some("Total War Rome II")
+        );
+    }
+
+    #[test]
+    fn extract_vdf_field_absent_is_none() {
+        assert_eq!(extract_vdf_field(ACF, "buildid"), None);
+        assert_eq!(extract_vdf_field("", "appid"), None);
     }
 }

@@ -56,6 +56,13 @@ env_logger = "0.11"
 # CLI flags
 clap = { version = "4", features = ["derive"] }
 
+# POSIX shell-style tokenisation of launcher command strings. Proton/Lutris
+# commands embed quoted paths with spaces, which split_whitespace() mangled.
+# Parse-only use (shlex::split): RUSTSEC-2024-0006 affected shlex::quote/join,
+# was fixed in 1.3.0, and does not apply to parsing. Already resolved in the
+# lockfile transitively, so naming it directly pulls in no new crate.
+shlex = "1.3"
+
 # System tray via D-Bus StatusNotifierItem (KDE/freedesktop, no libxdo needed)
 # Use async-io backend to avoid needing a Tokio runtime in a non-Tokio app.
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
