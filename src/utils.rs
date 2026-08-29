@@ -575,6 +575,28 @@ fn csv_field(s: &str) -> String {
     }
 }
 
+/// Tokenise a launcher command line with POSIX shell quoting rules.
+///
+/// Proton and Lutris commands embed quoted paths that contain spaces
+/// (`env STEAM_COMPAT_DATA_PATH="/games/My Library/..." proton run ...`),
+/// which the previous `split_whitespace()` shredded into broken argv. `shlex`
+/// honours single/double quotes and backslash escapes.
+///
+/// Returns the argv, or `None` when the input is empty/whitespace-only or has
+/// a shell syntax error (unbalanced quote, trailing backslash) — the caller
+/// must not spawn in that case.
+///
+/// Note: this deliberately changes tokenisation for existing saved launcher
+/// commands — a `command` that relied on the old naive whitespace split (e.g.
+/// a bare Windows path with spaces and no quotes) now tokenises differently.
+pub fn tokenize_command(cmd: &str) -> Option<Vec<String>> {
+    let argv = shlex::split(cmd)?;
+    if argv.is_empty() {
+        return None;
+    }
+    Some(argv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,5 +698,84 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["processes"][0]["pid"], 7);
         assert_eq!(v["processes"][0]["name"], "bash");
+    }
+
+    // ── tokenize_command ──────────────────────────────────────────────────
+
+    #[test]
+    fn tokenize_plain_words() {
+        assert_eq!(
+            tokenize_command("steam -applaunch 220"),
+            Some(vec!["steam".into(), "-applaunch".into(), "220".into()])
+        );
+    }
+
+    #[test]
+    fn tokenize_collapses_runs_of_whitespace() {
+        // Matches the old split_whitespace() behaviour for unquoted input:
+        // multiple spaces / tabs are separators, not empty fields.
+        assert_eq!(
+            tokenize_command("a\t b   c"),
+            Some(vec!["a".into(), "b".into(), "c".into()])
+        );
+    }
+
+    #[test]
+    fn tokenize_keeps_double_quoted_path_with_spaces() {
+        // The whole point: split_whitespace() broke this into 3 argv entries.
+        assert_eq!(
+            tokenize_command("\"/home/u/My Games/game.exe\" --foo"),
+            Some(vec!["/home/u/My Games/game.exe".into(), "--foo".into()])
+        );
+    }
+
+    #[test]
+    fn tokenize_keeps_single_quoted_arg_with_spaces() {
+        assert_eq!(
+            tokenize_command("sh -c 'echo hi there'"),
+            Some(vec!["sh".into(), "-c".into(), "echo hi there".into()])
+        );
+    }
+
+    #[test]
+    fn tokenize_handles_backslash_escaped_space() {
+        assert_eq!(
+            tokenize_command("/opt/My\\ Game/run"),
+            Some(vec!["/opt/My Game/run".into()])
+        );
+    }
+
+    #[test]
+    fn tokenize_proton_style_env_prefix() {
+        // A realistic Proton/Lutris invocation with a quoted compat-data path.
+        let argv = tokenize_command(
+            "env STEAM_COMPAT_DATA_PATH=\"/home/u/Steam Library/steamapps/compatdata/214950\" \
+             proton run \"/games/Rome II.exe\"",
+        )
+        .expect("valid");
+        assert_eq!(
+            argv,
+            vec![
+                "env".to_string(),
+                "STEAM_COMPAT_DATA_PATH=/home/u/Steam Library/steamapps/compatdata/214950".into(),
+                "proton".into(),
+                "run".into(),
+                "/games/Rome II.exe".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_rejects_empty_and_whitespace() {
+        assert_eq!(tokenize_command(""), None);
+        assert_eq!(tokenize_command("   \t "), None);
+    }
+
+    #[test]
+    fn tokenize_rejects_unbalanced_quote() {
+        // A syntax error must yield None so the caller refuses to spawn a
+        // half-parsed command, rather than launching something unintended.
+        assert_eq!(tokenize_command("\"/games/foo"), None);
+        assert_eq!(tokenize_command("proton run 'unterminated"), None);
     }
 }

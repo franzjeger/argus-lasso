@@ -28,6 +28,54 @@ pub(crate) enum WatchPhase {
     Running,
 }
 
+// ── Launcher command validation (pure, testable) ──────────────────────────────
+
+/// Outcome of validating a launch command, computed before any side effect.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LaunchPlan {
+    /// argv is well-formed (argv[0] is the program). The caller may park + spawn.
+    Run(Vec<String>),
+    /// The command is unusable; the string is a user-facing reason.
+    Reject(String),
+}
+
+/// Validate a launch command. Never parks, never spawns — pure, so the
+/// "don't touch the machine for a command we can't run" rule is testable.
+pub(crate) fn plan_launch(cmd: &str) -> LaunchPlan {
+    match crate::utils::tokenize_command(cmd) {
+        // tokenize_command already rejects empty / whitespace-only / syntactically
+        // broken (unbalanced quote, trailing backslash) input.
+        None => LaunchPlan::Reject(format!("Could not parse launch command: {cmd:?}")),
+        Some(argv) => LaunchPlan::Run(argv),
+    }
+}
+
+/// What the launcher should do after attempting to spawn the child.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PostLaunch {
+    /// Spawn succeeded — enter the watch loop.
+    Watch,
+    /// Spawn failed. `msg` is user-facing; `unpark` is whether this launch's own
+    /// parking must be undone (true only when THIS launch did the parking).
+    Failed { msg: String, unpark: bool },
+}
+
+/// Decide what to do after the spawn attempt. Pure — the actual spawn happens
+/// in the caller and its Result is passed in.
+pub(crate) fn post_launch(
+    spawn_result: &std::io::Result<()>,
+    prog: &str,
+    parked_by_launch: bool,
+) -> PostLaunch {
+    match spawn_result {
+        Ok(()) => PostLaunch::Watch,
+        Err(e) => PostLaunch::Failed {
+            msg: format!("Failed to launch {prog:?}: {e}"),
+            unpark: parked_by_launch,
+        },
+    }
+}
+
 // ── GamingModeTab ─────────────────────────────────────────────────────────────
 
 pub struct GamingModeTab {
@@ -64,6 +112,9 @@ pub struct GamingModeTab {
     pub watch_phase: WatchPhase,
     pub launched_pid: Option<u32>,
     pub watch_status: String,
+    /// User-facing reason the last launch attempt failed (unparseable command
+    /// or a spawn error), shown in the launcher UI. None once a launch succeeds.
+    pub launch_error: Option<String>,
     pub last_poll: std::time::Instant,
 
     // Profiles
@@ -130,6 +181,7 @@ impl GamingModeTab {
             watch_phase: WatchPhase::Idle,
             launched_pid: None,
             watch_status: String::new(),
+            launch_error: None,
             last_poll: std::time::Instant::now(),
             selected_profile: String::new(),
             show_install_dialog: false,
@@ -758,6 +810,9 @@ impl GamingModeTab {
                         if !self.watch_status.is_empty() {
                             ui.colored_label(s.ok, &self.watch_status);
                         }
+                        if let Some(err) = &self.launch_error {
+                            ui.colored_label(s.negative, err);
+                        }
                     });
                 });
             }
@@ -964,20 +1019,64 @@ impl GamingModeTab {
     }
 
     fn launch_game(&mut self) {
-        if !self.parked {
-            self.enable_gaming_mode();
-        }
-
         let cmd = self.command.clone();
-        self.append_log(format!("[Launcher] Launching '{}': {cmd}", self.game_name));
-        self.watch_phase = WatchPhase::Waiting;
-        self.watch_status = "Waiting for game process…".into();
-        self.last_poll = std::time::Instant::now();
 
-        // Spawn detached
-        let parts: Vec<_> = cmd.split_whitespace().collect();
-        if let Some((prog, args)) = parts.split_first() {
-            let _ = std::process::Command::new(prog).args(args).spawn();
+        // Validate BEFORE any side effect: never park or enter the watch loop
+        // for a command we cannot even parse. shlex::split returns None on
+        // exactly the quoted input this launcher targets, so this path is real.
+        let argv = match plan_launch(&cmd) {
+            LaunchPlan::Run(argv) => argv,
+            LaunchPlan::Reject(msg) => {
+                self.append_log(format!("[Launcher] {msg}"));
+                self.launch_error = Some(msg);
+                return;
+            }
+        };
+        let (prog, args) = match argv.split_first() {
+            Some(parts) => parts,
+            // plan_launch guarantees a non-empty argv; stay defensive rather
+            // than panic on an impossible split.
+            None => {
+                let msg = format!("Empty launch command: {cmd:?}");
+                self.append_log(format!("[Launcher] {msg}"));
+                self.launch_error = Some(msg);
+                return;
+            }
+        };
+
+        self.append_log(format!("[Launcher] Launching '{}': {cmd}", self.game_name));
+        self.append_log(format!("[Launcher] argv: {argv:?}"));
+
+        // Park before spawn so the child inherits the shaped topology. Record
+        // whether THIS launch did the parking, so a spawn failure undoes only
+        // its own park — never one the user set manually beforehand.
+        let parked_by_launch = if !self.parked {
+            self.enable_gaming_mode();
+            self.parked
+        } else {
+            false
+        };
+
+        // Spawn detached. The Child handle is dropped (see the unreaped-zombie
+        // note): map to Result<()> so the error is handled without keeping it.
+        let result = std::process::Command::new(prog)
+            .args(args)
+            .spawn()
+            .map(|_| ());
+        match post_launch(&result, prog, parked_by_launch) {
+            PostLaunch::Watch => {
+                self.launch_error = None;
+                self.watch_phase = WatchPhase::Waiting;
+                self.watch_status = "Waiting for game process…".into();
+                self.last_poll = std::time::Instant::now();
+            }
+            PostLaunch::Failed { msg, unpark } => {
+                self.append_log(format!("[Launcher] {msg}"));
+                self.launch_error = Some(msg);
+                if unpark && self.parked {
+                    self.disable_gaming_mode();
+                }
+            }
         }
     }
 }
@@ -1148,4 +1247,126 @@ fn card_untitled(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
             ui.set_min_width(ui.available_width());
             add_contents(ui);
         });
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    // An unparseable command must be rejected BEFORE any park/spawn, so the
+    // machine is never left parked-and-Waiting for a process that can't exist.
+    #[test]
+    fn plan_rejects_unparseable_command() {
+        match plan_launch("\"/games/foo") {
+            // unbalanced quote
+            LaunchPlan::Reject(msg) => assert!(msg.contains("Could not parse")),
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_rejects_empty_command() {
+        assert!(matches!(plan_launch("   "), LaunchPlan::Reject(_)));
+    }
+
+    #[test]
+    fn plan_accepts_quoted_command() {
+        assert_eq!(
+            plan_launch("proton run \"/games/Rome II.exe\""),
+            LaunchPlan::Run(vec![
+                "proton".into(),
+                "run".into(),
+                "/games/Rome II.exe".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn post_launch_watches_on_success() {
+        assert_eq!(post_launch(&Ok(()), "game", true), PostLaunch::Watch);
+    }
+
+    // Spawn failure must unpark when THIS launch parked...
+    #[test]
+    fn post_launch_fails_and_unparks_when_this_launch_parked() {
+        let r: std::io::Result<()> = Err(Error::new(ErrorKind::NotFound, "no such file"));
+        match post_launch(&r, "game", true) {
+            PostLaunch::Failed { unpark, msg } => {
+                assert!(unpark);
+                assert!(msg.contains("Failed to launch"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    // ...but leave a park the user set manually before launching.
+    #[test]
+    fn post_launch_fails_without_unpark_when_launch_did_not_park() {
+        let r: std::io::Result<()> = Err(Error::new(ErrorKind::NotFound, "x"));
+        assert_eq!(
+            post_launch(&r, "game", false),
+            PostLaunch::Failed {
+                msg: "Failed to launch \"game\": x".into(),
+                unpark: false
+            }
+        );
+    }
+
+    // Proof the spawn-error path is real, not hypothetical: a nonexistent
+    // binary makes Command::spawn return Err, which post_launch maps to Failed.
+    #[test]
+    fn spawning_a_nonexistent_binary_errors() {
+        let r = std::process::Command::new("/argus-lasso/definitely/not/here").spawn();
+        assert!(r.is_err());
+    }
+
+    // ── launch_game orchestration (the two unpark scenarios) ───────────────
+    //
+    // Both use paths that never call enable_gaming_mode/disable_gaming_mode, so
+    // no privileged helper is invoked: the parse-reject path returns before the
+    // park block, and the manual-park path skips it via `if !self.parked`.
+
+    // Scenario: user enabled Gaming Mode BY HAND, then a launch fails. The park
+    // is theirs, not this launch's, so it must survive the failure.
+    #[test]
+    fn manual_park_survives_a_failed_spawn() {
+        let mut tab = GamingModeTab::new(Config::default());
+        tab.parked = true; // simulate Gaming Mode enabled manually
+        tab.game_name = "x".into();
+        tab.command = "/argus-lasso/definitely/not/here".into();
+        tab.launch_game();
+        assert!(tab.parked, "a manual park must survive a failed launch");
+        assert_eq!(
+            tab.watch_phase,
+            WatchPhase::Idle,
+            "a failed spawn must not enter the watch loop"
+        );
+        assert!(
+            tab.launch_error.is_some(),
+            "the failure must be surfaced in the UI"
+        );
+    }
+
+    // Scenario: an unparseable command must be rejected before any park or spawn,
+    // so the machine is never left parked-and-Waiting for a process that can't
+    // exist. (The "not previously parked + spawn fails -> unparks" half is the
+    // decision post_launch_fails_and_unparks_when_this_launch_parked above: on a
+    // non-asymmetric CI host launch_game cannot actually park, so the unpark
+    // decision is proven at the pure layer rather than by driving the helper.)
+    #[test]
+    fn unparseable_command_does_not_park_or_watch() {
+        let mut tab = GamingModeTab::new(Config::default());
+        tab.parked = false;
+        tab.game_name = "x".into();
+        tab.command = "\"/games/foo".into(); // unbalanced quote
+        tab.launch_game();
+        assert_eq!(
+            tab.watch_phase,
+            WatchPhase::Idle,
+            "a parse failure must not enter Waiting"
+        );
+        assert!(!tab.parked, "a parse failure must not park");
+        assert!(tab.launch_error.is_some());
+    }
 }
