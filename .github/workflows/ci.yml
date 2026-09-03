@@ -109,7 +109,7 @@ jobs:
 
       # Pinned to the rust-version in Cargo.toml. Without this the field is
       # a claim nobody checks — it sat at 1.75 for a tree that needed 1.88.
-      - uses: dtolnay/rust-toolchain@1.92.0
+      - uses: dtolnay/rust-toolchain@1.120.0
 
       - uses: Swatinem/rust-cache@v2
 
