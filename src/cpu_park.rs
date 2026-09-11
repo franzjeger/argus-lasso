@@ -23,8 +23,15 @@ use crate::utils::{cpuset_to_cpulist, get_offline_cpus, read_cpulist_file};
 // all of them — which is what the previous sudoers rule granted: passwordless
 // root for every subcommand, including reniceing any PID on the system.
 
-pub const HELPER_DIR: &str = "/usr/local/lib/argus-lasso";
-pub const POLICY_PATH: &str = "/usr/share/polkit-1/actions/io.github.franzjeger.argus-lasso.policy";
+pub const HELPER_DIR: &str = match option_env!("ARGUS_HELPER_DIR") {
+    Some(dir) => dir,
+    None => "/usr/local/lib/argus-lasso",
+};
+
+pub const POLICY_PATH: &str = match option_env!("ARGUS_POLICY_PATH") {
+    Some(path) => path,
+    None => "/usr/share/polkit-1/actions/io.github.franzjeger.argus-lasso.policy",
+};
 
 /// Predecessor install: a single helper plus a blanket NOPASSWD sudoers rule.
 /// Removed when the polkit helpers are installed.
@@ -33,7 +40,7 @@ pub const LEGACY_SUDOERS: &str = "/etc/sudoers.d/argus-lasso";
 
 /// Bumped whenever a helper script changes, so the app can tell an outdated
 /// install from a missing one. Substring-matched in the installed files.
-const HELPER_VERSION: &str = "argus-lasso-helper v2";
+const HELPER_VERSION: &str = "argus-lasso-helper v3";
 
 /// The three privileged operations, and the file each one lives in.
 const OP_PARK: &str = "cpu-park";
@@ -45,8 +52,9 @@ fn helper_path(op: &str) -> String {
 }
 
 const PARK_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v2 — CPU parking. Managed by argus-lasso; do not edit.
+# argus-lasso-helper v3 — CPU parking. Managed by argus-lasso; do not edit.
 set -euo pipefail
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 case "${1-}" in
     online)
         [[ "${2-}" =~ ^[0-9]+$ ]] || exit 2
@@ -75,8 +83,9 @@ esac
 "#;
 
 const POWER_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v2 — CPU governor and energy preference.
+# argus-lasso-helper v3 — CPU governor and energy preference.
 set -euo pipefail
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 case "${1-}" in
     governor)
         [[ "${2-}" =~ ^[a-z_-]+$ ]] || exit 2
@@ -100,8 +109,9 @@ esac
 /// PKEXEC_UID; without it we are not being invoked through polkit and refuse
 /// rather than guess who is asking.
 const RENICE_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v2 — renice, restricted to the caller's own processes.
+# argus-lasso-helper v3 — renice, restricted to the caller's own processes.
 set -euo pipefail
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 [[ "${1-}" =~ ^-?[0-9]+$ ]] || exit 2
 [[ "${2-}" =~ ^[0-9]+$   ]] || exit 2
 nice_val=$1

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::process::Command;
 
 // ── cpulist parsing / formatting ──────────────────────────────────────────────
 
@@ -172,13 +173,23 @@ use nix::sched::CpuSet;
 
 // ── nice ──────────────────────────────────────────────────────────────────────
 
-/// Set nice priority via `renice` subprocess.
-/// Negative values require root. Returns true on success.
+/// Set nice priority via `setpriority` syscall.
+/// Negative values require root/CAP_SYS_NICE. Returns true on success.
 pub fn set_nice(pid: u32, nice: i32) -> bool {
     use nix::libc;
-    // clear errno just in case, though setpriority returns 0 on success
-    let res =
-        unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice as libc::c_int) };
+    // clear errno before call, because setpriority can legitimately return -1
+    // (if the previous nice was -1), so we must check if errno changed.
+    // However, we only care about success (res == 0) for the most part,
+    // but wait, setpriority returns 0 on success according to POSIX,
+    // actually it returns the new nice value on Linux sometimes?
+    // POSIX says: Upon successful completion, setpriority() shall return 0.
+    // Let's use it as standard.
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
+    let res = unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice as libc::c_int)
+    };
     if res == 0 {
         log::debug!("setpriority pid={pid} nice={nice}: OK");
         true
@@ -191,16 +202,18 @@ pub fn set_nice(pid: u32, nice: i32) -> bool {
 
 // ── ionice ───────────────────────────────────────────────────────────────────
 
-/// Set I/O priority via ioprio_set syscall.
+/// Set I/O priority via `ioprio_set` syscall.
 /// class: 1=realtime, 2=best-effort, 3=idle. level: 0-7 (RT and BE only).
 pub fn set_ionice(pid: u32, class: i32, level: Option<i32>) -> bool {
     use nix::libc;
-    let lvl = level.unwrap_or(0);
-    let prio = (class << 13) | (lvl & 0x1fff);
+    let class_val = (class as u32) & 0x7;
+    let data_val = (level.unwrap_or(0) as u32) & 0x1fff;
+    let prio = (class_val << 13) | data_val;
+
     let res = unsafe {
         libc::syscall(
             libc::SYS_ioprio_set,
-            1, /* IOPRIO_WHO_PROCESS */
+            1, // IOPRIO_WHO_PROCESS
             pid as libc::c_int,
             prio as libc::c_int,
         )
