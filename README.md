@@ -313,7 +313,7 @@ removes both the old helper and the sudoers file.
 | Crate | Purpose |
 |-------|---------|
 | `eframe` / `egui` / `egui_extras` | Immediate-mode GUI (glow/OpenGL backend) |
-| `procfs` | `/proc` filesystem parsing |
+| `(None)` | Zero-allocation custom `/proc` parser (`fast_proc.rs`) |
 | `nix` | `sched_setaffinity`, signals, ioprio |
 | `serde` + `toml` | Config serialisation |
 | `serde_json` | Rules import/export |
@@ -342,3 +342,22 @@ Release history is in [CHANGELOG.md](CHANGELOG.md).
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+## Vision & Roadmap
+
+Argus-Lasso is evolving into the ultimate **Linux Gaming Control Center**, moving beyond just CPU scheduling and into complete system performance orchestration. Our goal is to provide a "Linus Torvalds quality" (zero-bloat, highly efficient, native) experience.
+
+### Current State
+* **Process Management:** Zero-allocation custom `/proc` parser, completely independent of heavy generic crates.
+* **CPU Tuning:** Advanced ProBalance logic, Core Parking, and hardware topology detection (e.g., AMD X3D cache CCDs).
+* **UI/UX:** A frosted glass Wayland-native UI with full rule management and monitoring.
+
+### Next Horizon: Argus-Layer (Native FPS Overlay)
+To become a complete, standalone gaming product without relying on third-party software like MangoHud, we are building a native Vulkan Layer in Rust (`argus-layer`).
+* **Vulkan Interception:** A zero-overhead `cdylib` Vulkan Layer that intercepts `vkQueuePresentKHR` to measure true frametimes and FPS.
+* **In-Game Overlay:** A lightweight renderer that draws telemetry (CPU, GPU, RAM, FPS, 1% lows) directly into the game's swapchain.
+* **IPC Telemetry:** The layer will communicate with the Argus-Lasso daemon via Unix domain sockets to fetch real-time hardware stats (temperatures, core parking status) and display them in-game.
+* **Auto-Injection:** Argus-Lasso will seamlessly configure `VK_INSTANCE_LAYERS` and `LD_PRELOAD` when launching games from the "Gaming Mode" tab, requiring zero manual configuration from the user.
+
