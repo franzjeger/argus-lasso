@@ -482,11 +482,11 @@ impl AffinityDialog {
                         ui.horizontal(|ui| {
                             if ui.button("OK").clicked() {
                                 close_as = Some(true);
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                
                             }
                             if ui.button("Cancel").clicked() {
                                 close_as = Some(false);
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                
                             }
                         });
                     });
@@ -592,11 +592,11 @@ impl NiceDialog {
                         ui.horizontal(|ui| {
                             if ui.button("OK").clicked() {
                                 close_as = Some(true);
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                
                             }
                             if ui.button("Cancel").clicked() {
                                 close_as = Some(false);
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                
                             }
                         });
                     });
@@ -694,11 +694,11 @@ impl IoNiceDialog {
                         ui.horizontal(|ui| {
                             if ui.button("OK").clicked() {
                                 close_as = Some(true);
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                
                             }
                             if ui.button("Cancel").clicked() {
                                 close_as = Some(false);
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                
                             }
                         });
                     });
@@ -824,11 +824,11 @@ impl RuleEditDialog {
                                     // so saving one is never what was meant.
                                     if ui.add_enabled(!rule.pattern.is_empty(), save).clicked() {
                                         close_as = Some(true);
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                        
                                     }
                                     if ui.button("Cancel").clicked() {
                                         close_as = Some(false);
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                        
                                     }
                                 },
                             );
@@ -1243,11 +1243,11 @@ impl RulePresetsDialog {
                                     .fill(s.accent);
                                     if ui.add_enabled(selected.is_some(), use_btn).clicked() {
                                         close_as = Some(true);
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                        
                                     }
                                     if ui.button("Cancel").clicked() {
                                         close_as = Some(false);
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                        
                                     }
                                 },
                             );
@@ -1351,7 +1351,7 @@ impl RulePresetsDialog {
                                 if resp.double_clicked() {
                                     *selected = Some(i);
                                     close_as = Some(true);
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                    
                                 }
                             }
                         });
@@ -1479,11 +1479,11 @@ impl SteamGamePickerDialog {
                         ui.horizontal(|ui| {
                             if ui.button("Select").clicked() && selected.is_some() {
                                 accepted = true;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                
                             }
                             if ui.button("Cancel").clicked() {
                                 cancelled = true;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                
                             }
                         });
                     });
@@ -1670,11 +1670,11 @@ impl LutrisGamePickerDialog {
                         ui.horizontal(|ui| {
                             if ui.button("Select").clicked() && selected.is_some() {
                                 accepted = true;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                
                             }
                             if ui.button("Cancel").clicked() {
                                 cancelled = true;
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                
                             }
                         });
                     });
