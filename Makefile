@@ -4,7 +4,8 @@ ICONBASE   = $(PREFIX)/share/icons/hicolor
 DESKTOPDIR = $(PREFIX)/share/applications
 SYSTEMDDIR = $(HOME)/.config/systemd/user
 
-BINARY     = target/release/argus-lasso
+CARGO_TARGET_DIR ?= target
+BINARY     ?= $(CARGO_TARGET_DIR)/release/argus-lasso
 
 # Icon masters, tiered by detail. Downscaling one big raster turned the chip
 # pins and the 3x3 core grid into mush below ~48px, so each size range renders
