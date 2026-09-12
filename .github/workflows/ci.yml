@@ -32,7 +32,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config \
+            pkg-config glslang-tools \
             libgl1-mesa-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
@@ -48,10 +48,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo build (release)
-        run: cargo build --release --locked
+        run: cargo build --release --workspace --locked
 
       - name: cargo test
-        run: cargo test --release --locked
+        run: cargo test --release --workspace --locked
 
   lint:
     name: clippy & fmt
@@ -63,7 +63,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config \
+            pkg-config glslang-tools \
             libgl1-mesa-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
@@ -84,7 +84,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: cargo clippy
-        run: cargo clippy --release --all-targets --locked
+        run: cargo clippy --release --workspace --all-targets --locked
 
   msrv:
     name: minimum supported Rust
@@ -96,7 +96,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config \
+            pkg-config glslang-tools \
             libgl1-mesa-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
@@ -116,4 +116,4 @@ jobs:
       # check, not build: this job answers "does the floor still compile",
       # and a full release build on a fourth job is minutes for no more signal.
       - name: cargo check
-        run: cargo check --locked --all-targets
+        run: cargo check --locked --workspace --all-targets

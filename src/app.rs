@@ -3,19 +3,18 @@
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
-use egui::{Context, RichText};
+use egui::RichText;
 
 use crossbeam_channel::Sender;
 
 use crate::config::{self, Config};
 use crate::gui::bench_tab::BenchTab;
-use crate::gui::dialogs::{AffinityDialog, IoNiceDialog, NiceDialog};
 use crate::gui::gaming_mode_tab::{GamingEvent, GamingModeTab};
 use crate::gui::hw_monitor_tab::HwMonitorTab;
 use crate::gui::log_tab::LogTab;
 use crate::gui::overview_tab::OverviewTab;
 use crate::gui::probalance_tab::ProBalanceTab;
-use crate::gui::process_tab::{ProcessTab, TableAction};
+use crate::gui::process_tab::ProcessTab;
 use crate::gui::rules_tab::RulesTab;
 use crate::gui::settings_tab::SettingsTab;
 use crate::monitor::{AppState, DaemonCmd};
@@ -165,14 +164,12 @@ impl ArgusLassoApp {
         let native_ppp = cc.egui_ctx.pixels_per_point();
         let startup_theme = crate::gui::theme::AppTheme::from_str(&config.ui.theme);
         crate::gui::theme::apply_theme(&cc.egui_ctx, native_ppp, &startup_theme);
-        // Force menus and tooltips to be drawn embedded on the main canvas.
-        // Otherwise eframe spawns them as separate Wayland surfaces, which bypasses
-        // our wp_alpha_modifier_v1 opacity and makes them render 100% opaque.
-        cc.egui_ctx.set_embed_viewports(true);
-
+        // Child dialogs are native windows so they can be moved to another
+        // monitor. Ordinary tooltips/popups retain egui's normal popup behavior.
+        cc.egui_ctx.set_embed_viewports(false);
 
         let mut updates = crate::updater::UpdateState::default();
-        if config.ui.check_updates_on_start {
+        if config.ui.check_updates_on_start && tour_dir.is_none() {
             updates.start_check();
         }
 
@@ -289,6 +286,9 @@ impl ArgusLassoApp {
     }
 
     fn save_config(&self) {
+        if self.tour.is_some() {
+            return;
+        }
         let cfg = if let Ok(s) = self.state.lock() {
             s.config.clone()
         } else {
@@ -297,27 +297,6 @@ impl ArgusLassoApp {
         if let Err(e) = config::save(&cfg) {
             log::warn!("Config save failed: {e}");
         }
-    }
-
-    /// Surface a user-action failure: a log line (always) plus a desktop
-    /// notification when the user has them enabled. Previously several
-    /// failure paths (signal send, affinity/nice/ionice apply) were silent,
-    /// so the user believed the change had taken effect.
-
-    /// Send the actual kill signal. The target was SIGSTOPped for the undo
-    /// window, and a stopped process never sees SIGTERM — so always follow up
-    /// with SIGCONT to deliver it (harmless for SIGKILL).
-    fn deliver_kill(pid: u32, force: bool) -> Result<(), nix::Error> {
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid;
-        let sig = if force {
-            Signal::SIGKILL
-        } else {
-            Signal::SIGTERM
-        };
-        let result = signal::kill(Pid::from_raw(pid as i32), sig);
-        let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGCONT);
-        result
     }
 
     /// Put the UI into the state the current tour step documents.
@@ -361,6 +340,40 @@ impl ArgusLassoApp {
             Step::Log => self.active_tab = Tab::Log,
             Step::Settings => self.active_tab = Tab::Settings,
 
+            Step::GamingLauncher => {
+                self.active_tab = Tab::GamingMode;
+                self.gaming_mode_tab.section = crate::gui::gaming_mode_tab::GamingSection::Launcher;
+            }
+            Step::GamingOverlay => {
+                self.active_tab = Tab::GamingMode;
+                self.gaming_mode_tab.section = crate::gui::gaming_mode_tab::GamingSection::Overlay;
+            }
+            Step::GamingRecording => {
+                self.active_tab = Tab::GamingMode;
+                self.gaming_mode_tab.section =
+                    crate::gui::gaming_mode_tab::GamingSection::Recording;
+            }
+            Step::GamingSensors => {
+                self.active_tab = Tab::GamingMode;
+                self.gaming_mode_tab.section = crate::gui::gaming_mode_tab::GamingSection::Sensors;
+            }
+            Step::SettingsProcesses => {
+                self.active_tab = Tab::Settings;
+                self.settings_tab.section = crate::gui::settings_tab::SettingsSection::Processes;
+            }
+            Step::SettingsPower => {
+                self.active_tab = Tab::Settings;
+                self.settings_tab.section = crate::gui::settings_tab::SettingsSection::Power;
+            }
+            Step::SettingsNotifications => {
+                self.active_tab = Tab::Settings;
+                self.settings_tab.section =
+                    crate::gui::settings_tab::SettingsSection::Notifications;
+            }
+            Step::SettingsStartup => {
+                self.active_tab = Tab::Settings;
+                self.settings_tab.section = crate::gui::settings_tab::SettingsSection::Startup;
+            }
             Step::ProcessDetails => {
                 self.active_tab = Tab::Processes;
                 if self.detail_window.detail_pid != Some(pid) {
@@ -396,6 +409,12 @@ impl ArgusLassoApp {
 }
 
 impl eframe::App for ArgusLassoApp {
+    fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
+        // An opaque/translucent backend clear accumulates underneath child
+        // panels and prevents their configured background alpha from working.
+        [0.0; 4]
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Closing the window exits the whole process (daemon included) — ask
         // the daemon to restore nices/throttles/parked CPUs and wait briefly.
@@ -407,6 +426,55 @@ impl eframe::App for ArgusLassoApp {
     /// thing that had to change — so it is taken from the `Ui` we are given.
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root_ui.ctx().clone();
+        self.gaming_mode_tab.poll_game_process();
+        let events: Vec<GamingEvent> = std::mem::take(&mut self.gaming_mode_tab.events);
+        for event in events {
+            match event {
+                GamingEvent::GamingModeChanged {
+                    active,
+                    elevate_nice,
+                } => {
+                    self.send(DaemonCmd::SetGamingMode {
+                        active,
+                        elevate_nice,
+                        park: false,
+                    });
+                    if active {
+                        self.send(DaemonCmd::ReapplyDefaults);
+                    }
+                }
+                GamingEvent::GameLaunched { pid, profile } => {
+                    self.send(DaemonCmd::GameLaunched { pid, profile })
+                }
+                GamingEvent::ResetAll => {
+                    self.send(DaemonCmd::ResetAffinities);
+                }
+                GamingEvent::LogMessage(msg) => {
+                    if let Ok(mut s) = self.state.lock() {
+                        s.append_log(msg);
+                    }
+                }
+                GamingEvent::ConfigChanged(cfg) => {
+                    let mut updated = *cfg;
+                    if let Ok(mut s) = self.state.lock() {
+                        s.config.gaming_mode = updated.gaming_mode;
+                        s.config.ui.global_overlay = updated.ui.global_overlay;
+                        updated = s.config.clone();
+                    }
+                    self.send(DaemonCmd::UpdateConfig(Box::new(updated)));
+                    self.save_config();
+                }
+            }
+        }
+        if self.gaming_mode_tab.overlay_window(ctx, self.opacity) {
+            let mut config = self.gaming_mode_tab.config.clone();
+            if let Ok(mut s) = self.state.lock() {
+                s.config.gaming_mode.overlay = config.gaming_mode.overlay;
+                config = s.config.clone();
+            }
+            self.send(DaemonCmd::UpdateConfig(Box::new(config)));
+            self.save_config();
+        }
         // --ui-tour drives the UI from a script rather than from the user.
         // Applied before the frame is built so the capture at the end of it
         // shows the screen this step is meant to document.
@@ -545,7 +613,7 @@ impl eframe::App for ArgusLassoApp {
 
         // Per-process details window
         self.detail_window
-            .show(ctx, &snapshot, &proc_cpu_history, cpu_gen);
+            .show(ctx, &snapshot, &proc_cpu_history, cpu_gen, self.opacity);
 
         // Check pending kill
         if let Some(ref pk) = self.pending_kill {
@@ -589,6 +657,7 @@ impl eframe::App for ArgusLassoApp {
         let mut undo_requested = false;
 
         egui::Panel::bottom("status_bar").show_inside(root_ui, |ui| {
+            let compact_status = ui.available_width() < 1100.0;
             ui.horizontal(|ui| {
                 ui.label(format!("Processes: {}", self.proc_count));
                 ui.separator();
@@ -608,17 +677,29 @@ impl eframe::App for ArgusLassoApp {
                     // a static machine fact, and it belongs next to the model
                     // rather than in a tile showing live load.
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{}  ·  {} cores",
-                            self.cpu_model,
-                            utils::get_cpu_count()
-                        ))
+                        egui::RichText::new(if compact_status {
+                            format!("{} CPU threads", utils::get_cpu_count())
+                        } else {
+                            format!(
+                                "{}  ·  {} CPU threads",
+                                self.cpu_model,
+                                utils::get_cpu_count()
+                            )
+                        })
                         .weak(),
-                    );
+                    )
+                    .on_hover_text(&self.cpu_model);
                 }
                 ui.separator();
                 if gaming_active {
-                    ui.colored_label(crate::gui::theme::Breeze::POSITIVE, "⚡ Gaming Mode ACTIVE");
+                    ui.colored_label(
+                        crate::gui::theme::Breeze::POSITIVE,
+                        if compact_status {
+                            "Gaming Mode"
+                        } else {
+                            "⚡ Gaming Mode ACTIVE"
+                        },
+                    );
                 }
 
                 // ── Notification center (right-aligned bell with unseen badge)
@@ -675,7 +756,7 @@ impl eframe::App for ArgusLassoApp {
                     ui.horizontal(|ui| {
                         ui.colored_label(
                             crate::gui::theme::Breeze::WARNING,
-                            format!("Killing '{}' in {}s", kill_name, remaining + 1),
+                            format!("Ending '{}' in {} s", kill_name, remaining + 1),
                         );
                         if ui.button("Undo").clicked() {
                             undo_requested = true;
@@ -706,11 +787,13 @@ impl eframe::App for ArgusLassoApp {
             self.pending_kill = None;
         }
 
-        egui::CentralPanel::default().show_inside(root_ui, |ui| {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(ctx.global_style().visuals.panel_fill).inner_margin(16))
+            .show_inside(root_ui, |ui| {
             // Tab bar: five primary workflow tabs on the left; the occasional
             // tools live behind a "Tools ▾" menu and Settings behind the gear,
             // so nine equal flat tabs no longer bury the ones people live in.
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 use crate::gui::theme as th;
                 let s = th::sem(ui);
 
@@ -825,7 +908,7 @@ impl eframe::App for ArgusLassoApp {
                     Some(self.proc_count),
                     &mut clicked_tab,
                 );
-                pick(ui, "Rules", Tab::Rules, None, &mut clicked_tab);
+                pick(ui, "Process rules", Tab::Rules, None, &mut clicked_tab);
                 pick(
                     ui,
                     "ProBalance",
@@ -833,18 +916,21 @@ impl eframe::App for ArgusLassoApp {
                     (self.throttled_count > 0).then_some(self.throttled_count),
                     &mut clicked_tab,
                 );
-                pick(ui, "Gaming Mode", Tab::GamingMode, None, &mut clicked_tab);
+                pick(ui, "Gaming", Tab::GamingMode, None, &mut clicked_tab);
 
+                let compact_tools = ui.max_rect().width() < 1000.0;
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Right-to-left: Settings first (rightmost), then Tools menu.
                     pick(ui, "⚙  Settings", Tab::Settings, None, &mut clicked_tab);
                     let tools_active =
                         matches!(active_now, Tab::HwMonitor | Tab::Benchmark | Tab::Log);
-                    let tools_label = if tools_active {
-                        RichText::new("Tools ▾").color(s.accent).strong()
-                    } else {
-                        RichText::new("Tools ▾")
-                    };
+                    let tool_name = if compact_tools { "Tools ▾" } else { match active_now {
+                        Tab::HwMonitor => "Hardware sensors ▾",
+                        Tab::Benchmark => "Memory benchmarks ▾",
+                        Tab::Log => "Activity log ▾",
+                        _ => "Tools ▾",
+                    }};
+                    let tools_label = if tools_active { RichText::new(tool_name).color(s.accent).strong() } else { RichText::new(tool_name) };
                     // menu_button paints a full button frame, which read as
                     // "this control is pressed" next to the frameless tabs —
                     // the design review flagged it as looking active with the
@@ -857,9 +943,9 @@ impl eframe::App for ArgusLassoApp {
                     )
                     .ui(ui, |ui| {
                         for (label, tab) in [
-                            ("HW Monitor", Tab::HwMonitor),
-                            ("Benchmark", Tab::Benchmark),
-                            ("Log", Tab::Log),
+                            ("Hardware sensors", Tab::HwMonitor),
+                            ("Memory benchmarks", Tab::Benchmark),
+                            ("Activity log", Tab::Log),
                         ] {
                             if ui.selectable_label(active_now == tab, label).clicked() {
                                 clicked_tab = Some(tab);
@@ -920,6 +1006,19 @@ impl eframe::App for ArgusLassoApp {
                     ui.add_space(4.0);
                 }
             }
+
+            let (title, description) = match self.active_tab {
+                Tab::Overview => ("Overview", "System activity at a glance."),
+                Tab::Processes => ("Processes", "Inspect running processes. Right-click a row for actions; double-click for details."),
+                Tab::Rules => ("Process rules", "Choose persistent CPU assignments and priorities for matching applications."),
+                Tab::ProBalance => ("ProBalance", "Keep the system responsive by temporarily limiting busy background processes."),
+                Tab::GamingMode => ("Gaming", "CPU control, game profiles, overlay and performance recordings."),
+                Tab::HwMonitor => ("Hardware sensors", "Live readings grouped by component, with session minimums, maximums and averages."),
+                Tab::Benchmark => ("Memory benchmarks", "Measure memory latency and bandwidth. Game recordings are in Gaming → Recording."),
+                Tab::Settings => ("Settings", "Customize Argus and its defaults. Changes that need applying are collected in the bottom bar."),
+                Tab::Log => ("Activity log", "Review process actions, rule changes and hardware alerts."),
+            };
+            crate::gui::theme::page_intro(ui, title, description);
 
             // ── Tab content ──────────────────────────────────────────────
             match self.active_tab {
@@ -1038,39 +1137,6 @@ impl eframe::App for ArgusLassoApp {
                 Tab::GamingMode => {
                     self.gaming_mode_tab.show(ui, ctx, self.opacity);
                     // Drain events
-                    let events: Vec<GamingEvent> = std::mem::take(&mut self.gaming_mode_tab.events);
-                    for event in events {
-                        match event {
-                            GamingEvent::GamingModeChanged {
-                                active,
-                                elevate_nice,
-                            } => {
-                                self.send(DaemonCmd::SetGamingMode {
-                                    active,
-                                    elevate_nice,
-                                    park: false,
-                                });
-                                if active {
-                                    self.send(DaemonCmd::ReapplyDefaults);
-                                }
-                            }
-                            GamingEvent::ResetAll => {
-                                self.send(DaemonCmd::ResetAffinities);
-                            }
-                            GamingEvent::LogMessage(msg) => {
-                                if let Ok(mut s) = self.state.lock() {
-                                    s.append_log(msg);
-                                }
-                            }
-                            GamingEvent::ConfigChanged(cfg) => {
-                                if let Ok(mut s) = self.state.lock() {
-                                    s.config.clone_from(&cfg);
-                                }
-                                self.send(DaemonCmd::UpdateConfig(cfg));
-                                self.save_config();
-                            }
-                        }
-                    }
                 }
 
                 Tab::HwMonitor => {
@@ -1087,7 +1153,7 @@ impl eframe::App for ArgusLassoApp {
                 }
 
                 Tab::Benchmark => {
-                    self.bench_tab.show(ui);
+                    self.bench_tab.show(ui, self.opacity);
                 }
 
                 Tab::Settings => {
@@ -1117,9 +1183,16 @@ impl eframe::App for ArgusLassoApp {
                         }
                     }
 
-                    if let Some(updated) = config_changed {
+                    if let Some(mut updated) = config_changed {
                         if let Ok(mut s) = self.state.lock() {
-                            s.config = updated.clone();
+                            s.config.cpu.default_affinity = updated.cpu.default_affinity;
+                            s.config.monitor = updated.monitor;
+                            s.config.hw_alerts = updated.hw_alerts;
+                            s.config.ui.notifications_enabled = updated.ui.notifications_enabled;
+                            s.config.ui.check_updates_on_start = updated.ui.check_updates_on_start;
+                            s.config.ui.theme = updated.ui.theme;
+                            s.config.ui.opacity = updated.ui.opacity;
+                            updated = s.config.clone();
                         }
                         // Re-apply full theme (resets window_fill to opaque if needed)
                         crate::gui::theme::apply_theme(
@@ -1189,7 +1262,7 @@ impl eframe::App for ArgusLassoApp {
         // Last thing in the frame: the screen is fully laid out by now, so the
         // framebuffer egui hands back is the one this step is documenting.
         if let Some(mut tour) = self.tour.take() {
-            let done = tour.tick(ctx, self.proc_count > 0);
+            let done = tour.tick(ctx, self.proc_count > 0 && self.last_cpu_gen >= 3);
             let dir = tour.dir().display().to_string();
             // Take the failures only once, at the end: draining them every
             // frame threw away every skipped step and made a partial run

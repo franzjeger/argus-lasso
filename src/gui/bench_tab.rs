@@ -49,7 +49,7 @@ impl BenchTab {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui) {
+    pub fn show(&mut self, ui: &mut egui::Ui, opacity: f32) {
         // Drain async CSV save status messages
         while let Ok(msg) = self.csv_rx.try_recv() {
             self.csv_status = msg;
@@ -110,22 +110,21 @@ impl BenchTab {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // ── Memory Latency Benchmark ──────────────────────────────────
+                // ── Memory latency ──────────────────────────────────
                 let lat_buttons: &[(&str, bool)] = if self.last.complete {
                     &[("Run again", false), ("Show results", false)]
                 } else {
                     &[("Run test", true)]
                 };
                 let has_results = self.last.complete;
-                let clicked = bench_card(ui, "Memory Latency Benchmark", lat_buttons, |ui| {
+                let clicked = bench_card(ui, "Memory latency", lat_buttons, |ui| {
                     // Duration is information, not a warning — the orange text
                     // read as something being wrong. It belongs on the same
                     // help line as the method description.
                     ui.label(
                         RichText::new(
-                            "Random pointer-chasing, one cache-line per hop — identical method to \
-                             AIDA64 Cache & Memory Benchmark, so the prefetcher cannot hide true \
-                             hardware latency. Takes ~15–60 s and fully loads one CPU core.",
+                            "Random pointer-chasing, one cache line per hop, to reduce hardware prefetching. \
+                             Takes about 15–60 s and fully loads one CPU thread.",
                         )
                         .size(tokens::FONT_HELP)
                         .color(ui.visuals().weak_text_color()),
@@ -187,7 +186,7 @@ impl BenchTab {
 
                 ui.add_space(tokens::SPACE_M);
 
-                // ── Memory Bandwidth Benchmark ────────────────────────────────
+                // ── Memory bandwidth ────────────────────────────────
                 let bw = self.bw_bench.snapshot();
                 let was_running = self.last_bw.running;
                 if bw.running || bw.complete {
@@ -208,7 +207,7 @@ impl BenchTab {
                     // After a run it degrades to an outlined "Run again".
                     &[("Run test", true)]
                 };
-                let clicked = bench_card(ui, "Memory Bandwidth Benchmark", bw_buttons, |ui| {
+                let clicked = bench_card(ui, "Memory bandwidth", bw_buttons, |ui| {
                     ui.label(
                         RichText::new(
                             "Sequential read, write and copy throughput over a 256 MiB buffer \
@@ -310,8 +309,9 @@ impl BenchTab {
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("bench_results"),
                 egui::ViewportBuilder::default()
-                    .with_title("Argus-Lasso — Memory Latency Results")
+                    .with_title("Argus-Lasso — Memory latency results")
                     .with_app_id("argus-lasso")
+                    .with_transparent(true)
                     .with_inner_size([800.0, 600.0])
                     .with_min_inner_size([540.0, 400.0])
                     .with_icon(egui::IconData {
@@ -320,6 +320,7 @@ impl BenchTab {
                         height: crate::icon::H,
                     }),
                 |vp_ui, _class| {
+                    theme::apply_viewport_opacity(vp_ui, opacity);
                     let ctx = &vp_ui.ctx().clone();
                     if ctx.input(|i| i.viewport().close_requested()) {
                         close_requested = true;
@@ -377,7 +378,7 @@ fn show_results(
     ui.horizontal(|ui| {
         // Run again lives on the Benchmark tab — this window only reports.
         ui.label(
-            RichText::new("Close this window to run again from the Benchmark tab.")
+            RichText::new("Close this window to run again from Tools → Memory benchmarks.")
                 .color(weak)
                 .size(tokens::FONT_SMALL),
         );
@@ -588,7 +589,7 @@ fn show_results(
             ui.painter().rect_filled(hr, 0.0, hdr_bg);
             let fh = egui::FontId::proportional(tokens::FONT_SMALL);
             for (lbl, off) in [
-                ("Working Set", 10.0_f32),
+                ("Working set", 10.0_f32),
                 ("Latency", 130.0),
                 ("Region", 230.0),
             ] {
@@ -677,12 +678,12 @@ fn bench_card(
     buttons: &[(&str, bool)],
     add_contents: impl FnOnce(&mut egui::Ui),
 ) -> Option<usize> {
-    let border_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    let border_color = theme::tint(ui.visuals().text_color(), 22);
     let mut clicked = None;
     egui::Frame::new()
         .stroke(Stroke::new(1.0_f32, border_color))
-        .inner_margin(Margin::same(12))
-        .corner_radius(CornerRadius::same(4))
+        .inner_margin(Margin::same(16))
+        .corner_radius(CornerRadius::same(8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -707,7 +708,7 @@ fn bench_card(
                     }
                 });
             });
-            ui.add_space(tokens::SPACE_S);
+            theme::divider(ui);
             add_contents(ui);
         });
     clicked

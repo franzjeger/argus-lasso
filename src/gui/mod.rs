@@ -13,3 +13,6 @@ pub mod process_tab;
 pub mod rules_tab;
 pub mod settings_tab;
 pub mod theme;
+
+pub mod overlay_install;
+pub mod overlay_settings;

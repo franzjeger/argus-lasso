@@ -152,12 +152,12 @@ impl LogTab {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Destructive action last (rightmost).
                 if ui
-                    .button(egui::RichText::new("Clear").color(sem.negative))
+                    .button(egui::RichText::new("Clear log").color(sem.negative))
                     .clicked()
                 {
                     clear = true;
                 }
-                if ui.button("Save…").clicked() {
+                if ui.button("Save log…").clicked() {
                     save = true;
                 }
                 ui.checkbox(&mut self.auto_scroll, "Auto-scroll");

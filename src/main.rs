@@ -4,16 +4,19 @@ mod app;
 mod cgroup;
 mod config;
 mod cpu_park;
+mod fast_proc;
 mod file_dialog;
+mod game_benchmark;
 mod gui;
 mod hw_monitor;
 mod icon;
 mod logfile;
 mod mem_bench;
-mod fast_proc;
 mod monitor;
 mod probalance;
 mod rules;
+mod sensor_access;
+mod sensor_data;
 mod ui_tour;
 mod updater;
 mod utils;
@@ -113,6 +116,11 @@ impl ksni::Tray for ArgusLassoTray {
 
 #[derive(clap::Subcommand, Debug)]
 enum Cmd {
+    /// Toggle a per-frame game capture without starting another daemon.
+    Record {
+        #[arg(long, default_value_t = 60)]
+        seconds: u32,
+    },
     /// Kill a process by PID (sends SIGTERM, or SIGKILL with --force)
     Kill {
         /// PID to kill
@@ -190,6 +198,23 @@ fn main() {
     // Handle CLI subcommands — run action and exit without launching the GUI.
     if let Some(cmd) = args.command {
         match cmd {
+            Cmd::Record { seconds } => {
+                match argus_ipc::capture::toggle(seconds) {
+                    Ok(c) => println!(
+                        "{}",
+                        if c.active {
+                            "Recording requested"
+                        } else {
+                            "Recording stopped"
+                        }
+                    ),
+                    Err(e) => {
+                        eprintln!("Recording failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
             Cmd::Kill { pid, force } => {
                 use nix::sys::signal::{self, Signal};
                 use nix::unistd::Pid;
@@ -311,12 +336,16 @@ fn main() {
     // so a daemon stuck mid-restore is detected and logged rather than
     // silently abandoned when the process image is torn down.
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-    let daemon_handle = monitor::spawn(
-        Arc::clone(&state),
-        cmd_rx,
-        cfg.clone(),
-        Arc::clone(&rule_engine),
-    );
+    let daemon_handle = if args.ui_tour.is_some() {
+        monitor::spawn_preview(Arc::clone(&state), cmd_rx)
+    } else {
+        monitor::spawn(
+            Arc::clone(&state),
+            cmd_rx,
+            cfg.clone(),
+            Arc::clone(&rule_engine),
+        )
+    };
 
     // System tray via D-Bus StatusNotifierItem (KDE/freedesktop, no libxdo).
     // Spawned after state + cmd_tx exist so the menu can read/toggle gaming mode.

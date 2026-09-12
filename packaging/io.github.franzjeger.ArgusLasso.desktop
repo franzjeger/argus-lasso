@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Argus-Lasso
+Comment=Game telemetry and per-frame benchmark recording
+Exec=argus-lasso
+Icon=argus-lasso
+Type=Application
+NoDisplay=true
+Categories=System;Monitor;

@@ -4,9 +4,6 @@ ICONBASE   = $(PREFIX)/share/icons/hicolor
 DESKTOPDIR = $(PREFIX)/share/applications
 SYSTEMDDIR = $(HOME)/.config/systemd/user
 
-CARGO_TARGET_DIR ?= target
-BINARY     ?= $(CARGO_TARGET_DIR)/release/argus-lasso
-
 # Icon masters, tiered by detail. Downscaling one big raster turned the chip
 # pins and the 3x3 core grid into mush below ~48px, so each size range renders
 # from a master drawn for it: full art at 64+, no pins at 48, and just the
@@ -20,7 +17,7 @@ ICON_PNG_SIZE   = 256
 .PHONY: build install reinstall uninstall enable disable install-icons icon
 
 build:
-	cargo build --release
+	cargo build --release --workspace --locked
 
 # Regenerate the raster that gets embedded in the binary (window + tray icon).
 # build.rs reads its dimensions off the PNG, so ICON_PNG_SIZE is free to change.
@@ -47,35 +44,18 @@ install-icons:
 	@mkdir -p $(ICONBASE)/scalable/apps
 	@cp $(ICON_SVG) $(ICONBASE)/scalable/apps/argus-lasso.svg
 
-install: build install-icons
-	@echo "Installing binary…"
-	install -Dm755 $(BINARY) $(BINDIR)/argus-lasso
-	@echo "Installing .desktop entry…"
-	sed 's|^Exec=argus-lasso|Exec=$(BINDIR)/argus-lasso|' dist/argus-lasso.desktop > $(DESKTOPDIR)/argus-lasso.desktop
-	chmod 644 $(DESKTOPDIR)/argus-lasso.desktop
-	@echo "Installing systemd user service…"
-	install -Dm644 dist/argus-lasso.service $(SYSTEMDDIR)/argus-lasso.service
-	systemctl --user daemon-reload
-	@echo "Refreshing icon and desktop caches…"
-	-update-desktop-database $(DESKTOPDIR)
-	-gtk-update-icon-cache -f -t $(PREFIX)/share/icons/hicolor/
-	-kbuildsycoca6 --noincremental 2>/dev/null || kbuildsycoca5 --noincremental 2>/dev/null || true
-	@echo "Done. Run 'make enable' to autostart on login."
+# The application and layer share an IPC protocol and must be installed together.
+install: install-icons
+	@test "$(PREFIX)" = "$(HOME)/.local" || { echo "The user installer requires PREFIX=$(HOME)/.local"; exit 1; }
+	scripts/install-overlay.sh
 
-reinstall: build
-	@echo "Installing binary…"
-	install -Dm755 $(BINARY) $(BINDIR)/argus-lasso
-	@echo "Restarting argus-lasso…"
-	@if systemctl --user is-active --quiet argus-lasso.service; then \
-		systemctl --user restart argus-lasso.service; \
-		echo "Restarted via systemd."; \
-	else \
-		pkill -x argus-lasso 2>/dev/null || true; \
-		nohup $(BINDIR)/argus-lasso &>/dev/null & \
-		echo "Restarted as background process."; \
-	fi
+reinstall: install
 
 uninstall:
+	systemctl --user disable --now argus-lasso.service 2>/dev/null || true
+	rm -f $(HOME)/.local/share/vulkan/implicit_layer.d/ArgusOverlay.json
+	rm -rf $(HOME)/.local/share/argus-lasso/layers
+	rm -f $(DESKTOPDIR)/io.github.franzjeger.ArgusLasso.desktop
 	rm -f $(BINDIR)/argus-lasso
 	find $(ICONBASE) -name "argus-lasso.png" -delete 2>/dev/null || true
 	rm -f $(ICONBASE)/scalable/apps/argus-lasso.svg

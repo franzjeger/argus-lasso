@@ -340,7 +340,10 @@ mod tests {
         let r = rule_with("Chrome", "contains");
         assert!(r.matches("google-chrome", &"google-chrome".to_lowercase()));
         assert!(r.matches("CHROME.exe", &"CHROME.exe".to_lowercase()));
-        assert!(r.matches("chromium-but-contains-chrome", &"chromium-but-contains-chrome".to_lowercase()));
+        assert!(r.matches(
+            "chromium-but-contains-chrome",
+            &"chromium-but-contains-chrome".to_lowercase()
+        ));
         assert!(!r.matches("firefox", &"firefox".to_lowercase()));
     }
 

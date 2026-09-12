@@ -63,7 +63,7 @@ impl OverviewTab {
                     (
                         format!("{pct:.0}%"),
                         format!(
-                            "{:.1} of {:.1} GB",
+                            "{:.1} of {:.1} GiB",
                             used as f32 / 1024.0,
                             total as f32 / 1024.0
                         ),

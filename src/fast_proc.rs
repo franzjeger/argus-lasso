@@ -1,10 +1,8 @@
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
 
 #[derive(Debug, Default)]
 pub struct FastStat {
-    pub pid: u32,
     pub comm: String,
     pub ppid: u32,
     pub utime: u64,
@@ -17,9 +15,7 @@ pub struct FastStat {
 static PAGE_SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 fn get_page_size() -> u64 {
-    *PAGE_SIZE.get_or_init(|| {
-        unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) as u64 }
-    })
+    *PAGE_SIZE.get_or_init(|| unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) as u64 })
 }
 
 /// Parse /proc/[pid]/stat with zero allocation (except for comm when needed).
@@ -42,7 +38,7 @@ pub fn read_stat(pid: u32, buf: &mut [u8; 1024]) -> Option<FastStat> {
         return None;
     }
     let rest = &data[end_paren + 2..];
-    
+
     // Split by ASCII space
     let mut parts = rest.split(|&b| b == b' ');
 
@@ -85,7 +81,6 @@ pub fn read_stat(pid: u32, buf: &mut [u8; 1024]) -> Option<FastStat> {
     let rss_bytes = (rss_pages.max(0) as u64) * get_page_size();
 
     Some(FastStat {
-        pid,
         comm,
         ppid,
         utime,
@@ -119,7 +114,7 @@ pub fn read_cmdline(pid: u32, buf: &mut Vec<u8>) -> Vec<String> {
     if buf.is_empty() {
         return Vec::new();
     }
-    
+
     // Command line arguments are null-separated.
     buf.split(|&b| b == 0)
         .filter(|arg| !arg.is_empty())

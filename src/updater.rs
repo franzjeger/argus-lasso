@@ -17,7 +17,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 
-const REPO: &str = "franzjeger/process-lasso-linux-rs";
+const REPO: &str = "franzjeger/argus-lasso";
 const USER_AGENT: &str = concat!("argus-lasso/", env!("CARGO_PKG_VERSION"));
 /// Releases are small (single-digit MB); anything larger is not ours.
 const MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;

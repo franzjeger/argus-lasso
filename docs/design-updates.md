@@ -1,12 +1,16 @@
 # In-app updates
 
+Scope: this updater replaces the desktop binary and its integration only. It does
+not update the Vulkan layer or root sensor helper. Use the [paired installer](installation.md)
+for current overlay builds. No new release is implied by current source changes.
+
 Argus-Lasso checks GitHub for a newer release and can replace its own binary,
 so a user on the per-user install does not have to re-run the install script
 after every release.
 
 ## How it works
 
-1. **Check** — `GET /repos/franzjeger/process-lasso-linux-rs/releases/latest`.
+1. **Check** — `GET /repos/franzjeger/argus-lasso/releases/latest`.
    The tag is compared to `CARGO_PKG_VERSION` by dotted numeric components;
    a suffix like `-rc1` parses as `0`, so a pre-release never outranks the
    release it precedes.

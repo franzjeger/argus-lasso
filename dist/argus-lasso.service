@@ -1,6 +1,6 @@
 [Unit]
 Description=Argus-Lasso — Linux process manager (GUI + daemon)
-Documentation=https://github.com/franzjeger/process-lasso-linux-rs
+Documentation=https://github.com/franzjeger/argus-lasso
 After=graphical-session.target
 PartOf=graphical-session.target
 

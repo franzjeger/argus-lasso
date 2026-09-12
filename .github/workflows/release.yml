@@ -15,6 +15,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  ARGUS_BUILD_ID: ${{ github.sha }}
 
 permissions:
   contents: write
@@ -38,7 +39,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config \
+            pkg-config glslang-tools \
             libgl1-mesa-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
@@ -54,7 +55,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo build (release)
-        run: cargo build --release --locked
+        run: cargo build --release --workspace --locked
 
       - name: Package tarball
         env:
@@ -63,14 +64,18 @@ jobs:
           version="${RELEASE_TAG#v}"
           pkg="argus-lasso-${version}-${{ matrix.arch }}-linux"
           mkdir -p "${pkg}/assets"
-          cp target/release/argus-lasso "${pkg}/"
-          cp -r dist LICENSE README.md Makefile "${pkg}/"
+          cp target/release/argus-lasso target/release/libargus_layer.so target/release/argus-sensors "${pkg}/"
+          printf '%s\n' "$ARGUS_BUILD_ID" > "${pkg}/BUILD_ID"
+          mkdir -p "${pkg}/scripts"
+          cp scripts/install-binaries.sh scripts/install-sensors.sh "${pkg}/scripts/"
+          cp -r dist packaging docs LICENSE README.md "${pkg}/"
           # Keep the icon masters under assets/ rather than flattened into the
-          # package root: the bundled Makefile looks for them there, and the
+          # package root: the paired installer looks for them there, and the
           # in-app updater renders the small sizes from the tiered masters
           # when it refreshes an existing icon install.
           cp assets/icon.svg assets/icon-medium.svg assets/icon-small.svg \
              assets/icon.png "${pkg}/assets/"
+          cp -r assets/fonts assets/screenshots "${pkg}/assets/"
           tar czf "${pkg}.tar.gz" "${pkg}"
           sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256"
 

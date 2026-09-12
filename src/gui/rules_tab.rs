@@ -384,7 +384,7 @@ impl RulesTab {
                 .unwrap_or("this rule");
             let mut confirmed = false;
             let mut cancelled = false;
-            egui::Window::new("Confirm Delete Rule")
+            egui::Window::new("Delete process rule")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -417,7 +417,7 @@ impl RulesTab {
             let profile = self.selected_profile.clone();
             let mut confirmed = false;
             let mut cancelled = false;
-            egui::Window::new("Confirm Load Profile")
+            egui::Window::new("Load rule profile")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -456,7 +456,7 @@ impl RulesTab {
             let profile = self.selected_profile.clone();
             let mut confirmed = false;
             let mut cancelled = false;
-            egui::Window::new("Confirm Delete Profile")
+            egui::Window::new("Delete rule profile")
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -614,7 +614,7 @@ impl RulesTab {
         rule_profiles: &mut std::collections::HashMap<String, Vec<crate::config::RuleConfig>>,
         on_profiles_changed: &mut bool,
     ) {
-        ui.menu_button("⋯", |ui| {
+        ui.menu_button("Import / export ▾", |ui| {
             ui.set_min_width(210.0);
             if ui.button("Export rules…").clicked() {
                 self.export_rules(rule_engine);

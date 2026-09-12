@@ -1,5 +1,6 @@
 # Maintainer: franzjeger
-# AUR package template for Argus-Lasso. To publish: copy to an AUR repo,
+# Historical v1.3.0 desktop-only template; does not package the current overlay.
+# Not a published AUR package. To update: copy to an AUR repo,
 # update pkgver, run `updpkgsums` (replaces the SKIP checksum), then
 # `makepkg --printsrcinfo > .SRCINFO`.
 pkgname=argus-lasso
@@ -7,7 +8,7 @@ pkgver=1.3.0
 pkgrel=1
 pkgdesc="Linux process manager with CPU affinity, ProBalance, Gaming Mode CPU parking, and HW monitoring"
 arch=(x86_64 aarch64)
-url="https://github.com/franzjeger/process-lasso-linux-rs"
+url="https://github.com/franzjeger/argus-lasso"
 license=(MIT)
 depends=(gcc-libs libxkbcommon wayland)
 makedepends=(cargo librsvg)
@@ -19,7 +20,7 @@ optdepends=(
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
-_srcdir="process-lasso-linux-rs-$pkgver"
+_srcdir="argus-lasso-$pkgver"
 
 build() {
   cd "$_srcdir"

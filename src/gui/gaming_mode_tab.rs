@@ -15,6 +15,7 @@ use crate::utils::{get_offline_cpus, get_online_cpus};
 pub enum GamingEvent {
     GamingModeChanged { active: bool, elevate_nice: bool },
     ResetAll,
+    GameLaunched { pid: u32, profile: String },
     LogMessage(String),
     ConfigChanged(Box<Config>),
 }
@@ -30,7 +31,19 @@ pub(crate) enum WatchPhase {
 
 // ── GamingModeTab ─────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum GamingSection {
+    #[default]
+    Cpu,
+    Launcher,
+    Overlay,
+    Recording,
+    Sensors,
+}
+
 pub struct GamingModeTab {
+    pub section: GamingSection,
+    overlay_install_status: String,
     pub config: Config,
     pub topo: Option<CpuTopology>,
     pub topo_description: String,
@@ -85,15 +98,19 @@ pub struct GamingModeTab {
     // Pending re-enable after unpark (profile switch)
     pending_enable_after_unpark: bool,
     /// Expansion state of the two panels behind the footer buttons.
-    show_launcher: bool,
-    show_log: bool,
+    overlay_settings_open: bool,
+    sensor_access: crate::sensor_access::SensorAccess,
+    benchmark: crate::game_benchmark::GameBenchmark,
 
     // Events to emit to app.rs
     pub events: Vec<GamingEvent>,
 }
 
 impl GamingModeTab {
-    pub fn new(config: Config) -> Self {
+    pub fn new(mut config: Config) -> Self {
+        if let Ok(global) = crate::gui::overlay_install::is_global() {
+            config.ui.global_overlay = global;
+        }
         let topo = detect_topology();
         let topo_description = topo.description.clone();
         let offline = get_offline_cpus();
@@ -139,8 +156,11 @@ impl GamingModeTab {
             steam_picker: None,
             lutris_picker: None,
             pending_enable_after_unpark: false,
-            show_launcher: false,
-            show_log: false,
+            section: GamingSection::default(),
+            overlay_install_status: String::new(),
+            overlay_settings_open: false,
+            sensor_access: Default::default(),
+            benchmark: Default::default(),
             events: Vec::new(),
         };
         tab.refresh_helper_status();
@@ -306,7 +326,7 @@ impl GamingModeTab {
         self.events.push(GamingEvent::LogMessage(msg));
     }
 
-    fn poll_game_process(&mut self) {
+    pub fn poll_game_process(&mut self) {
         if self.watch_phase == WatchPhase::Idle {
             return;
         }
@@ -338,6 +358,10 @@ impl GamingModeTab {
             for &pid in &pids {
                 if proc_name_matches(&name, pid) {
                     self.launched_pid = Some(pid);
+                    self.events.push(GamingEvent::GameLaunched {
+                        pid,
+                        profile: self.selected_profile.clone(),
+                    });
                     self.watch_phase = WatchPhase::Running;
                     self.watch_status = format!("Game running (PID {pid})");
                     self.append_log(format!("[Launcher] Game process found: PID {pid}"));
@@ -352,6 +376,10 @@ impl GamingModeTab {
                         pids.iter().find(|&&p| proc_name_matches(&name, p)).copied()
                     {
                         self.launched_pid = Some(new_pid);
+                        self.events.push(GamingEvent::GameLaunched {
+                            pid: new_pid,
+                            profile: self.selected_profile.clone(),
+                        });
                         self.append_log(format!("[Launcher] Game PID changed → {new_pid}"));
                     } else {
                         self.append_log(format!("[Launcher] Game (PID {pid}) exited."));
@@ -367,6 +395,15 @@ impl GamingModeTab {
         }
     }
 
+    pub fn overlay_window(&mut self, ctx: &egui::Context, opacity: f32) -> bool {
+        crate::gui::overlay_settings::window(
+            ctx,
+            &mut self.config.gaming_mode.overlay,
+            &mut self.overlay_settings_open,
+            crate::utils::get_cpu_count(),
+            opacity,
+        )
+    }
     pub fn show(&mut self, ui: &mut Ui, ctx: &egui::Context, opacity: f32) {
         // Do NOT clear events here: app.rs drains them with mem::take AFTER
         // show(), and the constructor may queue a startup GamingModeChanged
@@ -391,7 +428,18 @@ impl GamingModeTab {
             }
         }
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        crate::gui::theme::section_nav(
+            ui,
+            &mut self.section,
+            &[
+                (GamingSection::Cpu, "CPU & performance"),
+                (GamingSection::Launcher, "Launcher & profiles"),
+                (GamingSection::Overlay, "Overlay"),
+                (GamingSection::Recording, "Recording"),
+                (GamingSection::Sensors, "Sensors"),
+            ],
+        );
+        egui::ScrollArea::vertical().id_salt(("gaming_body", self.section as u8)).show(ui, |ui| {
             use crate::gui::theme::{self as th, tokens};
             let s = th::sem(ui);
             let mut reset_clicked = false;
@@ -402,6 +450,7 @@ impl GamingModeTab {
                 .map(|t| t.has_asymmetry())
                 .unwrap_or(false);
 
+            if self.section == GamingSection::Cpu {
             // ── Helper banner: the blocking prerequisite gets one clear action
             if !self.helper_ok {
                 let color = if self.helper_outdated {
@@ -413,7 +462,7 @@ impl GamingModeTab {
                     ui,
                     color,
                     &self.helper_status_text,
-                    Some("Install / Update…"),
+                    Some("Set up CPU control…"),
                 ) {
                     self.show_install_dialog = true;
                 }
@@ -433,6 +482,7 @@ impl GamingModeTab {
                     );
                     ui.add_space(tokens::SPACE_XS);
                     ui.vertical(|ui| {
+                        ui.set_max_width((ui.available_width() - 200.0).max(200.0));
                         ui.label(
                             RichText::new(if self.parked {
                                 "Gaming Mode is on"
@@ -454,9 +504,9 @@ impl GamingModeTab {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let enabled = has_asym && self.helper_ok && !self.parking_in_progress;
                         let label = if self.parked {
-                            "Deactivate"
+                            "Disable Gaming Mode"
                         } else {
-                            "Activate"
+                            "Enable Gaming Mode"
                         };
                         let btn =
                             egui::Button::new(RichText::new(label).strong().color(s.on_accent))
@@ -477,8 +527,8 @@ impl GamingModeTab {
             // ── Core map: which cores stay online in Gaming Mode ──────────
             th::card_hinted(
                 ui,
-                "Active cores in Gaming Mode",
-                "click to park or activate",
+                "CPU threads used by Gaming Mode",
+                "Select which preferred CPU threads stay online",
                 |ui| {
                     let (pref, nonpref, pref_label, nonpref_label) = match &self.topo {
                         Some(t) => (
@@ -512,24 +562,26 @@ impl GamingModeTab {
 
                     ui.add_space(tokens::SPACE_S);
                     ui.horizontal(|ui| {
-                        if th::chip(ui, "All", false) {
+                        if th::chip(ui, "All threads", false) {
                             for v in self.preferred_checks.values_mut() {
                                 *v = true;
                             }
                         }
                         let has_smt = !self.smt_siblings.is_empty();
                         ui.add_enabled_ui(has_smt, |ui| {
-                            if th::chip(ui, "No SMT", false) {
+                            if th::chip(ui, "One thread per core", false) {
                                 for (&cpu, v) in &mut self.preferred_checks {
                                     *v = !self.smt_siblings.contains(&cpu);
                                 }
                             }
                         });
-                        if th::chip(ui, "None", false) {
+                        if th::chip(ui, "Clear selection", false) {
                             for v in self.preferred_checks.values_mut() {
                                 *v = false;
                             }
                         }
+                    });
+                    ui.horizontal_wrapped(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Uniform-topology machines have no non-preferred group,
                             // so that swatch would render with an empty caption.
@@ -546,7 +598,7 @@ impl GamingModeTab {
             ui.add_space(tokens::SPACE_S);
 
             // ── Behaviour: what happens when Gaming Mode is on ────────────
-            th::card(ui, "Behaviour", |ui| {
+            th::card(ui, "Automatic game detection & priority", |ui| {
                 ui.checkbox(&mut self.elevate_nice, "Elevate game priority (nice -1)");
                 let mut auto_changed = ui
                     .checkbox(
@@ -607,55 +659,17 @@ impl GamingModeTab {
             });
             ui.add_space(tokens::SPACE_S);
 
-            // ── Game launcher & profiles (collapsed) ──────────────────────
-            // ── One row of three: the two panels plus the destructive
-            //    reset, as mockup 2b lays them out.
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - tokens::SPACE_S * 2.0) / 3.0;
-                let arrow = |open: bool| if open { "▾" } else { "▸" };
-                if ui
-                    .add_sized(
-                        [w, 26.0],
-                        egui::Button::new(format!(
-                            "{}  Game launcher and profiles",
-                            arrow(self.show_launcher)
-                        )),
-                    )
-                    .clicked()
-                {
-                    self.show_launcher = !self.show_launcher;
-                }
-                if ui
-                    .add_sized(
-                        [w, 26.0],
-                        egui::Button::new(format!("{}  Activity log", arrow(self.show_log))),
-                    )
-                    .clicked()
-                {
-                    self.show_log = !self.show_log;
-                }
-                // Not a third peer of the two collapsing panels: it is a
-                // rarely-used escape hatch, so it gets its own smaller,
-                // right-aligned row below them rather than matching width.
-                let reset = egui::Button::new(
-                    RichText::new("↩  Reset all")
-                        .size(tokens::FONT_HELP)
-                        .color(s.negative),
-                )
-                .stroke(egui::Stroke::new(1.0_f32, s.negative));
-                if ui
-                    .add(reset)
-                    .on_hover_text(
-                        "Restores all per-process CPU affinities and unparks any parked CPUs.",
-                    )
-                    .clicked()
-                {
-                    reset_clicked = true;
-                }
-            });
             ui.add_space(tokens::SPACE_S);
-
-            if self.show_launcher {
+            if ui.button("Restore all CPU assignments").on_hover_text("Restores every process CPU affinity and brings all CPUs online.").clicked() {
+                reset_clicked = true;
+            }
+            egui::CollapsingHeader::new("Gaming activity").show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(140.0).stick_to_bottom(true).show(ui, |ui| {
+                    for line in &self.log_lines { ui.monospace(line); }
+                });
+            });
+            }
+            if self.section == GamingSection::Launcher {
                 th::card(ui, "Game launcher and profiles", |ui| {
                     ui.horizontal(|ui| {
                         ui.label("Profile");
@@ -683,13 +697,13 @@ impl GamingModeTab {
                                     }
                                 }
                             });
-                        if ui.button("Save").clicked() {
+                        if ui.button("Save profile").clicked() {
                             self.save_profile();
                         }
                         if ui
                             .add_enabled(
                                 !self.selected_profile.is_empty(),
-                                egui::Button::new("Delete"),
+                                egui::Button::new("Delete profile"),
                             )
                             .clicked()
                         {
@@ -731,7 +745,7 @@ impl GamingModeTab {
                         }
                         let can_kill = self.watch_phase != WatchPhase::Idle;
                         if ui
-                            .add_enabled(can_kill, egui::Button::new("Kill game"))
+                            .add_enabled(can_kill, egui::Button::new("Force quit game"))
                             .clicked()
                         {
                             if let Some(pid) = self.launched_pid {
@@ -754,7 +768,7 @@ impl GamingModeTab {
                             self.launched_pid = None;
                             self.watch_status = String::new();
                         }
-                        ui.checkbox(&mut self.auto_restore, "Auto-disable when game exits");
+                        ui.checkbox(&mut self.auto_restore, "Disable Gaming Mode when the game exits");
                         if !self.watch_status.is_empty() {
                             ui.colored_label(s.ok, &self.watch_status);
                         }
@@ -762,90 +776,32 @@ impl GamingModeTab {
                 });
             }
 
-            // ── Vulkan Overlay ────────────────────────────────────────────
-            let mut overlay_changed = false;
-            th::card(ui, "Vulkan In-Game Overlay (ARGUS_LASSO_HUD=1)", |ui| {
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut self.config.gaming_mode.overlay.show_overlay, "Enable overlay").changed() {
-                        overlay_changed = true;
-                    }
-                });
-
-                if self.config.gaming_mode.overlay.show_overlay {
-                    ui.add_space(tokens::SPACE_S);
-                    ui.horizontal(|ui| {
-                        ui.label("Scale:");
-                        if ui.add(egui::Slider::new(&mut self.config.gaming_mode.overlay.scale, 1..=4)).changed() {
-                            overlay_changed = true;
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Offset X:");
-                        if ui.add(egui::DragValue::new(&mut self.config.gaming_mode.overlay.offset_x).speed(1)).changed() {
-                            overlay_changed = true;
-                        }
-                        ui.add_space(tokens::SPACE_M);
-                        ui.label("Offset Y:");
-                        if ui.add(egui::DragValue::new(&mut self.config.gaming_mode.overlay.offset_y).speed(1)).changed() {
-                            overlay_changed = true;
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label("Text Color:");
-                        let mut tc = [
-                            self.config.gaming_mode.overlay.text_color.0,
-                            self.config.gaming_mode.overlay.text_color.1,
-                            self.config.gaming_mode.overlay.text_color.2,
-                            self.config.gaming_mode.overlay.text_color.3,
-                        ];
-                        if ui.color_edit_button_srgba_unmultiplied(&mut tc).changed() {
-                            self.config.gaming_mode.overlay.text_color = (tc[0], tc[1], tc[2], tc[3]);
-                            overlay_changed = true;
-                        }
-
-                        ui.add_space(tokens::SPACE_M);
-                        ui.label("Background:");
-                        let mut bc = [
-                            self.config.gaming_mode.overlay.bg_color.0,
-                            self.config.gaming_mode.overlay.bg_color.1,
-                            self.config.gaming_mode.overlay.bg_color.2,
-                            self.config.gaming_mode.overlay.bg_color.3,
-                        ];
-                        if ui.color_edit_button_srgba_unmultiplied(&mut bc).changed() {
-                            self.config.gaming_mode.overlay.bg_color = (bc[0], bc[1], bc[2], bc[3]);
-                            overlay_changed = true;
-                        }
-                    });
-                }
-            });
-
-            if overlay_changed {
-                self.events
-                    .push(GamingEvent::ConfigChanged(Box::new(self.config.clone())));
+            // ── Overlay switch and Gaming customization submenu ───────────
+            if self.section == GamingSection::Recording {
+                th::card_untitled(ui, |ui| self.benchmark.show(ui));
             }
-
-            // ── Activity log (collapsed) ──────────────────────────────────
-            if self.show_log {
-                th::card(ui, "Activity log", |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(140.0)
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            for line in &self.log_lines {
-                                ui.label(
-                                    RichText::new(line)
-                                        .font(th::num_font(tokens::FONT_SMALL))
-                                        .color(ui.visuals().weak_text_color()),
-                                );
-                            }
-                        });
+            if self.section == GamingSection::Sensors {
+                th::card_untitled(ui, |ui| self.sensor_access.show(ui));
+            }
+            if self.section == GamingSection::Overlay {
+                let mut overlay_changed = false;
+                th::card(ui, "In-game overlay", |ui| {
+                    overlay_changed = crate::gui::overlay_settings::show(ui, &mut self.config.gaming_mode.overlay, &mut self.overlay_settings_open, crate::utils::get_cpu_count());
+                    ui.separator();
+                    let mut global = self.config.ui.global_overlay;
+                    if ui.checkbox(&mut global, "Load in all Vulkan games").on_hover_text("Applies to games started after this change. Individual games can use ARGUS_LASSO_HUD_DISABLE=1.").changed() {
+                        match crate::gui::overlay_install::set_global(global) {
+                            Ok(()) => { self.config.ui.global_overlay = global; overlay_changed = true; self.overlay_install_status = "Saved. Restart running games to change layer loading.".into(); }
+                            Err(e) => self.overlay_install_status = format!("Could not change layer loading: {e}"),
+                        }
+                    }
+                    if !self.overlay_install_status.is_empty() { ui.label(&self.overlay_install_status); }
                 });
+                if overlay_changed { self.events.push(GamingEvent::ConfigChanged(Box::new(self.config.clone()))); }
             }
 
             // ── Footer: helper status ─────────────────────────────────────
-            if self.helper_ok {
+            if self.section == GamingSection::Cpu && self.helper_ok {
                 ui.add_space(tokens::SPACE_S);
                 ui.horizontal(|ui| {
                     // A whole line in accent-adjacent green reads as a link.
@@ -894,7 +850,7 @@ impl GamingModeTab {
 
         // ── Install helper dialog ─────────────────────────────────────────
         if self.show_install_dialog {
-            egui::Window::new("Install Privileged Helper")
+            egui::Window::new("Set up CPU control")
                 .resizable(false)
                 .collapsible(false)
                 .show(ctx, |ui| {
@@ -1041,7 +997,10 @@ impl GamingModeTab {
         // Spawn detached
         let parts: Vec<_> = cmd.split_whitespace().collect();
         if let Some((prog, args)) = parts.split_first() {
-            let _ = std::process::Command::new(prog).args(args).env("ARGUS_LASSO_HUD", "1").spawn();
+            let _ = std::process::Command::new(prog)
+                .args(args)
+                .env("ARGUS_LASSO_HUD", "1")
+                .spawn();
         }
     }
 }
@@ -1157,7 +1116,7 @@ fn core_map(
             th::num_font(tokens::FONT_LABEL),
             text_col,
         );
-        let tag = if smt.contains(&cpu) { "HT" } else { "P" };
+        let tag = if smt.contains(&cpu) { "SMT" } else { "CPU" };
         ui.painter().text(
             cell.center() + egui::vec2(0.0, 7.0),
             egui::Align2::CENTER_CENTER,
@@ -1198,4 +1157,3 @@ fn proc_name_matches(game_name: &str, pid: u32) -> bool {
     }
     false
 }
-

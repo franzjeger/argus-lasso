@@ -75,29 +75,15 @@ pub fn window_bg_rgb(theme: &AppTheme) -> (u8, u8, u8) {
     }
 }
 
-/// Apply opacity to the panel/window fills of a child viewport context.
-/// Call at the START of a `show_viewport_immediate` callback.
-/// Returns the original fills so they can be restored at the END of the callback.
-pub fn push_viewport_opacity(ctx: &Context, opacity: f32) -> (Color32, Color32) {
-    let orig_panel = ctx.global_style().visuals.panel_fill;
-    let orig_window = ctx.global_style().visuals.window_fill;
-    if opacity < 0.999 {
-        let a = (opacity * 255.0) as u8;
-        let tint = |c: Color32| Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
-        ctx.global_style_mut(|s| {
-            s.visuals.panel_fill = tint(s.visuals.panel_fill);
-            s.visuals.window_fill = tint(s.visuals.window_fill);
-        });
+/// Set the background alpha on this viewport's UI, without mutating the shared
+/// Context style. Native root UIs already cloned that style before the callback.
+/// Requires a transparent native surface and a transparent renderer clear color.
+pub fn apply_viewport_opacity(ui: &mut egui::Ui, opacity: f32) {
+    let alpha = (opacity.clamp(0.1, 1.0) * 255.0).round() as u8;
+    let visuals = ui.visuals_mut();
+    for color in [&mut visuals.panel_fill, &mut visuals.window_fill] {
+        *color = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
     }
-    (orig_panel, orig_window)
-}
-
-/// Restore panel/window fills saved by [`push_viewport_opacity`].
-pub fn pop_viewport_opacity(ctx: &Context, saved: (Color32, Color32)) {
-    ctx.global_style_mut(|s| {
-        s.visuals.panel_fill = saved.0;
-        s.visuals.window_fill = saved.1;
-    });
 }
 
 /// Apply the selected theme.
@@ -109,6 +95,29 @@ pub fn apply_theme(ctx: &Context, native_ppp: f32, theme: &AppTheme) {
         AppTheme::AdwaitaDark => apply_adwaita(ctx, native_ppp, true),
         AppTheme::AdwaitaLight => apply_adwaita(ctx, native_ppp, false),
     }
+    ctx.global_style_mut(|style| {
+        use egui::TextStyle::*;
+        style.text_styles = [
+            (Small, FontId::proportional(tokens::FONT_HELP)),
+            (Body, FontId::proportional(tokens::FONT_BODY)),
+            (Button, FontId::proportional(tokens::FONT_BODY)),
+            (Heading, bold_font(tokens::FONT_HEADING)),
+            (Monospace, FontId::monospace(tokens::FONT_BODY)),
+        ]
+        .into();
+        style.visuals.slider_trailing_fill = true;
+        style.visuals.weak_text_color = Some(if style.visuals.dark_mode {
+            Color32::from_rgb(0xb8, 0xbc, 0xc2)
+        } else {
+            Color32::from_rgb(0x62, 0x67, 0x6d)
+        });
+        if !style.visuals.dark_mode {
+            style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(0xe6, 0xe6, 0xe6);
+        }
+        style.spacing.interact_size.y = 30.0;
+        style.spacing.item_spacing = egui::vec2(10.0, 7.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    });
 }
 
 // ── Fonts ─────────────────────────────────────────────────────────────────────
@@ -272,17 +281,17 @@ impl Breeze {
 
 pub mod tokens {
     /// Fine print: table meta, thread lists, sublabels
-    pub const FONT_SMALL: f32 = 11.0;
+    pub const FONT_SMALL: f32 = 12.0;
     /// Column headers, chip labels, badges
-    pub const FONT_LABEL: f32 = 11.5;
+    pub const FONT_LABEL: f32 = 12.0;
     /// Help text under group titles
-    pub const FONT_HELP: f32 = 12.5;
+    pub const FONT_HELP: f32 = 13.5;
     /// Default body/table text
-    pub const FONT_BODY: f32 = 13.5;
+    pub const FONT_BODY: f32 = 15.0;
     /// Section headings inside cards
-    pub const FONT_HEADING: f32 = 15.0;
+    pub const FONT_HEADING: f32 = 16.0;
     /// Hero status headline (Gaming Mode / ProBalance status cards)
-    pub const FONT_HERO: f32 = 17.0;
+    pub const FONT_HERO: f32 = 20.0;
     /// KPI card value
     pub const FONT_KPI: f32 = 26.0;
 
@@ -291,12 +300,12 @@ pub mod tokens {
     /// Between related elements
     pub const SPACE_S: f32 = 8.0;
     /// Between sections/cards
-    pub const SPACE_M: f32 = 12.0;
+    pub const SPACE_M: f32 = 18.0;
 
     /// Standard data row height
-    pub const ROW_H: f32 = 26.0;
+    pub const ROW_H: f32 = 28.0;
     /// Dense data row height (HW Monitor sensors)
-    pub const ROW_H_DENSE: f32 = 22.0;
+    pub const ROW_H_DENSE: f32 = 24.0;
     /// Left label column width in settings forms
     pub const FORM_LABEL_W: f32 = 220.0;
     /// Label column inside dialogs — narrower than the settings pane's, which
@@ -307,6 +316,70 @@ pub mod tokens {
 // ── Component primitives ──────────────────────────────────────────────────────
 //
 // Shared widgets so every tab renders chips/badges/toggles identically.
+
+/// Quiet boundary between related groups. Its spacing belongs to the rule.
+pub fn divider(ui: &mut egui::Ui) {
+    ui.add_space(tokens::SPACE_XS);
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(
+        rect.x_range(),
+        rect.center().y,
+        Stroke::new(1.0_f32, tint(ui.visuals().text_color(), 32)),
+    );
+    ui.add_space(tokens::SPACE_XS);
+}
+
+pub fn page_intro(ui: &mut egui::Ui, title: &str, description: &str) {
+    ui.add_space(tokens::SPACE_S);
+    ui.label(bold(ui, title, 22.0));
+    ui.label(
+        egui::RichText::new(description)
+            .size(tokens::FONT_HELP)
+            .color(ui.visuals().weak_text_color()),
+    );
+    ui.add_space(tokens::SPACE_M);
+}
+
+/// Shared secondary navigation: generous targets, wrapping and a clear baseline.
+pub fn section_nav<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    selected: &mut T,
+    entries: &[(T, &str)],
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = tokens::SPACE_S;
+        for &(value, label) in entries {
+            let active = *selected == value;
+            let response = ui.add(
+                egui::Button::new(egui::RichText::new(label).color(if active {
+                    sem(ui).accent
+                } else {
+                    ui.visuals().text_color()
+                }))
+                .selected(active)
+                .frame(active)
+                .min_size(egui::vec2(
+                    ui.painter()
+                        .layout_no_wrap(
+                            label.to_owned(),
+                            FontId::proportional(tokens::FONT_BODY),
+                            Color32::WHITE,
+                        )
+                        .size()
+                        .x
+                        + 24.0,
+                    34.0,
+                )),
+            );
+            if response.clicked() {
+                *selected = value;
+            }
+        }
+    });
+    divider(ui);
+    ui.add_space(tokens::SPACE_S);
+}
 
 /// Pill-shaped filter chip in the accent colour.
 pub fn chip(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
@@ -616,18 +689,23 @@ pub fn form_row_w(
     label: &str,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
-    ui.horizontal(|ui| {
-        let h = ui.spacing().interact_size.y;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(label_w, h), egui::Sense::hover());
-        ui.painter().text(
-            egui::pos2(rect.left(), rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            egui::FontId::proportional(tokens::FONT_BODY),
-            ui.visuals().text_color(),
-        );
+    if ui.available_width() < label_w + 260.0 {
+        ui.label(label);
         add_contents(ui);
-    });
+    } else {
+        ui.horizontal(|ui| {
+            let size = egui::vec2(label_w, ui.spacing().interact_size.y);
+            ui.allocate_ui_with_layout(
+                size,
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_min_size(size);
+                    ui.add(egui::Label::new(label).wrap());
+                },
+            );
+            add_contents(ui);
+        });
+    }
     ui.add_space(tokens::SPACE_XS);
 }
 
@@ -708,18 +786,15 @@ pub fn num_font(size: f32) -> egui::FontId {
     egui::FontId::monospace(size)
 }
 
-/// QGroupBox-style bordered card with a top-left title — THE section container
-/// for every tab (single definition; per-tab copies are deprecated).
-
 /// A bordered container with no heading (used for hero cards where the
 /// title is replaced by a large primary value/status).
 pub fn card_untitled(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let border_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    let border_color = tint(ui.visuals().text_color(), 22);
     egui::Frame::new()
         .fill(card_fill(ui))
         .stroke(egui::Stroke::new(1.0_f32, border_color))
-        .inner_margin(egui::Margin::same(8))
-        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(16))
+        .corner_radius(egui::CornerRadius::same(8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             add_contents(ui);
@@ -738,25 +813,23 @@ pub fn card_hinted(
     hint: &str,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) {
-    let border_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    let border_color = tint(ui.visuals().text_color(), 22);
     egui::Frame::new()
         .fill(card_fill(ui))
         .stroke(egui::Stroke::new(1.0_f32, border_color))
-        .inner_margin(egui::Margin::same(8))
-        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::same(16))
+        .corner_radius(egui::CornerRadius::same(8))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(bold(ui, title, tokens::FONT_HEADING));
-                if !hint.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!("— {hint}"))
-                            .size(tokens::FONT_HELP)
-                            .color(ui.visuals().weak_text_color()),
-                    );
-                }
-            });
-            ui.add_space(tokens::SPACE_XS);
+            ui.label(bold(ui, title, tokens::FONT_HEADING));
+            if !hint.is_empty() {
+                ui.label(
+                    egui::RichText::new(hint)
+                        .size(tokens::FONT_HELP)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+            divider(ui);
             add_contents(ui);
         });
 }
@@ -1273,4 +1346,31 @@ pub fn apply_adwaita(ctx: &Context, native_ppp: f32, dark: bool) {
     style.visuals.faint_bg_color = alt_base;
 
     ctx.set_global_style(style);
+}
+
+#[cfg(test)]
+mod viewport_opacity_tests {
+    use super::*;
+
+    #[test]
+    fn native_panel_alpha_is_local_live_and_restorable() {
+        let ctx = egui::Context::default();
+        for theme in [AppTheme::BreezeDark, AppTheme::AdwaitaLight] {
+            apply_theme(&ctx, 1.0, &theme);
+            let original = ctx.global_style().visuals.panel_fill;
+            for opacity in [0.35, 0.78, 1.0] {
+                let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    apply_viewport_opacity(ui, opacity);
+                    assert_eq!(ui.visuals().panel_fill.a(), (opacity * 255.0).round() as u8);
+                    egui::CentralPanel::default().show_inside(ui, |_| {});
+                });
+                let panel_alpha = output.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Rect(rect) if rect.fill.a() != 0 => Some(rect.fill.a()),
+                    _ => None,
+                });
+                assert_eq!(panel_alpha, Some((opacity * 255.0).round() as u8));
+                assert_eq!(ctx.global_style().visuals.panel_fill, original);
+            }
+        }
+    }
 }

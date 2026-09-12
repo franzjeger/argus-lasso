@@ -105,7 +105,7 @@ impl AffinityPicker {
                         *cb = self.non_preferred.contains(&(i as u32));
                     }
                 }
-                if ui.button("All cores").clicked() {
+                if ui.button("All CPU threads").clicked() {
                     for (i, cb) in self.checkboxes.iter_mut().enumerate() {
                         if !self.offline.contains(&(i as u32)) {
                             *cb = true;
@@ -125,7 +125,7 @@ impl AffinityPicker {
         } else {
             ui.horizontal(|ui| {
                 ui.label("Quick:");
-                if ui.button("All cores").clicked() {
+                if ui.button("All CPU threads").clicked() {
                     for (i, cb) in self.checkboxes.iter_mut().enumerate() {
                         if !self.offline.contains(&(i as u32)) {
                             *cb = true;
@@ -362,7 +362,7 @@ impl AffinityDialog {
         let mut close_as: Option<bool> = None; // Some(true)=accept, Some(false)=cancel
 
         {
-            let title_str = format!("Set CPU Affinity — {}", self.title);
+            let title_str = format!("Set CPU affinity — {}", self.title);
             let checkboxes = &mut self.checkboxes;
             let offline = &self.offline;
             let preferred = &self.preferred;
@@ -381,7 +381,7 @@ impl AffinityDialog {
                     .with_resizable(true),
                 |vp_ui, _class| {
                     let ctx = &vp_ui.ctx().clone();
-                    let _opacity_saved = crate::gui::theme::push_viewport_opacity(ctx, opacity);
+                    crate::gui::theme::apply_viewport_opacity(vp_ui, opacity);
                     if ctx.input(|i| i.viewport().close_requested()) {
                         close_as = Some(false);
                     }
@@ -483,15 +483,14 @@ impl AffinityDialog {
                         ui.horizontal(|ui| {
                             if ui.button("OK").clicked() {
                                 close_as = Some(true);
-                                
+
                             }
                             if ui.button("Cancel").clicked() {
                                 close_as = Some(false);
-                                
+
                             }
                         });
                     });
-                    crate::gui::theme::pop_viewport_opacity(ctx, _opacity_saved);
                 },
             );
         }
@@ -549,7 +548,7 @@ impl NiceDialog {
         let mut close_as: Option<bool> = None;
 
         {
-            let title_str = format!("Set Priority (nice) — {}", self.title);
+            let title_str = format!("Set CPU priority — {}", self.title);
             let value = &mut self.value;
 
             ctx.show_viewport_immediate(
@@ -567,14 +566,14 @@ impl NiceDialog {
                     .with_resizable(false),
                 |vp_ui, _class| {
                     let ctx = &vp_ui.ctx().clone();
-                    let _opacity_saved = crate::gui::theme::push_viewport_opacity(ctx, opacity);
+                    crate::gui::theme::apply_viewport_opacity(vp_ui, opacity);
                     if ctx.input(|i| i.viewport().close_requested()) {
                         close_as = Some(false);
                     }
                     egui::CentralPanel::default().show_inside(vp_ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.label(
-                            "Nice priority: lower = higher priority. Negative values require root.",
+                            "Lower nice values give higher CPU priority. Raising priority may require system authentication.",
                         );
                         ui.add(egui::Slider::new(value, -20..=19).text("nice"));
                         ui.horizontal(|ui| {
@@ -594,15 +593,14 @@ impl NiceDialog {
                         ui.horizontal(|ui| {
                             if ui.button("OK").clicked() {
                                 close_as = Some(true);
-                                
+
                             }
                             if ui.button("Cancel").clicked() {
                                 close_as = Some(false);
-                                
+
                             }
                         });
                     });
-                    crate::gui::theme::pop_viewport_opacity(ctx, _opacity_saved);
                 },
             );
         }
@@ -650,7 +648,7 @@ impl IoNiceDialog {
         let mut close_as: Option<bool> = None;
 
         {
-            let title_str = format!("Set I/O Priority — {}", self.title);
+            let title_str = format!("Set disk I/O priority — {}", self.title);
             let class = &mut self.class;
             let level = &mut self.level;
 
@@ -669,7 +667,7 @@ impl IoNiceDialog {
                     .with_resizable(false),
                 |vp_ui, _class| {
                     let ctx = &vp_ui.ctx().clone();
-                    let _opacity_saved = crate::gui::theme::push_viewport_opacity(ctx, opacity);
+                    crate::gui::theme::apply_viewport_opacity(vp_ui, opacity);
                     if ctx.input(|i| i.viewport().close_requested()) {
                         close_as = Some(false);
                     }
@@ -697,15 +695,12 @@ impl IoNiceDialog {
                         ui.horizontal(|ui| {
                             if ui.button("OK").clicked() {
                                 close_as = Some(true);
-                                
                             }
                             if ui.button("Cancel").clicked() {
                                 close_as = Some(false);
-                                
                             }
                         });
                     });
-                    crate::gui::theme::pop_viewport_opacity(ctx, _opacity_saved);
                 },
             );
         }
@@ -799,7 +794,7 @@ impl RuleEditDialog {
                     .with_resizable(true),
                 |vp_ui, _class| {
                     let ctx = &vp_ui.ctx().clone();
-                    let _opacity_saved = crate::gui::theme::push_viewport_opacity(ctx, opacity);
+                    crate::gui::theme::apply_viewport_opacity(vp_ui, opacity);
                     if ctx.input(|i| i.viewport().close_requested()) {
                         close_as = Some(false);
                     }
@@ -827,11 +822,9 @@ impl RuleEditDialog {
                                     // so saving one is never what was meant.
                                     if ui.add_enabled(!rule.pattern.is_empty(), save).clicked() {
                                         close_as = Some(true);
-                                        
                                     }
                                     if ui.button("Cancel").clicked() {
                                         close_as = Some(false);
-                                        
                                     }
                                 },
                             );
@@ -896,7 +889,7 @@ impl RuleEditDialog {
                             // unchecked row goes weak, so what the rule does
                             // is readable without parsing a column of
                             // identical "Enable" boxes.
-                            action_row(ui, LW, affinity_enabled, "Affinity", |ui, on| {
+                            action_row(ui, LW, affinity_enabled, "CPU assignment", |ui, on| {
                                 let cpulist = picker.cpulist();
                                 let shown = if cpulist.is_empty() {
                                     "all CPUs".to_string()
@@ -920,7 +913,7 @@ impl RuleEditDialog {
                                 ui.add_space(tokens::SPACE_XS);
                             }
 
-                            action_row(ui, LW, nice_enabled, "Nice", |ui, on| {
+                            action_row(ui, LW, nice_enabled, "CPU priority (nice)", |ui, on| {
                                 let nice = rule.nice.get_or_insert(0);
                                 ui.add_enabled(on, egui::DragValue::new(nice).range(-20..=19));
                             });
@@ -938,7 +931,6 @@ impl RuleEditDialog {
                             });
                         });
                     });
-                    crate::gui::theme::pop_viewport_opacity(ctx, _opacity_saved);
                 },
             );
         }
@@ -1218,7 +1210,7 @@ impl RulePresetsDialog {
                     .with_resizable(true),
                 |vp_ui, _class| {
                     let ctx = &vp_ui.ctx().clone();
-                    let _opacity_saved = crate::gui::theme::push_viewport_opacity(ctx, opacity);
+                    crate::gui::theme::apply_viewport_opacity(vp_ui, opacity);
                     if ctx.input(|i| i.viewport().close_requested()) {
                         close_as = Some(false);
                     }
@@ -1247,11 +1239,9 @@ impl RulePresetsDialog {
                                     .fill(s.accent);
                                     if ui.add_enabled(selected.is_some(), use_btn).clicked() {
                                         close_as = Some(true);
-                                        
                                     }
                                     if ui.button("Cancel").clicked() {
                                         close_as = Some(false);
-                                        
                                     }
                                 },
                             );
@@ -1356,12 +1346,10 @@ impl RulePresetsDialog {
                                 if resp.double_clicked() {
                                     *selected = Some(i);
                                     close_as = Some(true);
-                                    
                                 }
                             }
                         });
                     });
-                    crate::gui::theme::pop_viewport_opacity(ctx, _opacity_saved);
                 },
             );
         }
@@ -1442,7 +1430,7 @@ impl SteamGamePickerDialog {
                     .with_resizable(true),
                 |vp_ui, _class| {
                     let ctx = &vp_ui.ctx().clone();
-                    let _opacity_saved = crate::gui::theme::push_viewport_opacity(ctx, opacity);
+                    crate::gui::theme::apply_viewport_opacity(vp_ui, opacity);
                     if ctx.input(|i| i.viewport().close_requested()) {
                         cancelled = true;
                     }
@@ -1476,14 +1464,14 @@ impl SteamGamePickerDialog {
                                     body.row(24.0, |mut row| {
                                         let sel = *selected == Some(*orig_i);
                                         row.set_selected(sel);
-                                        
+
                                         row.col(|ui| {
                                             ui.label(appid.as_str());
                                         });
                                         row.col(|ui| {
                                             ui.label(name.as_str());
                                         });
-                                        
+
                                         let resp = row.response();
                                         if resp.double_clicked() {
                                             *selected = Some(*orig_i);
@@ -1500,15 +1488,12 @@ impl SteamGamePickerDialog {
                         ui.horizontal(|ui| {
                             if ui.button("Select").clicked() && selected.is_some() {
                                 accepted = true;
-                                
                             }
                             if ui.button("Cancel").clicked() {
                                 cancelled = true;
-                                
                             }
                         });
                     });
-                    crate::gui::theme::pop_viewport_opacity(ctx, _opacity_saved);
                 },
             );
         }
@@ -1652,7 +1637,7 @@ impl LutrisGamePickerDialog {
                     .with_resizable(true),
                 |vp_ui, _class| {
                     let ctx = &vp_ui.ctx().clone();
-                    let _opacity_saved = crate::gui::theme::push_viewport_opacity(ctx, opacity);
+                    crate::gui::theme::apply_viewport_opacity(vp_ui, opacity);
                     if ctx.input(|i| i.viewport().close_requested()) {
                         cancelled = true;
                     }
@@ -1683,11 +1668,11 @@ impl LutrisGamePickerDialog {
                                     body.row(24.0, |mut row| {
                                         let sel = *selected == Some(*orig_i);
                                         row.set_selected(sel);
-                                        
+
                                         row.col(|ui| {
                                             ui.label(label.as_str());
                                         });
-                                        
+
                                         let resp = row.response();
                                         if resp.double_clicked() {
                                             *selected = Some(*orig_i);
@@ -1704,15 +1689,12 @@ impl LutrisGamePickerDialog {
                         ui.horizontal(|ui| {
                             if ui.button("Select").clicked() && selected.is_some() {
                                 accepted = true;
-                                
                             }
                             if ui.button("Cancel").clicked() {
                                 cancelled = true;
-                                
                             }
                         });
                     });
-                    crate::gui::theme::pop_viewport_opacity(ctx, _opacity_saved);
                 },
             );
         }

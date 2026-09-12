@@ -50,6 +50,9 @@ impl Sensor {
 
     pub fn push(&mut self, value: f32) {
         self.value = value;
+        if !value.is_finite() {
+            return;
+        }
         if self.avg_count == 0 {
             self.min = value;
             self.max = value;
@@ -113,75 +116,85 @@ pub struct HwMonitorData {
 }
 
 impl HwMonitorData {
-    pub fn get_gpu_usage(&self) -> u8 {
+    pub fn get_gpu_usage(&self) -> Option<u8> {
         for group in &self.groups {
             if group.category == "GPU" {
-                for sensor in &group.sensors {
+                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
                     if sensor.label == "Usage" || sensor.label == "GPU Load" {
-                        return sensor.value as u8;
+                        return Some(sensor.value as u8);
                     }
                 }
             }
         }
-        0
+        None
     }
 
-    pub fn get_gpu_temp(&self) -> u8 {
+    pub fn get_gpu_temp(&self) -> Option<u8> {
         for group in &self.groups {
             if group.category == "GPU" {
-                for sensor in &group.sensors {
-                    if sensor.label == "Temperature" || sensor.label == "Core Temp" || sensor.label == "Temp" {
-                        return sensor.value as u8;
+                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
+                    if sensor.label == "Temperature"
+                        || sensor.label == "Core Temp"
+                        || sensor.label == "Temp"
+                    {
+                        return Some(sensor.value as u8);
                     }
                 }
             }
         }
-        0
+        None
     }
 
-    pub fn get_cpu_temp(&self) -> u8 {
+    pub fn get_cpu_temp(&self) -> Option<u8> {
         for group in &self.groups {
             if group.category == "CPU" {
-                for sensor in &group.sensors {
-                    if sensor.label == "Temperature" || sensor.label == "Package Temp" || sensor.label == "Tctl" || sensor.label == "Tdie" {
-                        return sensor.value as u8;
+                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
+                    if sensor.label == "Temperature"
+                        || sensor.label == "Package Temp"
+                        || sensor.label == "Tctl"
+                        || sensor.label == "Tdie"
+                    {
+                        return Some(sensor.value as u8);
                     }
                 }
             }
         }
-        0
+        None
     }
 
-    pub fn get_cpu_power(&self) -> f32 {
+    pub fn get_cpu_power(&self) -> Option<f32> {
         for group in &self.groups {
-            if group.category == "Power" {
-                for sensor in &group.sensors {
-                    if sensor.label.contains("Package") || sensor.label.contains("CPU") || sensor.label.contains("Average") {
-                        return sensor.value;
+            if group.category == "CPU" && group.name == "CPU Package Power [RAPL]" {
+                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
+                    if sensor.label.contains("Package")
+                        || sensor.label.contains("CPU")
+                        || sensor.label.contains("Average")
+                    {
+                        return Some(sensor.value);
                     }
                 }
             }
         }
-        0.0
+        None
     }
 
-    pub fn get_gpu_power(&self) -> f32 {
+    pub fn get_gpu_power(&self) -> Option<f32> {
         for group in &self.groups {
             if group.category == "GPU" {
-                for sensor in &group.sensors {
+                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
                     if sensor.label.contains("Power") || sensor.unit == "W" {
-                        return sensor.value;
+                        return Some(sensor.value);
                     }
                 }
             }
         }
-        0.0
+        None
     }
 
     pub fn get_gpu_core_clock(&self) -> Option<u32> {
         for group in &self.groups {
             if group.category == "GPU" {
-                for sensor in &group.sensors {
+                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
                     if sensor.label == "GPU Clock" {
                         return Some(sensor.value as u32);
                     }
@@ -194,7 +207,7 @@ impl HwMonitorData {
     pub fn get_gpu_mem_clock(&self) -> Option<u32> {
         for group in &self.groups {
             if group.category == "GPU" {
-                for sensor in &group.sensors {
+                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
                     if sensor.label == "Memory Clock" {
                         return Some(sensor.value as u32);
                     }
@@ -207,7 +220,7 @@ impl HwMonitorData {
     pub fn get_gpu_fan_speed(&self) -> Option<u8> {
         for group in &self.groups {
             if group.category == "GPU" {
-                for sensor in &group.sensors {
+                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
                     if sensor.label == "Fan Speed" {
                         return Some(sensor.value as u8);
                     }
@@ -225,18 +238,6 @@ impl HwMonitorData {
             .map(|khz| khz / 1000)
     }
 
-    pub fn get_all_cpu_freqs(&self) -> Vec<u32> {
-        let mut freqs = Vec::new();
-        for group in &self.groups {
-            if group.category == "CPU" && group.name == "Frequencies" {
-                for sensor in &group.sensors {
-                    freqs.push(sensor.value as u32);
-                }
-            }
-        }
-        freqs
-    }
-
     pub fn get_gpu_name(&self) -> String {
         for group in &self.groups {
             if group.category == "GPU" {
@@ -246,38 +247,39 @@ impl HwMonitorData {
         "Unknown GPU".to_string()
     }
 
-    pub fn get_vram_usage_gb(&self) -> f32 {
+    pub fn get_vram_usage_gb(&self) -> Option<f32> {
         for group in &self.groups {
             if group.category == "GPU" {
-                for sensor in &group.sensors {
+                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
                     if sensor.label.contains("VRAM Used") || sensor.label.contains("Memory Used") {
                         if sensor.unit == "MiB" {
-                            return sensor.value / 1024.0;
+                            return Some(sensor.value / 1024.0);
                         } else if sensor.unit == "GiB" {
-                            return sensor.value;
+                            return Some(sensor.value);
                         }
                     }
                 }
             }
         }
-        0.0
+        None
     }
-    
-    pub fn get_vram_total_gb(&self) -> f32 {
+
+    pub fn get_vram_total_gb(&self) -> Option<f32> {
         for group in &self.groups {
             if group.category == "GPU" {
-                for sensor in &group.sensors {
-                    if sensor.label.contains("VRAM Total") || sensor.label.contains("Memory Total") {
+                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
+                    if sensor.label.contains("VRAM Total") || sensor.label.contains("Memory Total")
+                    {
                         if sensor.unit == "MiB" {
-                            return sensor.value / 1024.0;
+                            return Some(sensor.value / 1024.0);
                         } else if sensor.unit == "GiB" {
-                            return sensor.value;
+                            return Some(sensor.value);
                         }
                     }
                 }
             }
         }
-        0.0
+        None
     }
 }
 
@@ -323,6 +325,12 @@ impl HwCollector {
 
     /// Merge new readings into `self.data`, preserving existing sensor history.
     fn merge(&mut self, readings: Vec<(&'static str, String, Vec<Reading>)>) {
+        // Preserve history, but never present an old reading as a current one.
+        for group in &mut self.data.groups {
+            for sensor in &mut group.sensors {
+                sensor.value = f32::NAN;
+            }
+        }
         for (category, group_name, sensors) in readings {
             // Match on (category, name), not name alone — two categories can
             // legitimately expose the same group name (e.g. "coretemp" under
@@ -379,7 +387,7 @@ fn collect_all(
     let mut out: Vec<GroupReading> = Vec::new();
 
     let topo = crate::cpu_park::detect_topology();
-    
+
     // Dynamic hwmon discovery covers CPU, GPU (amdgpu), Memory (spd5118), Storage (nvme), Network (r8/igb/etc), System
     out.extend(collect_all_hwmon(&topo));
 
@@ -408,51 +416,57 @@ fn collect_all(
 fn collect_all_hwmon(topo: &crate::cpu_park::CpuTopology) -> Vec<GroupReading> {
     let core_id_map = build_core_id_to_cpu_map();
 
-    let mut groups = collect_hwmon_where(|_| true, |path, hw_name| {
-        // Dynamic categorization based on known driver prefixes or path content
-        if hw_name == "k10temp" || hw_name == "zenpower" || hw_name == "coretemp" {
-            let label = match hw_name {
-                "k10temp" => "AMD CPU [k10temp]",
-                "zenpower" => "AMD CPU [zenpower]",
-                _ => "Intel CPU [coretemp]",
-            };
-            return ("CPU", label.to_string());
-        }
-        
-        if hw_name == "spd5118" || hw_name == "ee1004" {
-            return ("Memory", dimm_slot_name(path));
-        }
-        
-        if hw_name == "nvme" {
-            let model = read_trimmed(&path.join("device/model"))
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "NVMe".into());
-            return ("Storage", model);
-        }
-        
-        if hw_name.starts_with("amdgpu") || hw_name.starts_with("nouveau") {
-            return ("GPU", format!("{} GPU", hw_name));
-        }
-        
-        if hw_name.starts_with("r8")
-            || hw_name.starts_with("atlantic")
-            || hw_name.starts_with("igb")
-            || hw_name.starts_with("ixgbe")
-            || hw_name.starts_with("e1000")
-        {
-            let iface = nic_interface_name(path).unwrap_or_else(|| hw_name.to_string());
-            return ("Network", format!("NIC [{iface}]"));
-        }
+    let mut groups = collect_hwmon_where(
+        |_| true,
+        |path, hw_name| {
+            // Dynamic categorization based on known driver prefixes or path content
+            if hw_name == "k10temp" || hw_name == "zenpower" || hw_name == "coretemp" {
+                let label = match hw_name {
+                    "k10temp" => "AMD CPU [k10temp]",
+                    "zenpower" => "AMD CPU [zenpower]",
+                    _ => "Intel CPU [coretemp]",
+                };
+                return ("CPU", label.to_string());
+            }
 
-        // Generic fallback for unknown hardware (motherboard sensors like nct6775, etc.)
-        ("System", format!("Sensor [{}]", hw_name))
-    });
+            if hw_name == "spd5118" || hw_name == "ee1004" {
+                return ("Memory", dimm_slot_name(path));
+            }
+
+            if hw_name == "nvme" {
+                let model = read_trimmed(&path.join("device/model"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| "NVMe".into());
+                return ("Storage", model);
+            }
+
+            if hw_name.starts_with("amdgpu") || hw_name.starts_with("nouveau") {
+                return ("GPU", format!("{} GPU", hw_name));
+            }
+
+            if hw_name.starts_with("r8")
+                || hw_name.starts_with("atlantic")
+                || hw_name.starts_with("igb")
+                || hw_name.starts_with("ixgbe")
+                || hw_name.starts_with("e1000")
+            {
+                let iface = nic_interface_name(path).unwrap_or_else(|| hw_name.to_string());
+                return ("Network", format!("NIC [{iface}]"));
+            }
+
+            // Generic fallback for unknown hardware (motherboard sensors like nct6775, etc.)
+            ("System", format!("Sensor [{}]", hw_name))
+        },
+    );
 
     // Remap CPU core labels like the original did
     for (cat, _name, sensors) in &mut groups {
         if *cat == "CPU" {
             for (label, _unit, _value) in sensors.iter_mut() {
-                if let Some(core_id) = label.strip_prefix("Core ").and_then(|s| s.parse::<u32>().ok()) {
+                if let Some(core_id) = label
+                    .strip_prefix("Core ")
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
                     if let Some(&cpu_num) = core_id_map.get(&core_id) {
                         let kind = core_kind_suffix(topo, cpu_num);
                         *label = intern(format!("CPU {cpu_num}{kind}"));
@@ -653,38 +667,38 @@ fn collect_nvidia_nvml() -> Vec<GroupReading> {
         let temp = dev
             .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
             .map(|t| t as f32)
-            .unwrap_or(0.0);
+            .unwrap_or(f32::NAN);
         let power = dev
             .power_usage()
             .map(|mw| mw as f32 / 1000.0)
-            .unwrap_or(0.0);
+            .unwrap_or(f32::NAN);
         let g_clk = dev
             .clock_info(nvml_wrapper::enum_wrappers::device::Clock::Graphics)
             .map(|mhz| mhz as f32)
-            .unwrap_or(0.0);
+            .unwrap_or(f32::NAN);
         let m_clk = dev
             .clock_info(nvml_wrapper::enum_wrappers::device::Clock::Memory)
             .map(|mhz| mhz as f32)
-            .unwrap_or(0.0);
+            .unwrap_or(f32::NAN);
 
         let (g_util, m_util) = dev
             .utilization_rates()
             .map(|u| (u.gpu as f32, u.memory as f32))
-            .unwrap_or((0.0, 0.0));
+            .unwrap_or((f32::NAN, f32::NAN));
 
         let mem = dev.memory_info();
         let m_used = mem
             .as_ref()
             .map(|m| m.used as f32 / (1024.0 * 1024.0 * 1024.0))
-            .unwrap_or(0.0);
+            .unwrap_or(f32::NAN);
         let m_total = mem
             .as_ref()
             .map(|m| m.total as f32 / (1024.0 * 1024.0 * 1024.0))
-            .unwrap_or(0.0);
-            
-        let fan_speed = dev.fan_speed(0).unwrap_or(0);
+            .unwrap_or(f32::NAN);
 
-        let mut sensors: Vec<Reading> = vec![
+        let fan_speed = dev.fan_speed(0).map(|v| v as f32).unwrap_or(f32::NAN);
+
+        let sensors: Vec<Reading> = vec![
             ("Temperature", "°C", temp),
             ("GPU Load", "%", g_util),
             ("Memory Usage", "%", m_util),
@@ -693,7 +707,7 @@ fn collect_nvidia_nvml() -> Vec<GroupReading> {
             ("Memory Clock", "MHz", m_clk),
             ("VRAM Used", "GiB", m_used),
             ("VRAM Total", "GiB", m_total),
-            ("Fan Speed", "%", fan_speed as f32),
+            ("Fan Speed", "%", fan_speed),
         ];
 
         groups.push(("GPU", intern(&gpu_name).to_string(), sensors));
@@ -746,6 +760,13 @@ fn rapl_watts(prev_uj: u64, now_uj: u64, max_uj: u64, dt_secs: f64) -> Option<f3
 }
 
 fn collect_rapl_power() -> Vec<GroupReading> {
+    if let Some(watts) = crate::sensor_data::read().ok().and_then(|s| s.cpu_power_w) {
+        return vec![(
+            "CPU",
+            "CPU Package Power [RAPL]".into(),
+            vec![("Package total", "W", watts)],
+        )];
+    }
     use std::sync::Mutex;
     use std::time::Instant;
 
@@ -1168,6 +1189,32 @@ fn intern(s: impl Into<String>) -> &'static str {
     leaked
 }
 
+/// Map physical core_id → lowest logical CPU number.
+fn build_core_id_to_cpu_map() -> HashMap<u32, u32> {
+    let mut map: HashMap<u32, u32> = HashMap::new();
+    let cpu_dir = Path::new("/sys/devices/system/cpu");
+    if let Ok(entries) = std::fs::read_dir(cpu_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            if let Some(cpu_num) = s.strip_prefix("cpu").and_then(|n| n.parse::<u32>().ok()) {
+                let core_path = entry.path().join("topology/core_id");
+                if let Some(core_id) = read_u64(&core_path).map(|v| v as u32) {
+                    // Keep the lowest CPU number for each core_id
+                    map.entry(core_id)
+                        .and_modify(|existing| {
+                            if cpu_num < *existing {
+                                *existing = cpu_num;
+                            }
+                        })
+                        .or_insert(cpu_num);
+                }
+            }
+        }
+    }
+    map
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1211,30 +1258,4 @@ mod tests {
         // Unknown labels passed through verbatim
         assert_eq!(pretty_rapl_label("custom-zone"), "custom-zone");
     }
-}
-
-/// Map physical core_id → lowest logical CPU number.
-fn build_core_id_to_cpu_map() -> HashMap<u32, u32> {
-    let mut map: HashMap<u32, u32> = HashMap::new();
-    let cpu_dir = Path::new("/sys/devices/system/cpu");
-    if let Ok(entries) = std::fs::read_dir(cpu_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let s = name.to_string_lossy();
-            if let Some(cpu_num) = s.strip_prefix("cpu").and_then(|n| n.parse::<u32>().ok()) {
-                let core_path = entry.path().join("topology/core_id");
-                if let Some(core_id) = read_u64(&core_path).map(|v| v as u32) {
-                    // Keep the lowest CPU number for each core_id
-                    map.entry(core_id)
-                        .and_modify(|existing| {
-                            if cpu_num < *existing {
-                                *existing = cpu_num;
-                            }
-                        })
-                        .or_insert(cpu_num);
-                }
-            }
-        }
-    }
-    map
 }

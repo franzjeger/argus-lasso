@@ -26,7 +26,7 @@ impl ProBalanceTab {
     /// Plain-language summary of the thresholds, for the status card.
     fn summary(&self) -> String {
         format!(
-            "Throttles processes above {:.0}% CPU for {:.0} s · restores below {:.0}%",
+            "Per-process CPU: throttle above {:.0}% for {:.0} s · restore below {:.0}%",
             self.cfg.cpu_threshold_percent,
             self.cfg.consecutive_seconds,
             self.cfg.restore_threshold_percent
@@ -167,7 +167,11 @@ impl ProBalanceTab {
         }
 
         // ── Throttling and restore ────────────────────────────────────────
-        th::card(ui, "Throttling and restore", |ui| {
+        let max_process_cpu = crate::utils::get_cpu_count().max(1) as f32 * 100.0;
+        let throttle_max = max_process_cpu.max(self.cfg.cpu_threshold_percent);
+        let restore_max = max_process_cpu.max(self.cfg.restore_threshold_percent);
+        th::card_hinted(ui, "Throttling and restore",
+            "Per-process scale: 100% = one logical CPU fully busy; 200% = two. Overall CPU pressure is not checked before lowering priority.", |ui| {
             egui::Grid::new("pb_thresholds")
                 .num_columns(2)
                 .min_row_height(tokens::ROW_H)
@@ -195,7 +199,7 @@ impl ProBalanceTab {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::DragValue::new(&mut self.cfg.cpu_threshold_percent)
-                                .range(10.0f32..=100.0)
+                                .range(10.0f32..=throttle_max)
                                 .suffix(" %"),
                         );
                         weak(ui, "for");
@@ -223,7 +227,7 @@ impl ProBalanceTab {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::DragValue::new(&mut self.cfg.restore_threshold_percent)
-                                .range(1.0f32..=99.0)
+                                .range(1.0f32..=restore_max)
                                 .suffix(" %"),
                         );
                         weak(ui, "for");
@@ -264,7 +268,7 @@ impl ProBalanceTab {
         // ── Exempt processes (chips) ──────────────────────────────────────
         th::card(ui, "Exempt processes", |ui| {
             ui.label(
-                RichText::new("Processes whose name or command line contains one of these patterns are never throttled.")
+                RichText::new("Processes whose name contains one of these patterns are never throttled.")
                     .size(tokens::FONT_HELP)
                     .color(ui.visuals().weak_text_color()),
             );
@@ -401,4 +405,3 @@ fn add_chip(ui: &mut Ui, label: &str) -> bool {
     .corner_radius(egui::CornerRadius::same(9));
     ui.add(btn).clicked()
 }
-

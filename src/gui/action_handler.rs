@@ -1,5 +1,3 @@
-use crossbeam_channel::Sender;
-use eframe::egui;
 use std::sync::{Arc, Mutex};
 
 use crate::gui::detail_window::DetailWindow;
@@ -7,8 +5,7 @@ use crate::gui::dialog_manager::DialogManager;
 use crate::gui::dialogs::{AffinityDialog, IoNiceDialog, NiceDialog};
 use crate::gui::process_tab::PendingKill;
 use crate::gui::process_tab::TableAction;
-use crate::monitor::{AppState, DaemonCmd, ProcInfo};
-use crate::rules::RuleEngine;
+use crate::monitor::{AppState, ProcInfo};
 
 pub struct ActionHandler;
 
@@ -26,6 +23,8 @@ impl ActionHandler {
         result
     }
 
+    // One dispatch point borrows the existing UI state without duplicating ownership.
+    #[allow(clippy::too_many_arguments)]
     pub fn handle(
         action: TableAction,
         snapshot: &[ProcInfo],

@@ -8,7 +8,18 @@ use crate::gui::theme::{self, AppTheme};
 use crate::utils::cpuset_to_cpulist;
 use egui::Ui;
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum SettingsSection {
+    #[default]
+    Appearance,
+    Processes,
+    Power,
+    Notifications,
+    Startup,
+}
+
 pub struct SettingsTab {
+    pub section: SettingsSection,
     pub config: Config,
     /// Snapshot of the last-saved config — drives the dirty indicator and Discard.
     pub saved: Config,
@@ -47,6 +58,7 @@ impl SettingsTab {
         let governor = read_governor();
         let epp = read_epp();
         Self {
+            section: SettingsSection::default(),
             default_affinity_text: current_affinity,
             default_affinity_enabled,
             cpu_dialog: None,
@@ -93,7 +105,7 @@ impl SettingsTab {
             || a.monitor.display_refresh_interval_ms != b.monitor.display_refresh_interval_ms
             || a.monitor.rule_enforce_interval_ms != b.monitor.rule_enforce_interval_ms
             || a.ui.notifications_enabled != b.ui.notifications_enabled
-            || a.ui.global_overlay != b.ui.global_overlay
+            || a.ui.check_updates_on_start != b.ui.check_updates_on_start
             || a.hw_alerts.enabled != b.hw_alerts.enabled
             || (a.hw_alerts.temp_threshold_celsius - b.hw_alerts.temp_threshold_celsius).abs()
                 > 0.01
@@ -193,14 +205,26 @@ impl SettingsTab {
     ) -> Option<Config> {
         let mut applied: Option<Config> = None;
 
+        crate::gui::theme::section_nav(
+            ui,
+            &mut self.section,
+            &[
+                (SettingsSection::Appearance, "Appearance"),
+                (SettingsSection::Processes, "Processes"),
+                (SettingsSection::Power, "CPU power"),
+                (SettingsSection::Notifications, "Notifications"),
+                (SettingsSection::Startup, "Startup & updates"),
+            ],
+        );
         // Reserve room for the apply bar, then scroll everything above it.
         let bar_h = 44.0;
         let body_h = (ui.available_height() - bar_h).max(120.0);
         egui::ScrollArea::vertical()
-            .id_salt("settings_body")
+            .id_salt(("settings_body", self.section as u8))
             .max_height(body_h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if self.section == SettingsSection::Processes {
                 // ── Default CPU affinity ──────────────────────────────────────────
                 theme::card(ui, "Default CPU affinity", |ui| {
                     let help = if self.topo.has_asymmetry() {
@@ -264,7 +288,7 @@ impl SettingsTab {
                                 self.default_affinity_enabled = true;
                             }
                         }
-                        if theme::chip(ui, "All cores", on && current.is_empty()) {
+                        if theme::chip(ui, "All CPU threads", on && current.is_empty()) {
                             self.default_affinity_text = String::new();
                             self.default_affinity_enabled = true;
                         }
@@ -292,7 +316,7 @@ impl SettingsTab {
                     );
                     ui.add_space(tokens::SPACE_S);
 
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Rule enforce interval", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Apply rules every", |ui| {
                         ui.add(
                             egui::DragValue::new(&mut self.config.monitor.rule_enforce_interval_ms)
                                 .range(100..=10000)
@@ -300,7 +324,7 @@ impl SettingsTab {
                         );
                     });
 
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Display refresh", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Refresh process list", |ui| {
                         const PICKS: [u64; 4] = [500, 1000, 2000, 5000];
                         let sel = PICKS
                             .iter()
@@ -314,12 +338,13 @@ impl SettingsTab {
 
                 ui.add_space(tokens::SPACE_M);
 
+                }
+                if self.section == SettingsSection::Appearance {
                 // ── Appearance and power ──────────────────────────────────────────
-                theme::card(ui, "Appearance and power", |ui| {
+                theme::card(ui, "Appearance", |ui| {
                     help_text(
                         ui,
-                        "Theme and window opacity preview live as you change them. \
-                 Governor and energy preference are written to sysfs on apply.",
+                        "Theme and window opacity are saved immediately. Game overlay appearance is in Gaming → Overlay.",
                     );
                     ui.add_space(tokens::SPACE_S);
 
@@ -363,10 +388,15 @@ impl SettingsTab {
                         );
                     });
 
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Scaling governor", |ui| {
+                });
+                }
+                if self.section == SettingsSection::Power {
+                theme::card(ui, "CPU power management", |ui| {
+                    help_text(ui, "Controls CPU frequency policy and the balance between performance and energy use. Changes take effect with Apply changes.");
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Frequency policy (governor)", |ui| {
                         if self.available_governors.is_empty() {
                             ui.label(
-                                egui::RichText::new("(not available)")
+                                egui::RichText::new("Unavailable on this system")
                                     .italics()
                                     .color(ui.visuals().weak_text_color()),
                             );
@@ -385,10 +415,10 @@ impl SettingsTab {
                         }
                     });
 
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Energy perf. preference", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Energy preference (EPP)", |ui| {
                         if self.available_epps.is_empty() {
                             ui.label(
-                                egui::RichText::new("(not available)")
+                                egui::RichText::new("Unavailable on this system")
                                     .italics()
                                     .color(ui.visuals().weak_text_color()),
                             );
@@ -414,47 +444,20 @@ impl SettingsTab {
 
                 ui.add_space(tokens::SPACE_M);
 
+                }
+                if self.section == SettingsSection::Notifications {
                 // ── Notifications and startup ─────────────────────────────────────
-                theme::card(ui, "Notifications and startup", |ui| {
+                theme::card(ui, "Desktop notifications", |ui| {
                     help_text(
                         ui,
                         "Desktop notifications cover ProBalance throttling, hardware alerts \
-                 and kill events.",
+                 and process termination.",
                     );
                     ui.add_space(tokens::SPACE_S);
 
                     crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Desktop notifications", |ui| {
                         ui.checkbox(&mut self.config.ui.notifications_enabled, "Enabled");
                     });
-
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Global Vulkan Overlay", |ui| {
-                        if ui.checkbox(&mut self.config.ui.global_overlay, "Inject overlay into all Vulkan games automatically").changed() {
-                            let config_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share/vulkan/implicit_layer.d");
-                            let layer_file = config_dir.join("ArgusOverlay.json");
-                            if self.config.ui.global_overlay {
-                                let _ = std::fs::create_dir_all(&config_dir);
-                                let manifest = format!(
-r#"{{
-    "file_format_version" : "1.0.0",
-    "layer" : {{
-        "name": "VK_LAYER_ARGUS_OVERLAY",
-        "type": "GLOBAL",
-        "library_path": "{}/.local/share/vulkan/explicit_layer.d/libargus_layer.so",
-        "api_version": "1.3.200",
-        "implementation_version": "1",
-        "description": "Argus-Lasso Native FPS Overlay Layer",
-        "disable_environment": {{
-            "DISABLE_ARGUS_OVERLAY": "1"
-        }}
-    }}
-}}"#, std::env::var("HOME").unwrap_or_default());
-                                let _ = std::fs::write(&layer_file, manifest);
-                            } else {
-                                let _ = std::fs::remove_file(&layer_file);
-                            }
-                        }
-                    });
-
 
                     crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Temperature alerts", |ui| {
                         ui.checkbox(&mut self.config.hw_alerts.enabled, "Enabled");
@@ -482,6 +485,10 @@ r#"{{
                         });
                     });
 
+                });
+                }
+                if self.section == SettingsSection::Startup {
+                theme::card(ui, "Startup", |ui| {
                     crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Start with session", |ui| {
                         ui.checkbox(
                             &mut self.autostart_enabled,
@@ -564,6 +571,7 @@ r#"{{
                     });
                 });
 
+                }
                 if !self.status.is_empty() {
                     ui.add_space(tokens::SPACE_S);
                     ui.colored_label(ui.visuals().weak_text_color(), &self.status);
@@ -583,7 +591,6 @@ r#"{{
         applied
     }
 }
-
 
 /// Weak, small help line under a group title (§7).
 fn help_text(ui: &mut Ui, text: &str) {

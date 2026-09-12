@@ -7,6 +7,46 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- Transparent Vulkan graphics HUD with 14 px default text, per-value colors,
+  compact logical-CPU columns, independent background opacity and live settings.
+- Versioned IPC with build identification, configuration replay, private runtime
+  and Steam-visible home sockets, and explicit disconnected/stale telemetry.
+- Per-present frame recording, bounded background CSV writer, documented AVG,
+  1% low and p99 calculations, recording UI and optional desktop portal shortcut.
+- Optional sandboxed sensor service for measured RAPL package power and cached
+  configured RAM speed, with system authentication from Gaming → Sensors.
+- Separate Gaming and Settings subsections, detached customization/detail windows,
+  launcher/profile context, shared spacing and typography, and current guides/gallery.
+- Paired user installer and future release archives containing app/layer/helper;
+  workspace-wide build, lint, test and minimum-Rust checks.
+
+### Fixed
+
+- Wrong installed overlay library selection, silent IPC schema mismatch and missed
+  initial configuration; missing sensors no longer masquerade as measured zeroes.
+- Per-frame rasterization after the old frame deque saturated; text caching and
+  sampling now have separate frequencies from drawing and frame collection.
+- Slow graph refresh: independent default 60 Hz update with spike-preserving history.
+- Gaming/Settings edits overwriting each other's newer values, and an old global
+  loading toggle replacing the correct versioned manifest path.
+- Native subwindow opacity: transparent surfaces and clear color, viewport-local
+  style updates, and live inheritance for customization, details and benchmark results.
+- Long process PIDs and multicore numbers overflowing table cells: font-aware
+  minimum widths, cell clipping and horizontal scrolling for narrow windows.
+- ProBalance's misleading CPU scale: labels explain 100% = one logical CPU;
+  threshold controls now accept multicore values above 100%. The algorithm still
+  uses per-process thresholds without an overall-contention gate.
+
+### Changed
+
+- Repository renamed to `franzjeger/argus-lasso`, preserving Git history and releases.
+- Old screenshots replaced; staged investigation moved to a dated archive.
+- Validation claims distinguish native Vulkan tests from pending controlled PoE2,
+  actual DXVK/VKD3D game tests, 32-bit packaging and OpenGL support.
+
+
 ## [1.3.1] — 2026-08-23
 
 ### Added
@@ -301,31 +341,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 - Virtualized the process table; dropped per-frame clones and sysfs reads.
 
-[Unreleased]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.3.1...HEAD
-[1.3.1]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.3.0...v1.3.1
-[1.2.0]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.1.0...v1.2.0
-[1.1.0]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.0.9...v1.1.0
-[1.0.9]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.0.8...v1.0.9
-[1.0.8]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.0.7...v1.0.8
-[1.0.7]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.0.6...v1.0.7
-[1.0.6]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.0.5...v1.0.6
-[1.0.5]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.0.4...v1.0.5
-[1.0.4]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.0.3...v1.0.4
-[1.0.3]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.0.2...v1.0.3
-[1.0.2]: https://github.com/franzjeger/process-lasso-linux-rs/compare/v1.0.1...v1.0.2
-[1.0.1]: https://github.com/franzjeger/process-lasso-linux-rs/releases/tag/v1.0.1
-[#22]: https://github.com/franzjeger/process-lasso-linux-rs/pull/22
-[#23]: https://github.com/franzjeger/process-lasso-linux-rs/pull/23
-[#24]: https://github.com/franzjeger/process-lasso-linux-rs/pull/24
-[#25]: https://github.com/franzjeger/process-lasso-linux-rs/pull/25
-[#26]: https://github.com/franzjeger/process-lasso-linux-rs/pull/26
-[#27]: https://github.com/franzjeger/process-lasso-linux-rs/pull/27
-[#28]: https://github.com/franzjeger/process-lasso-linux-rs/pull/28
-[#29]: https://github.com/franzjeger/process-lasso-linux-rs/pull/29
-[#30]: https://github.com/franzjeger/process-lasso-linux-rs/pull/30
-[#31]: https://github.com/franzjeger/process-lasso-linux-rs/pull/31
-[#38]: https://github.com/franzjeger/process-lasso-linux-rs/pull/38
-[#40]: https://github.com/franzjeger/process-lasso-linux-rs/pull/40
-[#41]: https://github.com/franzjeger/process-lasso-linux-rs/pull/41
-[#53]: https://github.com/franzjeger/process-lasso-linux-rs/pull/53
-[#54]: https://github.com/franzjeger/process-lasso-linux-rs/pull/54
+[Unreleased]: https://github.com/franzjeger/argus-lasso/compare/v1.3.1...HEAD
+[1.3.1]: https://github.com/franzjeger/argus-lasso/compare/v1.3.0...v1.3.1
+[1.2.0]: https://github.com/franzjeger/argus-lasso/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/franzjeger/argus-lasso/compare/v1.0.9...v1.1.0
+[1.0.9]: https://github.com/franzjeger/argus-lasso/compare/v1.0.8...v1.0.9
+[1.0.8]: https://github.com/franzjeger/argus-lasso/compare/v1.0.7...v1.0.8
+[1.0.7]: https://github.com/franzjeger/argus-lasso/compare/v1.0.6...v1.0.7
+[1.0.6]: https://github.com/franzjeger/argus-lasso/compare/v1.0.5...v1.0.6
+[1.0.5]: https://github.com/franzjeger/argus-lasso/compare/v1.0.4...v1.0.5
+[1.0.4]: https://github.com/franzjeger/argus-lasso/compare/v1.0.3...v1.0.4
+[1.0.3]: https://github.com/franzjeger/argus-lasso/compare/v1.0.2...v1.0.3
+[1.0.2]: https://github.com/franzjeger/argus-lasso/compare/v1.0.1...v1.0.2
+[1.0.1]: https://github.com/franzjeger/argus-lasso/releases/tag/v1.0.1
+[#22]: https://github.com/franzjeger/argus-lasso/pull/22
+[#23]: https://github.com/franzjeger/argus-lasso/pull/23
+[#24]: https://github.com/franzjeger/argus-lasso/pull/24
+[#25]: https://github.com/franzjeger/argus-lasso/pull/25
+[#26]: https://github.com/franzjeger/argus-lasso/pull/26
+[#27]: https://github.com/franzjeger/argus-lasso/pull/27
+[#28]: https://github.com/franzjeger/argus-lasso/pull/28
+[#29]: https://github.com/franzjeger/argus-lasso/pull/29
+[#30]: https://github.com/franzjeger/argus-lasso/pull/30
+[#31]: https://github.com/franzjeger/argus-lasso/pull/31
+[#38]: https://github.com/franzjeger/argus-lasso/pull/38
+[#40]: https://github.com/franzjeger/argus-lasso/pull/40
+[#41]: https://github.com/franzjeger/argus-lasso/pull/41
+[#53]: https://github.com/franzjeger/argus-lasso/pull/53
+[#54]: https://github.com/franzjeger/argus-lasso/pull/54

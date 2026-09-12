@@ -95,7 +95,7 @@ impl HwMonitorTab {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    egui::RichText::new("Sparklines")
+                    egui::RichText::new("History graphs")
                         .size(tokens::FONT_LABEL)
                         .color(ui.visuals().weak_text_color()),
                 );
@@ -471,6 +471,9 @@ fn category_color(ui: &Ui, cat: &str) -> Color32 {
 }
 
 fn fmt_val(v: f32, unit: &str) -> String {
+    if !v.is_finite() {
+        return "—".into();
+    }
     match unit {
         "°C" => format!("{v:.1} °C"),
         "RPM" => format!("{v:.0} RPM"),

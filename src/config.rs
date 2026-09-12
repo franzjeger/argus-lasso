@@ -406,6 +406,42 @@ mod tests {
         assert!(cfg.rules.is_empty());
     }
 
+    #[test]
+    fn overlay_legacy_and_live_options_roundtrip() {
+        let mut cfg: Config = toml::from_str(
+            r#"
+[ui]
+opacity = 0.78
+[gaming_mode.overlay]
+scale = 2
+show_overlay = false
+offset_x = 70
+bg_color = [0, 0, 0, 0]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.ui.opacity, 0.78);
+        assert_eq!(cfg.gaming_mode.overlay.font_px, 14);
+        assert!(!cfg.gaming_mode.overlay.show_overlay);
+        let o = &mut cfg.gaming_mode.overlay;
+        o.font_px = 24;
+        o.show_graph = true;
+        o.margin = 12;
+        o.fields.gpu_fan = false;
+        o.fields.cpu_temp = false;
+        o.hidden_cpu_ids = vec![0, 7, 31];
+        o.anchor = 3;
+        o.value_colors
+            .insert(argus_ipc::OverlayMetric::GpuTemp, [255, 80, 120]);
+        o.value_colors
+            .insert(argus_ipc::OverlayMetric::ThreadFrequency, [200, 220, 255]);
+        o.section_dividers = false;
+        o.text_color = (12, 34, 56, 78);
+        o.bg_color = (1, 2, 3, 128);
+        let decoded: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(decoded.gaming_mode.overlay, cfg.gaming_mode.overlay);
+    }
+
     /// Guards the actual on-disk format, not just the in-memory types.
     #[test]
     fn the_installed_config_shape_parses() {

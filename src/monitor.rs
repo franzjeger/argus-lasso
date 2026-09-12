@@ -27,6 +27,10 @@ use crate::utils;
 #[derive(Debug)]
 pub enum DaemonCmd {
     UpdateConfig(Box<Config>),
+    GameLaunched {
+        pid: u32,
+        profile: String,
+    },
     SetGamingMode {
         active: bool,
         elevate_nice: bool,
@@ -206,54 +210,124 @@ pub fn shutdown_and_wait(state: &Arc<Mutex<AppState>>, cmd_tx: &Sender<DaemonCmd
 // ── Overlay IPC Server ────────────────────────────────────────────────────────
 
 mod ipc_server {
-    use argus_ipc::{IpcMessage, TelemetryFrame, OverlayConfig};
-    use std::os::unix::net::UnixListener;
+    use argus_ipc::IpcMessage;
     use std::io::Write;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    
-    pub struct Broadcaster {
-        clients: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
+    use std::os::unix::{
+        fs::{DirBuilderExt, PermissionsExt},
+        net::{UnixListener, UnixStream},
+    };
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+    #[derive(Default)]
+    struct Latest {
+        config: Option<Vec<u8>>,
+        telemetry: Option<Vec<u8>>,
+        generation: u64,
     }
-
+    pub struct Broadcaster {
+        latest: Arc<(Mutex<Latest>, Condvar)>,
+    }
     impl Broadcaster {
         pub fn start() -> Self {
-            let clients = Arc::new(Mutex::new(Vec::new()));
-            let clients_clone = Arc::clone(&clients);
-
-            let _ = std::fs::remove_file(argus_ipc::IPC_SOCKET_PATH);
-            if let Ok(listener) = UnixListener::bind(argus_ipc::IPC_SOCKET_PATH) {
-                thread::spawn(move || {
-                    for stream in listener.incoming() {
-                        if let Ok(stream) = stream {
-                            if let Ok(mut lock) = clients_clone.lock() {
-                                lock.push(stream);
+            let latest = Arc::new((Mutex::new(Latest::default()), Condvar::new()));
+            for path in argus_ipc::socket_paths() {
+                let shared = latest.clone();
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(parent);
+                }
+                // Do not unlink another listener (including an exempt UI-tour instance).
+                if UnixStream::connect(&path).is_ok() {
+                    log::error!("Overlay socket already has a listener: {}", path.display());
+                    continue;
+                }
+                // The process-wide flock is held before the monitor starts.
+                let _ = std::fs::remove_file(&path);
+                match UnixListener::bind(&path) {
+                    Ok(listener) => {
+                        let _ =
+                            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                        log::warn!(
+                            "Overlay IPC build={} protocol={} socket={}",
+                            argus_ipc::BUILD_ID,
+                            argus_ipc::PROTOCOL_VERSION,
+                            path.display()
+                        );
+                        std::thread::spawn(move || {
+                            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                            for mut stream in listener.incoming().flatten() {
+                                if count.load(std::sync::atomic::Ordering::Relaxed) >= 16 {
+                                    continue;
+                                }
+                                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let count = count.clone();
+                                let shared = shared.clone();
+                                std::thread::spawn(move || {
+                                    let _ =
+                                        stream.set_write_timeout(Some(Duration::from_millis(250)));
+                                    let mut cred: nix::libc::ucred = unsafe { std::mem::zeroed() };
+                                    let mut len =
+                                        std::mem::size_of_val(&cred) as nix::libc::socklen_t;
+                                    use std::os::fd::AsRawFd;
+                                    let ok = unsafe {
+                                        nix::libc::getsockopt(
+                                            stream.as_raw_fd(),
+                                            nix::libc::SOL_SOCKET,
+                                            nix::libc::SO_PEERCRED,
+                                            &mut cred as *mut _ as *mut _,
+                                            &mut len,
+                                        )
+                                    } == 0;
+                                    let hello = IpcMessage::Hello {
+                                        build: argus_ipc::BUILD_ID.into(),
+                                        protocol: argus_ipc::PROTOCOL_VERSION,
+                                        host_pid: if ok { cred.pid as u32 } else { 0 },
+                                    };
+                                    if argus_ipc::write_message(&mut stream, &hello).is_ok() {
+                                        let mut generation = u64::MAX;
+                                        loop {
+                                            let (lock, changed) = &*shared;
+                                            let mut latest = lock.lock().unwrap();
+                                            while latest.generation == generation {
+                                                latest = changed.wait(latest).unwrap();
+                                            }
+                                            generation = latest.generation;
+                                            let packets =
+                                                [latest.config.clone(), latest.telemetry.clone()];
+                                            drop(latest);
+                                            if packets
+                                                .iter()
+                                                .flatten()
+                                                .any(|packet| stream.write_all(packet).is_err())
+                                            {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                });
                             }
-                        }
+                        });
                     }
-                });
-            } else {
-                log::warn!("Failed to bind to IPC socket for overlay");
+                    Err(e) => log::error!("Overlay socket {}: {e}", path.display()),
+                }
             }
-
-            Self { clients }
+            Self { latest }
         }
-
         pub fn broadcast(&self, msg: &IpcMessage) {
-            let data = bincode::serialize(msg).unwrap();
-            let len_buf = (data.len() as u32).to_le_bytes();
-            
-            if let Ok(mut clients) = self.clients.lock() {
-                clients.retain_mut(|client| {
-                    if client.write_all(&len_buf).is_err() {
-                        return false;
-                    }
-                    if client.write_all(&data).is_err() {
-                        return false;
-                    }
-                    true
-                });
+            let Ok(packet) = argus_ipc::encode(msg) else {
+                return;
+            };
+            let mut latest = self.latest.0.lock().unwrap();
+            match msg {
+                IpcMessage::Config(_) => latest.config = Some(packet),
+                IpcMessage::Telemetry(_) => latest.telemetry = Some(packet),
+                _ => return,
             }
+            latest.generation = latest.generation.wrapping_add(1);
+            self.latest.1.notify_all();
         }
     }
 }
@@ -266,6 +340,56 @@ pub fn spawn(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         run_loop(state, cmd_rx, initial_config, rule_engine);
+    })
+}
+
+/// Read-only snapshots for screenshot QA. Never starts IPC or applies policies.
+pub fn spawn_preview(
+    state: Arc<Mutex<AppState>>,
+    cmd_rx: Receiver<DaemonCmd>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut hw = HwCollector::new();
+        let mut times = HashMap::new();
+        let mut total = 0;
+        let mut caches = SnapshotCaches::default();
+        let mut last = Instant::now();
+        loop {
+            let elapsed = last.elapsed().as_secs_f32().max(0.001);
+            last = Instant::now();
+            let (snapshot, next_times, next_total) =
+                collect_snapshot(&mut times, total, &mut caches, true, elapsed);
+            times = next_times;
+            total = next_total;
+            hw.update();
+            let cpus = collect_cpu_percents();
+            if let Ok(mut s) = state.lock() {
+                s.snapshot = Arc::new(snapshot);
+                s.cpu_avg = cpus.iter().sum::<f32>() / cpus.len().max(1) as f32;
+                s.cpu_percents = cpus;
+                s.cpu_generation += 1;
+                let avg = s.cpu_avg;
+                s.cpu_history.push_back(avg);
+                if s.cpu_history.len() > 120 {
+                    s.cpu_history.pop_front();
+                }
+                s.hw_monitor = hw.data.clone();
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match cmd_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(DaemonCmd::Shutdown)
+                    | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        if let Ok(mut s) = state.lock() {
+                            s.shutdown_complete = true;
+                        }
+                        return;
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                    _ => {} // Read-only: deliberately ignore all policy commands.
+                }
+            }
+        }
     })
 }
 
@@ -300,13 +424,22 @@ fn get_ram_speed_mts() -> Option<u32> {
     use std::sync::OnceLock;
     static RAM_SPEED: OnceLock<Option<u32>> = OnceLock::new();
     *RAM_SPEED.get_or_init(|| {
-        let out = std::process::Command::new("dmidecode").arg("-t").arg("memory").output().ok()?;
+        let out = std::process::Command::new("dmidecode")
+            .arg("-t")
+            .arg("memory")
+            .output()
+            .ok()?;
         let s = String::from_utf8_lossy(&out.stdout);
         for line in s.lines() {
             if line.contains("Configured Memory Speed:") && !line.contains("Unknown") {
                 let parts: Vec<&str> = line.split(':').collect();
                 if parts.len() == 2 {
-                    if let Ok(mts) = parts[1].trim().split_whitespace().next().unwrap_or("").parse::<u32>() {
+                    if let Ok(mts) = parts[1]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .parse::<u32>()
+                    {
                         return Some(mts);
                     }
                 }
@@ -314,6 +447,50 @@ fn get_ram_speed_mts() -> Option<u32> {
         }
         None
     })
+}
+
+fn sensor_access_status(path: &str) -> String {
+    match std::fs::File::open(path) {
+        Ok(_) => "available".into(),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => "permission denied".into(),
+        Err(_) => "unsupported/unavailable".into(),
+    }
+}
+fn logical_cpus(usages: &[f32]) -> Vec<argus_ipc::LogicalCpu> {
+    let mut cpus = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(id) = name.strip_prefix("cpu").and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            let read = |file: &str| {
+                std::fs::read_to_string(entry.path().join(file))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+            };
+            let online = read("online").unwrap_or(1) != 0;
+            cpus.push(argus_ipc::LogicalCpu {
+                id,
+                package_id: read("topology/physical_package_id"),
+                core_id: read("topology/core_id"),
+                online,
+                usage: if online {
+                    usages.get(id as usize).map(|v| *v as u8)
+                } else {
+                    None
+                },
+                frequency_mhz: if online {
+                    read("cpufreq/scaling_cur_freq").map(|v| v / 1000)
+                } else {
+                    None
+                },
+            });
+        }
+    }
+    cpus.sort_by_key(|c| c.id);
+    cpus
 }
 
 fn get_ram_info() -> (f32, f32) {
@@ -324,12 +501,14 @@ fn get_ram_info() -> (f32, f32) {
             if line.starts_with("MemTotal:") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() > 1 {
-                    mem_total = parts[1].parse::<f32>().unwrap_or(0.0) / (1024.0 * 1024.0); // GiB
+                    mem_total = parts[1].parse::<f32>().unwrap_or(0.0) / (1024.0 * 1024.0);
+                    // GiB
                 }
             } else if line.starts_with("MemAvailable:") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() > 1 {
-                    mem_available = parts[1].parse::<f32>().unwrap_or(0.0) / (1024.0 * 1024.0); // GiB
+                    mem_available = parts[1].parse::<f32>().unwrap_or(0.0) / (1024.0 * 1024.0);
+                    // GiB
                 }
             }
         }
@@ -346,7 +525,9 @@ fn run_loop(
 ) {
     let mut config = initial_config;
     let ipc = ipc_server::Broadcaster::start();
-    ipc.broadcast(&argus_ipc::IpcMessage::Config(config.gaming_mode.overlay.clone()));
+    ipc.broadcast(&argus_ipc::IpcMessage::Config(
+        config.gaming_mode.overlay.clone(),
+    ));
 
     // Build closures that push log messages into shared state
     let state_log = state.clone();
@@ -358,6 +539,10 @@ fn run_loop(
 
     let mut probalance = ProBalance::new(config.probalance.clone());
     let mut hw_collector = HwCollector::new();
+    let mut last_sensors = Instant::now() - Duration::from_secs(1);
+    let mut cpu_percents = Vec::new();
+    let mut avg = 0.0;
+
     let log_cb2 = log_cb.clone();
     probalance.set_log_callback(log_cb2);
 
@@ -390,6 +575,7 @@ fn run_loop(
     let mut manual_overrides: HashMap<u32, Instant> = HashMap::new();
     // Gaming Mode nice tracking: pid → original nice before we elevated
     let mut gaming_mode = false;
+    let mut launch_profiles = Vec::<argus_ipc::LaunchProfile>::new();
     let mut gaming_elevate_nice = false;
     let mut gaming_niced: HashMap<u32, i32> = HashMap::new();
     // Did WE auto-enable Gaming Mode? (never auto-disable a manual activation)
@@ -420,11 +606,23 @@ fn run_loop(
         // ── Drain commands from GUI ─────────────────────────────────────────
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
+                DaemonCmd::GameLaunched { pid, profile } => {
+                    if let Some(stat) = crate::fast_proc::read_stat(pid, &mut [0; 1024]) {
+                        launch_profiles.retain(|p| p.pid != pid);
+                        launch_profiles.push(argus_ipc::LaunchProfile {
+                            pid,
+                            start_ticks: stat.starttime,
+                            profile,
+                        });
+                    }
+                }
                 DaemonCmd::UpdateConfig(cfg) => {
                     let cfg = *cfg;
                     probalance.update_config(cfg.probalance.clone());
                     config = cfg.clone();
-                    ipc.broadcast(&argus_ipc::IpcMessage::Config(config.gaming_mode.overlay.clone()));
+                    ipc.broadcast(&argus_ipc::IpcMessage::Config(
+                        config.gaming_mode.overlay.clone(),
+                    ));
                     log_cb(format!(
                         "Config updated — ProBalance: {}  |  Notifications: {}",
                         if config.probalance.enabled {
@@ -718,22 +916,9 @@ fn run_loop(
             last_pb = now;
         }
 
-        // ── Snapshot emit every display_refresh_interval ───────────────────
-        let refresh = Duration::from_millis(config.monitor.display_refresh_interval_ms);
-        if now.duration_since(last_snapshot) >= refresh {
-            let throttled = probalance.throttled_pids();
-            let pb_snap_for_infos: Vec<crate::probalance::ProcSnapshot> = raw_snapshot
-                .iter()
-                .map(|p| crate::probalance::ProcSnapshot {
-                    pid: p.pid,
-                    name: p.name.clone(),
-                    cpu_percent: p.cpu_percent,
-                    nice: p.nice,
-                })
-                .collect();
-            let throttle_infos = probalance.throttle_infos(&pb_snap_for_infos);
-            let cpu_percents = collect_cpu_percents();
-            let avg = if cpu_percents.is_empty() {
+        if now.duration_since(last_sensors) >= Duration::from_secs(1) {
+            cpu_percents = collect_cpu_percents();
+            avg = if cpu_percents.is_empty() {
                 0.0
             } else {
                 cpu_percents.iter().sum::<f32>() / cpu_percents.len() as f32
@@ -770,40 +955,90 @@ fn run_loop(
             let gpu_temp = hw_collector.data.get_gpu_temp();
             let cpu_temp = hw_collector.data.get_cpu_temp();
             let gpu_power = hw_collector.data.get_gpu_power();
-            let cpu_power = hw_collector.data.get_cpu_power();
+            let extended = crate::sensor_data::read().ok();
+            let cpu_power = extended
+                .as_ref()
+                .and_then(|s| s.cpu_power_w)
+                .or_else(|| hw_collector.data.get_cpu_power());
             let gpu_name = hw_collector.data.get_gpu_name();
             let cpu_name = get_cpu_name();
             let (ram_used, ram_total) = get_ram_info();
             let vram_used = hw_collector.data.get_vram_usage_gb();
             let vram_total = hw_collector.data.get_vram_total_gb();
-            
-            ipc.broadcast(&argus_ipc::IpcMessage::Telemetry(argus_ipc::TelemetryFrame {
-                cpu_name,
-                cpu_usage_percent: avg as u8,
-                cpu_temp_c: cpu_temp,
-                cpu_power_w: cpu_power,
-                gpu_name,
-                gpu_usage_percent: gpu_usage,
-                gpu_temp_c: gpu_temp,
-                gpu_power_w: gpu_power,
-                gpu_core_clock_mhz: hw_collector.data.get_gpu_core_clock(),
-                gpu_mem_clock_mhz: hw_collector.data.get_gpu_mem_clock(),
-                gpu_fan_speed_percent: hw_collector.data.get_gpu_fan_speed(),
-                cpu_freq_mhz: hw_collector.data.get_cpu_freq(),
-                ram_speed_mts: get_ram_speed_mts(),
-                ram_used_gb: ram_used,
-                ram_total_gb: ram_total,
-                vram_used_gb: vram_used,
-                vram_total_gb: vram_total,
-                active_profile,
-                parked_cores,
-                core_usages: cpu_percents.iter().map(|&v| v as u8).collect(),
-                core_freqs: hw_collector.data.get_all_cpu_freqs(),
-            }));
+
+            ipc.broadcast(&argus_ipc::IpcMessage::Telemetry(
+                argus_ipc::TelemetryFrame {
+                    cpu_name,
+                    cpu_usage_percent: avg as u8,
+                    cpu_temp_c: cpu_temp,
+                    cpu_power_w: cpu_power,
+                    gpu_name,
+                    gpu_usage_percent: gpu_usage,
+                    gpu_temp_c: gpu_temp,
+                    gpu_power_w: gpu_power,
+                    gpu_core_clock_mhz: hw_collector.data.get_gpu_core_clock(),
+                    gpu_mem_clock_mhz: hw_collector.data.get_gpu_mem_clock(),
+                    gpu_fan_speed_percent: hw_collector.data.get_gpu_fan_speed(),
+                    cpu_freq_mhz: hw_collector.data.get_cpu_freq(),
+                    ram_speed_mts: extended
+                        .as_ref()
+                        .and_then(|s| s.ram_speed_mts)
+                        .or_else(get_ram_speed_mts),
+                    ram_used_gb: ram_used,
+                    ram_total_gb: ram_total,
+                    vram_used_gb: vram_used,
+                    vram_total_gb: vram_total,
+                    active_profile,
+                    game: None,
+                    launch_profiles: {
+                        launch_profiles.retain(|p| {
+                            crate::fast_proc::read_stat(p.pid, &mut [0; 1024])
+                                .is_some_and(|s| s.starttime == p.start_ticks)
+                        });
+                        launch_profiles.clone()
+                    },
+                    probalance_pids: probalance.throttled_pids().into_iter().collect(),
+                    parked_cores,
+                    cpus: logical_cpus(&cpu_percents),
+                    sample_unix_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    sample_interval_ms: 1000,
+                    cpu_power_status: extended
+                        .as_ref()
+                        .map(|s| s.cpu_power_status.clone())
+                        .unwrap_or_else(|| {
+                            sensor_access_status("/sys/class/powercap/intel-rapl:0/energy_uj")
+                        }),
+                    ram_speed_status: extended
+                        .as_ref()
+                        .map(|s| s.ram_speed_status.clone())
+                        .unwrap_or_else(|| sensor_access_status("/sys/firmware/dmi/tables/DMI")),
+                },
+            ));
+
+            last_sensors = now;
+        }
+
+        // ── Snapshot emit every display_refresh_interval ───────────────────
+        let refresh = Duration::from_millis(config.monitor.display_refresh_interval_ms);
+        if now.duration_since(last_snapshot) >= refresh {
+            let throttled = probalance.throttled_pids();
+            let pb_snap_for_infos: Vec<crate::probalance::ProcSnapshot> = raw_snapshot
+                .iter()
+                .map(|p| crate::probalance::ProcSnapshot {
+                    pid: p.pid,
+                    name: p.name.clone(),
+                    cpu_percent: p.cpu_percent,
+                    nice: p.nice,
+                })
+                .collect();
+            let throttle_infos = probalance.throttle_infos(&pb_snap_for_infos);
 
             if let Ok(mut s) = state.lock() {
                 s.snapshot = std::sync::Arc::new(raw_snapshot.clone());
-                s.cpu_percents = cpu_percents;
+                s.cpu_percents = cpu_percents.clone();
                 s.cpu_generation = s.cpu_generation.wrapping_add(1);
                 s.throttled_pids = throttled;
                 s.throttle_infos = throttle_infos;
@@ -1069,7 +1304,6 @@ fn read_proc_io(pid: u32, io_cache: &mut HashMap<u32, (u64, u64)>, elapsed: f32)
     )
 }
 
-
 fn read_sys_cpu_total() -> u64 {
     // Read first line of /proc/stat: cpu  user nice system idle iowait irq softirq ...
     if let Ok(text) = std::fs::read_to_string("/proc/stat") {
@@ -1105,10 +1339,11 @@ fn collect_cpu_percents() -> Vec<f32> {
                 continue; // CPU just came online — no baseline yet
             };
             // Fields: user nice system idle iowait irq softirq steal guest guest_nice
-            let prev_total: u64 = prev.iter().sum();
-            let new_total: u64 = new.iter().sum();
+            let prev_total: u64 = prev[..8].iter().sum();
+            let new_total: u64 = new[..8].iter().sum();
             let total_delta = new_total.saturating_sub(prev_total) as f32;
-            let idle_delta = new[3].saturating_sub(prev[3]) as f32;
+            let idle_delta =
+                new[3].saturating_sub(prev[3]) as f32 + new[4].saturating_sub(prev[4]) as f32;
             let pct = if total_delta > 0.0 {
                 ((total_delta - idle_delta) / total_delta * 100.0).clamp(0.0, 100.0)
             } else {

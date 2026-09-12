@@ -146,7 +146,7 @@ fn policy_xml() -> String {
  "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
 <policyconfig>
   <vendor>Argus-Lasso</vendor>
-  <vendor_url>https://github.com/franzjeger/process-lasso-linux-rs</vendor_url>
+  <vendor_url>https://github.com/franzjeger/argus-lasso</vendor_url>
 {}{}{}</policyconfig>
 "#,
         action(
