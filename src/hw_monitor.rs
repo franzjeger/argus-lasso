@@ -209,11 +209,11 @@ fn collect_all(
 ) -> Vec<GroupReading> {
     let mut out: Vec<GroupReading> = Vec::new();
 
-    // CPU: hwmon temps + frequencies + load + RAPL package power
-    // Detect topology once per tick — both collectors need it, and each
-    // detection is a full per-CPU sysfs scan on uniform machines.
     let topo = crate::cpu_park::detect_topology();
-    out.extend(collect_hwmon_cpu(&topo));
+    
+    // Dynamic hwmon discovery covers CPU, GPU (amdgpu), Memory (spd5118), Storage (nvme), Network (r8/igb/etc), System
+    out.extend(collect_all_hwmon(&topo));
+
     if let Some(g) = collect_cpu_freqs(&topo) {
         out.push(g);
     }
@@ -222,26 +222,13 @@ fn collect_all(
     }
     out.extend(collect_rapl_power());
 
-    // GPU: prefer NVML (NVIDIA); fall back to amdgpu hwmon
-    let gpu = collect_nvidia_nvml();
-    if !gpu.is_empty() {
-        out.extend(gpu);
-    } else {
-        out.extend(collect_hwmon_category("GPU"));
-    }
+    out.extend(collect_nvidia_nvml());
 
-    // Memory: SPD temps + /proc/meminfo
-    out.extend(collect_hwmon_memory());
     if let Some(g) = collect_meminfo() {
         out.push(g);
     }
 
-    // Storage: NVMe hwmon + disk I/O
-    out.extend(collect_hwmon_storage());
     out.extend(collect_disk_io(prev_disk, new_disk, dt));
-
-    // Network: NIC hwmon + interface I/O
-    out.extend(collect_hwmon_network());
     out.extend(collect_net_io(prev_net, new_net, dt));
 
     out
@@ -249,118 +236,65 @@ fn collect_all(
 
 // ── hwmon: per-category collectors ───────────────────────────────────────────
 
-fn collect_hwmon_cpu(topo: &crate::cpu_park::CpuTopology) -> Vec<GroupReading> {
-    // Build core_id → logical CPU mapping for friendly labels.
+fn collect_all_hwmon(topo: &crate::cpu_park::CpuTopology) -> Vec<GroupReading> {
     let core_id_map = build_core_id_to_cpu_map();
 
-    collect_hwmon_where(
-        |hw_name| matches!(hw_name, "k10temp" | "zenpower" | "coretemp"),
-        |_path, hw_name| {
+    let mut groups = collect_hwmon_where(|_| true, |path, hw_name| {
+        // Dynamic categorization based on known driver prefixes or path content
+        if hw_name == "k10temp" || hw_name == "zenpower" || hw_name == "coretemp" {
             let label = match hw_name {
                 "k10temp" => "AMD CPU [k10temp]",
                 "zenpower" => "AMD CPU [zenpower]",
                 _ => "Intel CPU [coretemp]",
             };
-            ("CPU", label.to_string())
-        },
-    )
-    .into_iter()
-    .map(|(cat, name, sensors)| {
-        let remapped: Vec<Reading> = sensors
-            .into_iter()
-            .map(|(label, unit, value)| {
-                // Remap "Core N" → "CPU X (suffix)" using topology-aware labels
-                if let Some(core_id) = label
-                    .strip_prefix("Core ")
-                    .and_then(|s| s.parse::<u32>().ok())
-                {
+            return ("CPU", label.to_string());
+        }
+        
+        if hw_name == "spd5118" || hw_name == "ee1004" {
+            return ("Memory", dimm_slot_name(path));
+        }
+        
+        if hw_name == "nvme" {
+            let model = read_trimmed(&path.join("device/model"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "NVMe".into());
+            return ("Storage", model);
+        }
+        
+        if hw_name.starts_with("amdgpu") || hw_name.starts_with("nouveau") {
+            return ("GPU", format!("{} GPU", hw_name));
+        }
+        
+        if hw_name.starts_with("r8")
+            || hw_name.starts_with("atlantic")
+            || hw_name.starts_with("igb")
+            || hw_name.starts_with("ixgbe")
+            || hw_name.starts_with("e1000")
+        {
+            let iface = nic_interface_name(path).unwrap_or_else(|| hw_name.to_string());
+            return ("Network", format!("NIC [{iface}]"));
+        }
+
+        // Generic fallback for unknown hardware (motherboard sensors like nct6775, etc.)
+        ("System", format!("Sensor [{}]", hw_name))
+    });
+
+    // Remap CPU core labels like the original did
+    for (cat, _name, sensors) in &mut groups {
+        if *cat == "CPU" {
+            for (label, _unit, _value) in sensors.iter_mut() {
+                if let Some(core_id) = label.strip_prefix("Core ").and_then(|s| s.parse::<u32>().ok()) {
                     if let Some(&cpu_num) = core_id_map.get(&core_id) {
                         let kind = core_kind_suffix(topo, cpu_num);
-                        return (intern(format!("CPU {cpu_num}{kind}")), unit, value);
+                        *label = intern(format!("CPU {cpu_num}{kind}"));
                     }
-                }
-                (label, unit, value)
-            })
-            .collect();
-        (cat, name, remapped)
-    })
-    .collect()
-}
-
-/// Map physical core_id → lowest logical CPU number.
-fn build_core_id_to_cpu_map() -> HashMap<u32, u32> {
-    let mut map: HashMap<u32, u32> = HashMap::new();
-    let cpu_dir = Path::new("/sys/devices/system/cpu");
-    if let Ok(entries) = std::fs::read_dir(cpu_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let s = name.to_string_lossy();
-            if let Some(cpu_num) = s.strip_prefix("cpu").and_then(|n| n.parse::<u32>().ok()) {
-                let core_path = entry.path().join("topology/core_id");
-                if let Some(core_id) = read_u64(&core_path).map(|v| v as u32) {
-                    // Keep the lowest CPU number for each core_id
-                    map.entry(core_id)
-                        .and_modify(|existing| {
-                            if cpu_num < *existing {
-                                *existing = cpu_num;
-                            }
-                        })
-                        .or_insert(cpu_num);
                 }
             }
         }
     }
-    map
-}
 
-fn collect_hwmon_memory() -> Vec<GroupReading> {
-    collect_hwmon_where(
-        |hw_name| matches!(hw_name, "spd5118" | "ee1004"),
-        |path, _hw_name| {
-            let slot = dimm_slot_name(path);
-            ("Memory", slot)
-        },
-    )
+    groups
 }
-
-fn collect_hwmon_storage() -> Vec<GroupReading> {
-    collect_hwmon_where(
-        |hw_name| hw_name == "nvme",
-        |path, _hw_name| {
-            let model = read_trimmed(&path.join("device/model"))
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "NVMe".into());
-            ("Storage", model)
-        },
-    )
-}
-
-fn collect_hwmon_network() -> Vec<GroupReading> {
-    collect_hwmon_where(
-        |hw_name| {
-            hw_name.starts_with("r8")
-                || hw_name.starts_with("atlantic")
-                || hw_name.starts_with("igb")
-                || hw_name.starts_with("ixgbe")
-                || hw_name.starts_with("e1000")
-        },
-        |path, hw_name| {
-            // Try to derive network interface name from device symlink
-            let iface = nic_interface_name(path).unwrap_or_else(|| hw_name.to_string());
-            ("Network", format!("NIC [{iface}]"))
-        },
-    )
-}
-
-/// Collect hwmon groups for any non-handled driver (amdgpu etc.)
-fn collect_hwmon_category(target_category: &'static str) -> Vec<GroupReading> {
-    collect_hwmon_where(
-        |hw_name| matches!(hw_name, "amdgpu" | "nvidia"),
-        |_path, hw_name| (target_category, format!("{hw_name} GPU")),
-    )
-}
-
-// ── Generic hwmon scanner ─────────────────────────────────────────────────────
 
 fn collect_hwmon_where<F, G>(filter: F, namer: G) -> Vec<GroupReading>
 where
@@ -1105,4 +1039,30 @@ mod tests {
         // Unknown labels passed through verbatim
         assert_eq!(pretty_rapl_label("custom-zone"), "custom-zone");
     }
+}
+
+/// Map physical core_id → lowest logical CPU number.
+fn build_core_id_to_cpu_map() -> HashMap<u32, u32> {
+    let mut map: HashMap<u32, u32> = HashMap::new();
+    let cpu_dir = Path::new("/sys/devices/system/cpu");
+    if let Ok(entries) = std::fs::read_dir(cpu_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let s = name.to_string_lossy();
+            if let Some(cpu_num) = s.strip_prefix("cpu").and_then(|n| n.parse::<u32>().ok()) {
+                let core_path = entry.path().join("topology/core_id");
+                if let Some(core_id) = read_u64(&core_path).map(|v| v as u32) {
+                    // Keep the lowest CPU number for each core_id
+                    map.entry(core_id)
+                        .and_modify(|existing| {
+                            if cpu_num < *existing {
+                                *existing = cpu_num;
+                            }
+                        })
+                        .or_insert(cpu_num);
+                }
+            }
+        }
+    }
+    map
 }

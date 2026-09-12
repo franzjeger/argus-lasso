@@ -119,7 +119,9 @@ impl Rule {
     /// time was pure waste.
     pub fn refresh_pattern_caches(&mut self) {
         // Always sync the lowercase pattern cache
-        if self.pattern_lower.len() != self.pattern.len() || !self.pattern.eq_ignore_ascii_case(&self.pattern_lower) {
+        if self.pattern_lower.len() != self.pattern.len()
+            || !self.pattern.eq_ignore_ascii_case(&self.pattern_lower)
+        {
             self.pattern_lower = self.pattern.to_lowercase();
         }
 
@@ -228,7 +230,7 @@ impl RuleEngine {
             current_nice,
             current_ionice,
             &mut nice_failed,
-            &|m| self.log(m)
+            &|m| self.log(m),
         );
         self.nice_failed = nice_failed;
         actions
@@ -336,58 +338,58 @@ mod tests {
     #[test]
     fn match_contains_is_case_insensitive() {
         let r = rule_with("Chrome", "contains");
-        assert!(r.matches("google-chrome"));
-        assert!(r.matches("CHROME.exe"));
-        assert!(r.matches("chromium-but-contains-chrome"));
-        assert!(!r.matches("firefox"));
+        assert!(r.matches("google-chrome", &"google-chrome".to_lowercase()));
+        assert!(r.matches("CHROME.exe", &"CHROME.exe".to_lowercase()));
+        assert!(r.matches("chromium-but-contains-chrome", &"chromium-but-contains-chrome".to_lowercase()));
+        assert!(!r.matches("firefox", &"firefox".to_lowercase()));
     }
 
     #[test]
     fn match_exact_is_case_sensitive_and_full_string() {
         let r = rule_with("steam", "exact");
-        assert!(r.matches("steam"));
-        assert!(!r.matches("Steam"));
-        assert!(!r.matches("steamwebhelper"));
-        assert!(!r.matches("not-steam"));
+        assert!(r.matches("steam", &"steam".to_lowercase()));
+        assert!(!r.matches("Steam", &"Steam".to_lowercase()));
+        assert!(!r.matches("steamwebhelper", &"steamwebhelper".to_lowercase()));
+        assert!(!r.matches("not-steam", &"not-steam".to_lowercase()));
     }
 
     #[test]
     fn match_regex_anchored_or_not() {
         let r = rule_with(r"^node(\.exe)?$", "regex");
-        assert!(r.matches("node"));
-        assert!(r.matches("node.exe"));
-        assert!(!r.matches("nodejs"));
-        assert!(!r.matches("my-node"));
+        assert!(r.matches("node", &"node".to_lowercase()));
+        assert!(r.matches("node.exe", &"node.exe".to_lowercase()));
+        assert!(!r.matches("nodejs", &"nodejs".to_lowercase()));
+        assert!(!r.matches("my-node", &"my-node".to_lowercase()));
     }
 
     #[test]
     fn match_regex_invalid_pattern_returns_false() {
         // Invalid regex should fail safe (no match) rather than panic.
         let r = rule_with("[unclosed", "regex");
-        assert!(!r.matches("anything"));
+        assert!(!r.matches("anything", &"anything".to_lowercase()));
     }
 
     #[test]
     fn empty_pattern_never_matches() {
         let r = rule_with("", "contains");
-        assert!(!r.matches("anything"));
+        assert!(!r.matches("anything", &"anything".to_lowercase()));
     }
 
     #[test]
     fn disabled_rule_never_matches() {
         let mut r = rule_with("chrome", "contains");
         r.enabled = false;
-        assert!(!r.matches("chrome"));
+        assert!(!r.matches("chrome", &"chrome".to_lowercase()));
     }
 
     #[test]
     fn refresh_pattern_caches_recompiles_on_pattern_change() {
         let mut r = rule_with("foo", "regex");
-        assert!(r.matches("foo"));
+        assert!(r.matches("foo", &"foo".to_lowercase()));
         r.pattern = "bar".into();
         r.refresh_pattern_caches();
-        assert!(r.matches("bar"));
-        assert!(!r.matches("foo"));
+        assert!(r.matches("bar", &"bar".to_lowercase()));
+        assert!(!r.matches("foo", &"foo".to_lowercase()));
     }
 
     #[test]
@@ -395,11 +397,11 @@ mod tests {
         // The rule dialog calls this every frame; it must be a no-op (and keep
         // matching) when the pattern hasn't changed.
         let mut r = rule_with("foo", "regex");
-        assert!(r.matches("foo"));
+        assert!(r.matches("foo", &"foo".to_lowercase()));
         r.refresh_pattern_caches();
         r.refresh_pattern_caches();
-        assert!(r.matches("foo"));
-        assert!(!r.matches("bar"));
+        assert!(r.matches("foo", &"foo".to_lowercase()));
+        assert!(!r.matches("bar", &"bar".to_lowercase()));
     }
 
     #[test]
@@ -413,7 +415,7 @@ mod tests {
         r.match_type = "regex".into();
         r.refresh_pattern_caches();
         assert!(r.cached_regex.is_some());
-        assert!(r.matches("foo"));
+        assert!(r.matches("foo", &"foo".to_lowercase()));
     }
 
     #[test]

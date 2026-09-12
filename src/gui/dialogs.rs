@@ -1015,10 +1015,13 @@ fn match_summary(
     let mut probe = rule.clone();
     probe.enabled = true;
     probe.refresh_pattern_caches();
-    let hits: Vec<&String> = proc_names.iter().filter(|n| {
-        let lower = n.to_lowercase();
-        probe.matches(n, &lower)
-    }).collect();
+    let hits: Vec<&String> = proc_names
+        .iter()
+        .filter(|n| {
+            let lower = n.to_lowercase();
+            probe.matches(n, &lower)
+        })
+        .collect();
     if hits.is_empty() {
         return (
             "Matches no running process".into(),

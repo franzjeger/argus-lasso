@@ -85,33 +85,6 @@ fn read_cpu_temp() -> Option<f32> {
     None
 }
 
-// ── "Remember settings" offer ─────────────────────────────────────────────────
-
-/// After a manual affinity/nice/ionice change, offer to persist it as a rule
-/// so it survives process restarts (à la Process Lasso's "remember" prompt).
-struct RuleOffer {
-    proc_name: String,
-    affinity: Option<String>,
-    nice: Option<i32>,
-    ionice: Option<(i32, i32)>,
-}
-
-impl RuleOffer {
-    fn summary(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(a) = &self.affinity {
-            parts.push(format!("affinity {a}"));
-        }
-        if let Some(n) = self.nice {
-            parts.push(format!("nice {n}"));
-        }
-        if let Some((c, l)) = self.ionice {
-            parts.push(format!("ionice {c}/{l}"));
-        }
-        parts.join(", ")
-    }
-}
-
 // ── ArgusLassoApp ─────────────────────────────────────────────────────────────
 
 pub struct ArgusLassoApp {
@@ -134,9 +107,7 @@ pub struct ArgusLassoApp {
 
     // Per-process dialogs — each tracks its own target PID so two open
     // dialogs can never apply one process's settings to another.
-    affinity_dialog: Option<(u32, AffinityDialog)>,
-    nice_dialog: Option<(u32, NiceDialog)>,
-    ionice_dialog: Option<(u32, IoNiceDialog)>,
+    dialog_manager: crate::gui::dialog_manager::DialogManager,
 
     // Process count for tab title
     proc_count: usize,
@@ -165,11 +136,7 @@ pub struct ArgusLassoApp {
     // Pending kill awaiting undo
     pending_kill: Option<crate::gui::process_tab::PendingKill>,
     // Pending "create a rule from this manual change?" offer
-    rule_offer: Option<RuleOffer>,
-    // Per-process details window (opened by double-clicking a row)
-    detail_pid: Option<u32>,
-    detail_info: Option<utils::ProcDetails>,
-    detail_last_gen: u64,
+    detail_window: crate::gui::detail_window::DetailWindow,
     // How many notable events the user has seen (bell badge = len - seen)
     events_seen: usize,
     // CPU model string for status bar
@@ -271,9 +238,7 @@ impl ArgusLassoApp {
             overview_tab: OverviewTab::new(),
             settings_tab,
             log_tab: LogTab::new(),
-            affinity_dialog: None,
-            nice_dialog: None,
-            ionice_dialog: None,
+            dialog_manager: Default::default(),
             proc_count: 0,
             throttled_count: 0,
             last_cpu_gen: 0,
@@ -286,10 +251,7 @@ impl ArgusLassoApp {
             last_saved_theme,
             cpu_temp,
             pending_kill: None,
-            rule_offer: None,
-            detail_pid: None,
-            detail_info: None,
-            detail_last_gen: 0,
+            detail_window: Default::default(),
             tour: tour_dir.map(|d| match crate::ui_tour::Tour::new(d) {
                 Ok(t) => t,
                 Err(e) => {
@@ -317,194 +279,6 @@ impl ArgusLassoApp {
         true
     }
 
-    /// Details window for one process: procfs facts refreshed on the display
-    /// cadence, plus live fields from the current snapshot.
-    fn show_detail_window(
-        &mut self,
-        ctx: &Context,
-        snapshot: &[crate::monitor::ProcInfo],
-        proc_cpu_history: &std::collections::HashMap<u32, std::collections::VecDeque<f32>>,
-        cpu_gen: u64,
-    ) {
-        let Some(pid) = self.detail_pid else { return };
-
-        // Refresh procfs details only when the daemon emitted a new sample.
-        if self.detail_info.is_none() || cpu_gen != self.detail_last_gen {
-            self.detail_last_gen = cpu_gen;
-            self.detail_info = utils::read_proc_details(pid);
-            if self.detail_info.is_none() {
-                // Process is gone — close the window.
-                self.detail_pid = None;
-                return;
-            }
-        }
-        let Some(details) = self.detail_info.clone() else {
-            return;
-        };
-        let proc = snapshot.iter().find(|p| p.pid == pid);
-        let title = match proc {
-            Some(p) => format!("{} ({})", p.name, pid),
-            None => format!("PID {pid}"),
-        };
-
-        let mut open = true;
-        egui::Window::new(format!("Details — {title}"))
-            .id(egui::Id::new("proc_detail_window"))
-            .default_width(440.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                egui::Grid::new("detail_grid")
-                    .num_columns(2)
-                    .spacing([12.0, 3.0])
-                    .show(ui, |ui| {
-                        let mut row = |k: &str, v: &str| {
-                            ui.label(RichText::new(k).weak());
-                            ui.label(v);
-                            ui.end_row();
-                        };
-                        row("State", &details.state);
-                        if let Some(p) = proc {
-                            row("CPU", &format!("{:.1} %", p.cpu_percent));
-                            if p.gpu_percent > 0.0 {
-                                row("GPU", &format!("{:.0} %", p.gpu_percent));
-                            }
-                            row(
-                                "Memory (RSS)",
-                                &format!("{:.1} MB", p.mem_rss as f64 / 1_048_576.0),
-                            );
-                            row("Nice", &p.nice.to_string());
-                            row("Affinity", &p.affinity);
-                            if p.disk_read_bps > 0 || p.disk_write_bps > 0 {
-                                row(
-                                    "Disk I/O",
-                                    &format!(
-                                        "read {:.1} KB/s, write {:.1} KB/s",
-                                        p.disk_read_bps as f64 / 1024.0,
-                                        p.disk_write_bps as f64 / 1024.0
-                                    ),
-                                );
-                            }
-                        }
-                        row("Threads", &details.thread_count.to_string());
-                        if let Some(fds) = details.fd_count {
-                            row("Open FDs", &fds.to_string());
-                        }
-                        if !details.exe.is_empty() {
-                            row("Executable", &details.exe);
-                        }
-                        if !details.cwd.is_empty() {
-                            row("Working dir", &details.cwd);
-                        }
-                    });
-
-                if let Some(p) = proc {
-                    if !p.cmdline.is_empty() {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("Command line").weak());
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(p.cmdline.as_str()).monospace())
-                                .wrap(),
-                        );
-                    }
-                }
-
-                // CPU sparkline from the shared per-PID history
-                if let Some(hist) = proc_cpu_history.get(&pid) {
-                    if hist.len() >= 2 {
-                        ui.add_space(6.0);
-                        ui.label(RichText::new("CPU history").weak());
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), 40.0),
-                            egui::Sense::hover(),
-                        );
-                        let painter = ui.painter();
-                        painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
-                        let hi = hist.iter().cloned().fold(1.0f32, f32::max);
-                        let pts: Vec<egui::Pos2> = hist
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &v)| {
-                                let x =
-                                    rect.left() + i as f32 / (hist.len() - 1) as f32 * rect.width();
-                                let y = rect.bottom() - (v / hi) * (rect.height() - 4.0) - 2.0;
-                                egui::pos2(x, y)
-                            })
-                            .collect();
-                        for pair in pts.windows(2) {
-                            painter.line_segment(
-                                [pair[0], pair[1]],
-                                egui::Stroke::new(1.5_f32, crate::gui::theme::Breeze::HIGHLIGHT),
-                            );
-                        }
-                    }
-                }
-
-                if !details.threads.is_empty() {
-                    ui.add_space(6.0);
-                    egui::CollapsingHeader::new(format!("Threads ({})", details.thread_count))
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            egui::ScrollArea::vertical()
-                                .max_height(160.0)
-                                .show(ui, |ui| {
-                                    for (tid, name) in &details.threads {
-                                        ui.label(
-                                            egui::RichText::new(format!("{tid:>8}  {name}"))
-                                                .monospace()
-                                                .size(11.0),
-                                        );
-                                    }
-                                    if details.thread_count > details.threads.len() {
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "… and {} more",
-                                                details.thread_count - details.threads.len()
-                                            ))
-                                            .weak(),
-                                        );
-                                    }
-                                });
-                        });
-                }
-            });
-        if !open {
-            self.detail_pid = None;
-            self.detail_info = None;
-        }
-    }
-
-    /// Record a manual change so the "remember as rule?" prompt can offer it.
-    /// Consecutive changes to the same process merge into one offer.
-    fn offer_rule(
-        &mut self,
-        proc_name: String,
-        affinity: Option<String>,
-        nice: Option<i32>,
-        ionice: Option<(i32, i32)>,
-    ) {
-        match &mut self.rule_offer {
-            Some(offer) if offer.proc_name == proc_name => {
-                if affinity.is_some() {
-                    offer.affinity = affinity;
-                }
-                if nice.is_some() {
-                    offer.nice = nice;
-                }
-                if ionice.is_some() {
-                    offer.ionice = ionice;
-                }
-            }
-            _ => {
-                self.rule_offer = Some(RuleOffer {
-                    proc_name,
-                    affinity,
-                    nice,
-                    ionice,
-                });
-            }
-        }
-    }
-
     fn send(&self, cmd: DaemonCmd) {
         let _ = self.cmd_tx.send(cmd);
     }
@@ -524,23 +298,6 @@ impl ArgusLassoApp {
     /// notification when the user has them enabled. Previously several
     /// failure paths (signal send, affinity/nice/ionice apply) were silent,
     /// so the user believed the change had taken effect.
-    fn notify_error(&self, msg: &str) {
-        let enabled = self
-            .state
-            .lock()
-            .map(|s| s.config.ui.notifications_enabled)
-            .unwrap_or(false);
-        if enabled {
-            let _ = notify_rust::Notification::new()
-                .summary("Argus-Lasso")
-                .body(msg)
-                .timeout(notify_rust::Timeout::Milliseconds(4000))
-                .show();
-        }
-        if let Ok(mut s) = self.state.lock() {
-            s.append_log(msg.to_string());
-        }
-    }
 
     /// Send the actual kill signal. The target was SIGSTOPped for the undo
     /// window, and a stopped process never sees SIGTERM — so always follow up
@@ -556,343 +313,6 @@ impl ArgusLassoApp {
         let result = signal::kill(Pid::from_raw(pid as i32), sig);
         let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGCONT);
         result
-    }
-
-    fn handle_table_action(
-        &mut self,
-        action: TableAction,
-        _ctx: &Context,
-        snapshot: &[crate::monitor::ProcInfo],
-    ) {
-        match action {
-            TableAction::Kill { pid, name, force } => {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-                // A second kill within the undo window must not drop the first
-                // one on the floor (it would stay SIGSTOPped forever) — the
-                // user asked for it and never undid it, so execute it now.
-                if let Some(old) = self.pending_kill.take() {
-                    let msg = match Self::deliver_kill(old.pid, old.force) {
-                        Ok(_) => format!(
-                            "{}illed {} ({}) — superseded by new kill",
-                            if old.force { "Force k" } else { "K" },
-                            old.name,
-                            old.pid
-                        ),
-                        Err(e) => format!("Kill failed for {} ({}): {e}", old.name, old.pid),
-                    };
-                    if let Ok(mut s) = self.state.lock() {
-                        s.append_log(msg);
-                    }
-                }
-                // If SIGSTOP fails (e.g. EPERM on another user's process) we
-                // must NOT arm the 5s undo window — the process was never
-                // stopped, so a later SIGTERM would hit a running target with
-                // no "undo" protection. Deliver immediately and report it.
-                match signal::kill(Pid::from_raw(pid as i32), Signal::SIGSTOP) {
-                    Ok(()) => {
-                        self.pending_kill = Some(crate::gui::process_tab::PendingKill {
-                            pid,
-                            name: name.clone(),
-                            force,
-                            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-                        });
-                        if let Ok(mut s) = self.state.lock() {
-                            s.append_log(format!(
-                                "Suspended {} ({}) — will {} in 5s",
-                                name,
-                                pid,
-                                if force { "force kill" } else { "kill" }
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        // Couldn't suspend — kill immediately and report what
-                        // happened instead of arming a dead undo window.
-                        let outcome = match Self::deliver_kill(pid, force) {
-                            Ok(()) => format!(
-                                "{}illed it immediately.",
-                                if force { "Force k" } else { "K" }
-                            ),
-                            Err(ke) => format!("kill also failed: {ke}"),
-                        };
-                        self.notify_error(&format!(
-                            "Suspend failed for {} ({}): {e}. {outcome}",
-                            name, pid
-                        ));
-                    }
-                }
-            }
-            TableAction::Suspend { pid, name } => {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-                match signal::kill(Pid::from_raw(pid as i32), Signal::SIGSTOP) {
-                    Ok(()) => {
-                        if let Ok(mut s) = self.state.lock() {
-                            s.suspended_pids.insert(pid);
-                            s.append_log(format!("Suspended {} ({})", name, pid));
-                        }
-                    }
-                    Err(e) => {
-                        self.notify_error(&format!("Suspend failed for {} ({}): {e}", name, pid));
-                    }
-                }
-            }
-            TableAction::Resume { pid, name } => {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-                match signal::kill(Pid::from_raw(pid as i32), Signal::SIGCONT) {
-                    Ok(()) => {
-                        if let Ok(mut s) = self.state.lock() {
-                            s.suspended_pids.remove(&pid);
-                            s.append_log(format!("Resumed {} ({})", name, pid));
-                        }
-                    }
-                    Err(e) => {
-                        self.notify_error(&format!("Resume failed for {} ({}): {e}", name, pid));
-                    }
-                }
-            }
-            TableAction::SetAffinity { pid, name, current } => {
-                self.affinity_dialog = Some((pid, AffinityDialog::new(&current, &name)));
-            }
-            TableAction::SetNice { pid, name, current } => {
-                self.nice_dialog = Some((pid, NiceDialog::new(current, &name)));
-            }
-            TableAction::SetIonice { pid, name } => {
-                self.ionice_dialog = Some((pid, IoNiceDialog::new(&name)));
-            }
-            TableAction::AddRule { name } => {
-                let mut rule = crate::rules::Rule::new_empty();
-                rule.name = name.clone();
-                rule.pattern = name;
-                rule.match_type = "contains".into();
-                self.rules_tab.open_add_dialog(Some(rule));
-                self.active_tab = Tab::Rules;
-            }
-            TableAction::ShowDetails { pid } => {
-                self.detail_pid = Some(pid);
-                self.detail_info = None; // force immediate refresh
-            }
-            TableAction::KillTree { pid, name } => {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-                let edges: Vec<(u32, u32)> = snapshot.iter().map(|p| (p.pid, p.ppid)).collect();
-                let tree = crate::utils::process_tree(pid, &edges);
-                if tree.is_empty() {
-                    self.notify_error(&format!("No process tree found for {} ({})", name, pid));
-                    return;
-                }
-                let count = tree.len();
-                // Kill leaves first (reverse BFS) so children don't get
-                // reparented to init mid-sweep. SIGTERM first, then SIGKILL any
-                // survivors after a brief grace period; SIGCONT so a stopped
-                // target actually receives the signal.
-                let mut killed = 0u32;
-                let mut failed = 0u32;
-                let mut survivors: Vec<u32> = Vec::new();
-                for &t in tree.iter().rev() {
-                    match signal::kill(Pid::from_raw(t as i32), Signal::SIGTERM) {
-                        Ok(()) => {
-                            killed += 1;
-                            let _ = signal::kill(Pid::from_raw(t as i32), Signal::SIGCONT);
-                        }
-                        Err(_) => {
-                            failed += 1;
-                        }
-                    }
-                    survivors.push(t);
-                }
-                // Give well-behaved processes a moment to exit, then force-kill
-                // any that are still around.
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                for &t in &survivors {
-                    // ESRCH means it already exited — that's the success case.
-                    if let Err(nix::Error::ESRCH) =
-                        signal::kill(Pid::from_raw(t as i32), Signal::SIGKILL)
-                    {
-                        continue;
-                    }
-                    let _ = signal::kill(Pid::from_raw(t as i32), Signal::SIGCONT);
-                }
-                let msg = format!(
-                    "Killed {} of {} processes in tree of {} ({})",
-                    killed, count, name, pid
-                );
-                if let Ok(mut s) = self.state.lock() {
-                    s.append_log(msg.clone());
-                }
-                if failed > 0 {
-                    self.notify_error(&format!("{} — {} failed (permissions?)", msg, failed));
-                }
-            }
-            TableAction::Export { format } => {
-                let ext = match format {
-                    crate::gui::process_tab::ExportFormat::Csv => "csv",
-                    crate::gui::process_tab::ExportFormat::Json => "json",
-                };
-                let default_name = format!("processes.{}", ext);
-                let filter = match format {
-                    crate::gui::process_tab::ExportFormat::Csv => "*.csv",
-                    crate::gui::process_tab::ExportFormat::Json => "*.json",
-                };
-                let Some(path) = crate::file_dialog::save(&default_name, filter) else {
-                    return; // user cancelled
-                };
-                let content = match format {
-                    crate::gui::process_tab::ExportFormat::Csv => {
-                        crate::utils::export_csv(snapshot)
-                    }
-                    crate::gui::process_tab::ExportFormat::Json => {
-                        crate::utils::export_json(snapshot)
-                    }
-                };
-                match std::fs::write(&path, content) {
-                    Ok(_) => {
-                        if let Ok(mut s) = self.state.lock() {
-                            s.append_log(format!(
-                                "Exported {} processes to {}",
-                                snapshot.len(),
-                                path.display()
-                            ));
-                        }
-                    }
-                    Err(e) => self.notify_error(&format!("Export failed: {e}")),
-                }
-            }
-            TableAction::None => {}
-        }
-    }
-
-    fn poll_dialogs(&mut self, ctx: &Context) {
-        // Affinity dialog
-        if let Some((pid, ref mut dlg)) = self.affinity_dialog {
-            let proc_name = dlg.title.clone();
-            if let Some(result) = dlg.show(ctx, self.opacity) {
-                let cpulist = result.as_str();
-                if cpulist.is_empty() {
-                    self.affinity_dialog = None;
-                } else if utils::set_affinity(pid, cpulist) {
-                    self.send(DaemonCmd::SetManualOverride {
-                        pid,
-                        duration_secs: 30.0,
-                    });
-                    if let Ok(mut s) = self.state.lock() {
-                        s.append_log(format!("[Manual] affinity={cpulist} → PID {pid}"));
-                    }
-                    self.offer_rule(proc_name, Some(result.clone()), None, None);
-                } else {
-                    self.notify_error(&format!(
-                        "Failed to set affinity '{cpulist}' on {} (PID {pid}) — needs root?",
-                        proc_name
-                    ));
-                }
-                self.affinity_dialog = None;
-            }
-        }
-
-        // Nice dialog
-        if let Some((pid, ref mut dlg)) = self.nice_dialog {
-            let proc_name = dlg.title.clone();
-            if let Some(result) = dlg.show(ctx, self.opacity) {
-                if let Some(nice) = result {
-                    if utils::set_nice(pid, nice) {
-                        if let Ok(mut s) = self.state.lock() {
-                            s.append_log(format!("[Manual] nice={nice} → PID {pid}"));
-                        }
-                        self.offer_rule(proc_name, None, Some(nice), None);
-                    } else {
-                        self.notify_error(&format!(
-                            "Failed to set nice {nice} on {} (PID {pid}) — needs root?",
-                            proc_name
-                        ));
-                    }
-                }
-                self.nice_dialog = None;
-            }
-        }
-
-        // IoNice dialog
-        if let Some((pid, ref mut dlg)) = self.ionice_dialog {
-            let proc_name = dlg.title.clone();
-            if let Some(result) = dlg.show(ctx, self.opacity) {
-                if let Some((class, level)) = result {
-                    if utils::set_ionice(pid, class, Some(level)) {
-                        if let Ok(mut s) = self.state.lock() {
-                            s.append_log(format!(
-                                "[Manual] ionice class={class} level={level} → PID {pid}"
-                            ));
-                        }
-                        self.offer_rule(proc_name, None, None, Some((class, level)));
-                    } else {
-                        self.notify_error(&format!(
-                            "Failed to set ionice {class}/{level} on {} (PID {pid}) — needs root?",
-                            proc_name
-                        ));
-                    }
-                }
-                self.ionice_dialog = None;
-            }
-        }
-
-        // "Remember settings?" prompt for the latest manual change
-        if let Some(offer) = &self.rule_offer {
-            let mut create = false;
-            let mut dismiss = false;
-            egui::Window::new("Remember settings?")
-                .id(egui::Id::new("rule_offer_window"))
-                .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -40.0))
-                .resizable(false)
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    ui.label(format!(
-                        "Keep {} for '{}' with a rule?\nThe setting will be re-applied every time the process starts.",
-                        offer.summary(),
-                        offer.proc_name
-                    ));
-                    ui.horizontal(|ui| {
-                        if ui.button("Create rule").clicked() {
-                            create = true;
-                        }
-                        if ui.button("No thanks").clicked() {
-                            dismiss = true;
-                        }
-                    });
-                });
-            if create {
-                let offer = self.rule_offer.take().unwrap();
-                let mut rule = crate::rules::Rule::new_empty();
-                rule.name = offer.proc_name.clone();
-                rule.pattern = offer.proc_name.clone();
-                rule.match_type = "exact".into();
-                rule.affinity = offer.affinity.clone();
-                rule.nice = offer.nice;
-                rule.ionice_class = offer.ionice.map(|(c, _)| c);
-                rule.ionice_level = offer.ionice.map(|(_, l)| l);
-                // Lock ORDER matters: the daemon nests state inside the rule
-                // engine (engine → state via the log callback), so the GUI must
-                // never nest engine inside state or the two deadlock. Collect
-                // the rule list first, then take the state lock.
-                let rules_cfg = if let Ok(mut re) = self.rule_engine.lock() {
-                    re.add_rule(rule);
-                    re.to_config_list()
-                } else {
-                    Vec::new()
-                };
-                if let Ok(mut s) = self.state.lock() {
-                    s.config.rules = rules_cfg;
-                    s.append_log(format!(
-                        "[Rule] Created rule for '{}' ({}) from manual change",
-                        offer.proc_name,
-                        offer.summary()
-                    ));
-                }
-                self.save_config();
-                self.send(DaemonCmd::ReapplyDefaults);
-            } else if dismiss {
-                self.rule_offer = None;
-            }
-        }
     }
 
     /// Put the UI into the state the current tour step documents.
@@ -913,17 +333,12 @@ impl ArgusLassoApp {
         // Keeping this step's own overlay alive across the settle frames is
         // what stops it being rebuilt — and re-running topology detection —
         // on every frame.
-        self.affinity_dialog = None;
-        self.nice_dialog = None;
-        self.ionice_dialog = None;
+        self.dialog_manager = Default::default();
         if !matches!(step, Step::ProcessDetails) {
-            self.detail_pid = None;
+            self.detail_window = Default::default();
         }
         if !matches!(step, Step::KillToast) {
             self.pending_kill = None;
-        }
-        if !matches!(step, Step::RuleOffer) {
-            self.rule_offer = None;
         }
 
         // A real PID with real values, so the dialogs are not full of zeroes.
@@ -943,9 +358,8 @@ impl ArgusLassoApp {
 
             Step::ProcessDetails => {
                 self.active_tab = Tab::Processes;
-                if self.detail_pid != Some(pid) {
-                    self.detail_pid = Some(pid);
-                    self.detail_info = utils::read_proc_details(pid);
+                if self.detail_window.detail_pid != Some(pid) {
+                    self.detail_window.set_pid(pid);
                 }
             }
             Step::KillToast => {
@@ -963,8 +377,8 @@ impl ArgusLassoApp {
             }
             Step::RuleOffer => {
                 self.active_tab = Tab::Processes;
-                if self.rule_offer.is_none() {
-                    self.rule_offer = Some(RuleOffer {
+                if self.dialog_manager.rule_offer.is_none() {
+                    self.dialog_manager.rule_offer = Some(crate::gui::dialog_manager::RuleOffer {
                         proc_name: "argus-lasso".into(),
                         affinity: Some("0-7".into()),
                         nice: Some(-5),
@@ -1018,7 +432,7 @@ impl eframe::App for ArgusLassoApp {
         // otherwise its sparkline vanishes when switching away from Processes.
         let on_proc_tab = self.active_tab == Tab::Processes
             || self.active_tab == Tab::Overview
-            || self.detail_pid.is_some();
+            || self.detail_window.detail_pid.is_some();
         let on_overview_tab = self.active_tab == Tab::Overview;
         let (
             snapshot,
@@ -1104,10 +518,29 @@ impl eframe::App for ArgusLassoApp {
         }
 
         // Poll active dialogs
-        self.poll_dialogs(ctx);
+        let notif_enabled = config.ui.notifications_enabled;
+        let notify_error = move |msg: &str| {
+            log::error!("{msg}");
+            if notif_enabled {
+                let _ = notify_rust::Notification::new()
+                    .summary("Argus-Lasso Error")
+                    .body(msg)
+                    .timeout(notify_rust::Timeout::Milliseconds(5000))
+                    .show();
+            }
+        };
+        self.dialog_manager.poll_dialogs(
+            ctx,
+            self.opacity,
+            &self.state,
+            &self.cmd_tx,
+            &self.rule_engine,
+            &notify_error,
+        );
 
         // Per-process details window
-        self.show_detail_window(ctx, &snapshot, &proc_cpu_history, cpu_gen);
+        self.detail_window
+            .show(ctx, &snapshot, &proc_cpu_history, cpu_gen);
 
         // Check pending kill
         if let Some(ref pk) = self.pending_kill {
@@ -1115,7 +548,8 @@ impl eframe::App for ArgusLassoApp {
                 let name = pk.name.clone();
                 let pid = pk.pid;
                 let force = pk.force;
-                let msg = match Self::deliver_kill(pid, force) {
+                let msg = match crate::gui::action_handler::ActionHandler::deliver_kill(pid, force)
+                {
                     Ok(_) => format!(
                         "{}illed {} ({})",
                         if force { "Force k" } else { "K" },
@@ -1508,7 +942,21 @@ impl eframe::App for ArgusLassoApp {
                         gaming_active,
                         &proc_cpu_history,
                     );
-                    self.handle_table_action(action, ctx, &snapshot);
+                    let mut trigger_rule = None;
+                    crate::gui::action_handler::ActionHandler::handle(
+                        action,
+                        &snapshot,
+                        &self.state,
+                        &mut self.pending_kill,
+                        &mut self.dialog_manager,
+                        &mut self.detail_window,
+                        &notify_error,
+                        &mut trigger_rule,
+                    );
+                    if let Some(rule) = trigger_rule {
+                        self.rules_tab.open_add_dialog(Some(rule));
+                        self.active_tab = Tab::Rules;
+                    }
                     // Persist col_widths when user drags a column divider
                     // (debounced — see col_save_due).
                     if self.process_tab.cols_dirty {

@@ -177,9 +177,8 @@ use nix::sched::CpuSet;
 pub fn set_nice(pid: u32, nice: i32) -> bool {
     use nix::libc;
     // clear errno just in case, though setpriority returns 0 on success
-    let res = unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice as libc::c_int)
-    };
+    let res =
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice as libc::c_int) };
     if res == 0 {
         log::debug!("setpriority pid={pid} nice={nice}: OK");
         true
