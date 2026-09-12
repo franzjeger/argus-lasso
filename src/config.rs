@@ -88,6 +88,8 @@ impl Default for MonitorConfig {
 #[serde(default)]
 pub struct UiConfig {
     pub start_minimized: bool,
+    #[serde(default)]
+    pub global_overlay: bool,
     /// Window opacity 0.1–1.0
     pub opacity: f32,
     /// "BreezeDark" | "BreezeLight" | "AdwaitaDark" | "AdwaitaLight".
@@ -126,6 +128,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             start_minimized: false,
+            global_overlay: false,
             opacity: 1.0,
             theme: String::new(), // auto-detect from desktop on first run
             sort_column: "cpu_percent".into(),
