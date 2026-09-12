@@ -165,6 +165,11 @@ impl ArgusLassoApp {
         let native_ppp = cc.egui_ctx.pixels_per_point();
         let startup_theme = crate::gui::theme::AppTheme::from_str(&config.ui.theme);
         crate::gui::theme::apply_theme(&cc.egui_ctx, native_ppp, &startup_theme);
+        // Force menus and tooltips to be drawn embedded on the main canvas.
+        // Otherwise eframe spawns them as separate Wayland surfaces, which bypasses
+        // our wp_alpha_modifier_v1 opacity and makes them render 100% opaque.
+        cc.egui_ctx.set_embed_viewports(true);
+
 
         let mut updates = crate::updater::UpdateState::default();
         if config.ui.check_updates_on_start {
