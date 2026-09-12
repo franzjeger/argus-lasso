@@ -137,9 +137,13 @@ pub const BOLD: &str = "bold";
 ///
 /// Idempotent: the fonts are only installed once per context.
 fn install_fonts(ctx: &Context) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static INSTALLED: AtomicBool = AtomicBool::new(false);
-    if INSTALLED.swap(true, Ordering::Relaxed) {
+    let already_installed = ctx.data_mut(|data| {
+        let id = egui::Id::new("argus_fonts_installed");
+        let installed = data.get_temp::<bool>(id).unwrap_or(false);
+        data.insert_temp(id, true);
+        installed
+    });
+    if already_installed {
         return;
     }
 
@@ -1351,6 +1355,20 @@ pub fn apply_adwaita(ctx: &Context, native_ppp: f32, dark: bool) {
 #[cfg(test)]
 mod viewport_opacity_tests {
     use super::*;
+
+    #[test]
+    fn bundled_fonts_are_installed_for_each_independent_context() {
+        for _ in 0..2 {
+            let ctx = egui::Context::default();
+            apply_theme(&ctx, 1.0, &AppTheme::BreezeDark);
+            apply_theme(&ctx, 1.0, &AppTheme::BreezeDark);
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.label(bold(ui, "Heading", 16.0));
+            });
+            assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+                egui::Shape::Text(text) if text.galley.job.text == "Heading")));
+        }
+    }
 
     #[test]
     fn native_panel_alpha_is_local_live_and_restorable() {

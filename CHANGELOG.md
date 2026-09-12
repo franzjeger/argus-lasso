@@ -31,6 +31,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Slow graph refresh: independent default 60 Hz update with spike-preserving history.
 - Gaming/Settings edits overwriting each other's newer values, and an old global
   loading toggle replacing the correct versioned manifest path.
+- Bundled font registration now belongs to each UI context; independent contexts
+  no longer share an initialization flag that can leave the bold font missing.
 - Native subwindow opacity: transparent surfaces and clear color, viewport-local
   style updates, and live inheritance for customization, details and benchmark results.
 - Long process PIDs and multicore numbers overflowing table cells: font-aware
