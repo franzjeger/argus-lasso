@@ -456,7 +456,16 @@ pub unsafe extern "system" fn argus_vkCreateSwapchainKHR(
     let qf = DEVICE_QUEUE_FAMILY.read().unwrap().get(&device).copied().unwrap_or(0);
 
     // Create overlay state
-    match OverlayState::new(ash_inst, &ash_dev, physical_device, qf, &images, format, extent) {
+    match renderer::OverlayState::new(
+        ash_inst,
+        physical_device,
+        &ash_dev,
+        qf,
+        &images,
+        format,
+        extent,
+        ci.pre_transform,
+    ) {
         Some(state) => {
             OVERLAY_STATES.lock().unwrap().insert(swapchain, state);
             eprintln!("[Argus-Layer] Overlay initialised for swapchain ({} images)", images.len());

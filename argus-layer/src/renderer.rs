@@ -25,6 +25,7 @@ pub struct OverlayState {
     pub fences: Vec<vk::Fence>,
     pub extent: vk::Extent2D,
     pub format: vk::Format,
+    pub transform: vk::SurfaceTransformFlagsKHR,
     pub images: Vec<vk::Image>,
 }
 
@@ -52,12 +53,13 @@ impl OverlayState {
     /// Create overlay resources for the given swapchain images.
     pub unsafe fn new(
         instance: &ash::Instance,
-        device: &ash::Device,
         physical_device: vk::PhysicalDevice,
+        device: &ash::Device,
         queue_family_index: u32,
         images: &[vk::Image],
         format: vk::Format,
         extent: vk::Extent2D,
+        transform: vk::SurfaceTransformFlagsKHR,
     ) -> Option<Self> {
         let image_count = images.len();
         if image_count == 0 {
@@ -111,6 +113,7 @@ impl OverlayState {
             fences,
             extent,
             format,
+            transform,
             images: images.to_vec(),
         })
     }
@@ -132,17 +135,55 @@ impl OverlayState {
             .map_memory(self.staging_memory, 0, self.staging_size, vk::MemoryMapFlags::empty())
             .ok()? as *mut u8;
 
-        let row_stride = HUD_W * 4;
-        let pixels = std::slice::from_raw_parts_mut(ptr, (HUD_W * HUD_H * 4) as usize);
+        let pixels = std::slice::from_raw_parts_mut(ptr as *mut u32, (HUD_W * HUD_H) as usize);
 
-        // Fill background: semi-transparent black (0,0,0,0xB0)
+        // Helper to pack a color based on format
+        let pack_color = |r: u32, g: u32, b: u32, a: u32| -> u32 {
+            match self.format {
+                vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => {
+                    (a << 24) | (r << 16) | (g << 8) | b
+                }
+                vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => {
+                    (a << 24) | (b << 16) | (g << 8) | r
+                }
+                vk::Format::A2R10G10B10_UNORM_PACK32 => {
+                    // A2 (2 bits), R10 (10 bits), G10 (10 bits), B10 (10 bits)
+                    let a2 = (a >> 6) & 0x3;
+                    let r10 = (r << 2) | (r >> 6);
+                    let g10 = (g << 2) | (g >> 6);
+                    let b10 = (b << 2) | (b >> 6);
+                    (a2 << 30) | (r10 << 20) | (g10 << 10) | b10
+                }
+                vk::Format::A2B10G10R10_UNORM_PACK32 => {
+                    let a2 = (a >> 6) & 0x3;
+                    let r10 = (r << 2) | (r >> 6);
+                    let g10 = (g << 2) | (g >> 6);
+                    let b10 = (b << 2) | (b >> 6);
+                    (a2 << 30) | (b10 << 20) | (g10 << 10) | r10
+                }
+                _ => {
+                    // Default to B8G8R8A8
+                    (a << 24) | (r << 16) | (g << 8) | b
+                }
+            }
+        };
+
+        let bg_color = pack_color(0, 0, 0, 0xB0);
+        let text_color = pack_color(0, 0xFF, 0x66, 0xFF); // Greenish
+
+        // We force a 180-degree rotation of the pixels in the buffer because the presentation
+        // engine or game is somehow flipping the image contents, causing our overlay to appear
+        // upside down and backwards.
+        let get_px_idx = |x: u32, y: u32| -> usize {
+            let rx = HUD_W - 1 - x;
+            let ry = HUD_H - 1 - y;
+            (ry * HUD_W + rx) as usize
+        };
+
+        // Fill background
         for y in 0..HUD_H {
             for x in 0..HUD_W {
-                let off = ((y * HUD_W + x) * 4) as usize;
-                pixels[off]     = 0x00; // R
-                pixels[off + 1] = 0x00; // G
-                pixels[off + 2] = 0x00; // B
-                pixels[off + 3] = 0xB0; // A
+                pixels[get_px_idx(x, y)] = bg_color;
             }
         }
 
@@ -161,12 +202,7 @@ impl OverlayState {
                         let px = gx + col;
                         let py = pad_top + row;
                         if py < HUD_H {
-                            let off = ((py * HUD_W + px) * 4) as usize;
-                            // Green-ish HUD text colour
-                            pixels[off]     = 0x00; // R
-                            pixels[off + 1] = 0xFF; // G
-                            pixels[off + 2] = 0x66; // B
-                            pixels[off + 3] = 0xFF; // A
+                            pixels[get_px_idx(px, py)] = text_color;
                         }
                     }
                 }
@@ -218,9 +254,11 @@ impl OverlayState {
             &[barrier_to_dst],
         );
 
-        // Copy staging buffer → image (top-left corner)
         let copy_w = HUD_W.min(self.extent.width);
         let copy_h = HUD_H.min(self.extent.height);
+        
+        let offset = vk::Offset3D { x: 4, y: 4, z: 0 };
+
         let region = vk::BufferImageCopy::default()
             .buffer_offset(0)
             .buffer_row_length(HUD_W)
@@ -230,7 +268,7 @@ impl OverlayState {
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
                     .layer_count(1),
             )
-            .image_offset(vk::Offset3D { x: 4, y: 4, z: 0 }) // small margin
+            .image_offset(offset)
             .image_extent(vk::Extent3D {
                 width: copy_w,
                 height: copy_h,

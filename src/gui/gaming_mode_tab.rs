@@ -977,7 +977,7 @@ impl GamingModeTab {
         // Spawn detached
         let parts: Vec<_> = cmd.split_whitespace().collect();
         if let Some((prog, args)) = parts.split_first() {
-            let _ = std::process::Command::new(prog).args(args).env("VK_INSTANCE_LAYERS", "VK_LAYER_ARGUS_OVERLAY").spawn();
+            let _ = std::process::Command::new(prog).args(args).env("ARGUS_LASSO_HUD", "1").spawn();
         }
     }
 }
