@@ -203,6 +203,61 @@ pub fn shutdown_and_wait(state: &Arc<Mutex<AppState>>, cmd_tx: &Sender<DaemonCmd
     log::warn!("daemon did not confirm shutdown within 3s; continuing anyway");
 }
 
+// ── Overlay IPC Server ────────────────────────────────────────────────────────
+
+mod ipc_server {
+    use argus_ipc::{IpcMessage, TelemetryFrame, OverlayConfig};
+    use std::os::unix::net::UnixListener;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    
+    pub struct Broadcaster {
+        clients: Arc<Mutex<Vec<std::os::unix::net::UnixStream>>>,
+    }
+
+    impl Broadcaster {
+        pub fn start() -> Self {
+            let clients = Arc::new(Mutex::new(Vec::new()));
+            let clients_clone = Arc::clone(&clients);
+
+            let _ = std::fs::remove_file(argus_ipc::IPC_SOCKET_PATH);
+            if let Ok(listener) = UnixListener::bind(argus_ipc::IPC_SOCKET_PATH) {
+                thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        if let Ok(stream) = stream {
+                            if let Ok(mut lock) = clients_clone.lock() {
+                                lock.push(stream);
+                            }
+                        }
+                    }
+                });
+            } else {
+                log::warn!("Failed to bind to IPC socket for overlay");
+            }
+
+            Self { clients }
+        }
+
+        pub fn broadcast(&self, msg: &IpcMessage) {
+            let data = bincode::serialize(msg).unwrap();
+            let len_buf = (data.len() as u32).to_le_bytes();
+            
+            if let Ok(mut clients) = self.clients.lock() {
+                clients.retain_mut(|client| {
+                    if client.write_all(&len_buf).is_err() {
+                        return false;
+                    }
+                    if client.write_all(&data).is_err() {
+                        return false;
+                    }
+                    true
+                });
+            }
+        }
+    }
+}
+
 pub fn spawn(
     state: Arc<Mutex<AppState>>,
     cmd_rx: Receiver<DaemonCmd>,
@@ -228,6 +283,61 @@ pub fn join_daemon(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bo
     rx.recv_timeout(timeout).is_ok()
 }
 
+fn get_cpu_name() -> String {
+    if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
+        for line in content.lines() {
+            if line.starts_with("model name") {
+                if let Some(name) = line.split(':').nth(1) {
+                    return name.trim().to_string();
+                }
+            }
+        }
+    }
+    "Unknown CPU".to_string()
+}
+
+fn get_ram_speed_mts() -> Option<u32> {
+    use std::sync::OnceLock;
+    static RAM_SPEED: OnceLock<Option<u32>> = OnceLock::new();
+    *RAM_SPEED.get_or_init(|| {
+        let out = std::process::Command::new("dmidecode").arg("-t").arg("memory").output().ok()?;
+        let s = String::from_utf8_lossy(&out.stdout);
+        for line in s.lines() {
+            if line.contains("Configured Memory Speed:") && !line.contains("Unknown") {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() == 2 {
+                    if let Ok(mts) = parts[1].trim().split_whitespace().next().unwrap_or("").parse::<u32>() {
+                        return Some(mts);
+                    }
+                }
+            }
+        }
+        None
+    })
+}
+
+fn get_ram_info() -> (f32, f32) {
+    let mut mem_total = 0.0;
+    let mut mem_available = 0.0;
+    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+        for line in content.lines() {
+            if line.starts_with("MemTotal:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 1 {
+                    mem_total = parts[1].parse::<f32>().unwrap_or(0.0) / (1024.0 * 1024.0); // GiB
+                }
+            } else if line.starts_with("MemAvailable:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 1 {
+                    mem_available = parts[1].parse::<f32>().unwrap_or(0.0) / (1024.0 * 1024.0); // GiB
+                }
+            }
+        }
+    }
+    let mem_used = mem_total - mem_available;
+    (mem_used.max(0.0), mem_total)
+}
+
 fn run_loop(
     state: Arc<Mutex<AppState>>,
     cmd_rx: Receiver<DaemonCmd>,
@@ -235,6 +345,8 @@ fn run_loop(
     rule_engine: Arc<Mutex<RuleEngine>>,
 ) {
     let mut config = initial_config;
+    let ipc = ipc_server::Broadcaster::start();
+    ipc.broadcast(&argus_ipc::IpcMessage::Config(config.gaming_mode.overlay.clone()));
 
     // Build closures that push log messages into shared state
     let state_log = state.clone();
@@ -312,6 +424,7 @@ fn run_loop(
                     let cfg = *cfg;
                     probalance.update_config(cfg.probalance.clone());
                     config = cfg.clone();
+                    ipc.broadcast(&argus_ipc::IpcMessage::Config(config.gaming_mode.overlay.clone()));
                     log_cb(format!(
                         "Config updated — ProBalance: {}  |  Notifications: {}",
                         if config.probalance.enabled {
@@ -645,6 +758,46 @@ fn run_loop(
                 &mut last_alert_times,
                 &log_cb,
             );
+
+            // Broadcast overlay telemetry
+            let parked_cores = utils::get_offline_cpus().len() as u32;
+            let active_profile = if gaming_mode {
+                "Gaming".to_string()
+            } else {
+                "Normal".to_string()
+            };
+            let gpu_usage = hw_collector.data.get_gpu_usage();
+            let gpu_temp = hw_collector.data.get_gpu_temp();
+            let cpu_temp = hw_collector.data.get_cpu_temp();
+            let gpu_power = hw_collector.data.get_gpu_power();
+            let cpu_power = hw_collector.data.get_cpu_power();
+            let gpu_name = hw_collector.data.get_gpu_name();
+            let cpu_name = get_cpu_name();
+            let (ram_used, ram_total) = get_ram_info();
+            let vram_used = hw_collector.data.get_vram_usage_gb();
+            let vram_total = hw_collector.data.get_vram_total_gb();
+            
+            ipc.broadcast(&argus_ipc::IpcMessage::Telemetry(argus_ipc::TelemetryFrame {
+                cpu_name,
+                cpu_usage_percent: avg as u8,
+                cpu_temp_c: cpu_temp,
+                cpu_power_w: cpu_power,
+                gpu_name,
+                gpu_usage_percent: gpu_usage,
+                gpu_temp_c: gpu_temp,
+                gpu_power_w: gpu_power,
+                gpu_core_clock_mhz: hw_collector.data.get_gpu_core_clock(),
+                gpu_mem_clock_mhz: hw_collector.data.get_gpu_mem_clock(),
+                gpu_fan_speed_percent: hw_collector.data.get_gpu_fan_speed(),
+                cpu_freq_mhz: hw_collector.data.get_cpu_freq(),
+                ram_speed_mts: get_ram_speed_mts(),
+                ram_used_gb: ram_used,
+                ram_total_gb: ram_total,
+                vram_used_gb: vram_used,
+                vram_total_gb: vram_total,
+                active_profile,
+                parked_cores,
+            }));
 
             if let Ok(mut s) = state.lock() {
                 s.snapshot = std::sync::Arc::new(raw_snapshot.clone());

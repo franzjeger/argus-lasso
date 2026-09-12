@@ -112,6 +112,163 @@ pub struct HwMonitorData {
     pub groups: Vec<SensorGroup>,
 }
 
+impl HwMonitorData {
+    pub fn get_gpu_usage(&self) -> u8 {
+        for group in &self.groups {
+            if group.category == "GPU" {
+                for sensor in &group.sensors {
+                    if sensor.label == "Usage" {
+                        return sensor.value as u8;
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    pub fn get_gpu_temp(&self) -> u8 {
+        for group in &self.groups {
+            if group.category == "GPU" {
+                for sensor in &group.sensors {
+                    if sensor.label == "Temperature" || sensor.label == "Core Temp" || sensor.label == "Temp" {
+                        return sensor.value as u8;
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    pub fn get_cpu_temp(&self) -> u8 {
+        for group in &self.groups {
+            if group.category == "CPU" {
+                for sensor in &group.sensors {
+                    if sensor.label == "Temperature" || sensor.label == "Package Temp" || sensor.label == "Tctl" || sensor.label == "Tdie" {
+                        return sensor.value as u8;
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    pub fn get_cpu_power(&self) -> f32 {
+        for group in &self.groups {
+            if group.category == "Power" {
+                for sensor in &group.sensors {
+                    if sensor.label.contains("Package") || sensor.label.contains("CPU") || sensor.label.contains("Average") {
+                        return sensor.value;
+                    }
+                }
+            }
+        }
+        0.0
+    }
+
+    pub fn get_gpu_power(&self) -> f32 {
+        for group in &self.groups {
+            if group.category == "GPU" {
+                for sensor in &group.sensors {
+                    if sensor.label.contains("Power") || sensor.unit == "W" {
+                        return sensor.value;
+                    }
+                }
+            }
+        }
+        0.0
+    }
+
+    pub fn get_gpu_core_clock(&self) -> Option<u32> {
+        for group in &self.groups {
+            if group.category == "GPU" {
+                for sensor in &group.sensors {
+                    if sensor.label == "GPU Clock" {
+                        return Some(sensor.value as u32);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_gpu_mem_clock(&self) -> Option<u32> {
+        for group in &self.groups {
+            if group.category == "GPU" {
+                for sensor in &group.sensors {
+                    if sensor.label == "Memory Clock" {
+                        return Some(sensor.value as u32);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_gpu_fan_speed(&self) -> Option<u8> {
+        for group in &self.groups {
+            if group.category == "GPU" {
+                for sensor in &group.sensors {
+                    if sensor.label == "Fan Speed" {
+                        return Some(sensor.value as u8);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_cpu_freq(&self) -> Option<u32> {
+        // Read /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+        std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|khz| khz / 1000)
+    }
+
+    pub fn get_gpu_name(&self) -> String {
+        for group in &self.groups {
+            if group.category == "GPU" {
+                return group.name.clone();
+            }
+        }
+        "Unknown GPU".to_string()
+    }
+
+    pub fn get_vram_usage_gb(&self) -> f32 {
+        for group in &self.groups {
+            if group.category == "GPU" {
+                for sensor in &group.sensors {
+                    if sensor.label.contains("VRAM Used") || sensor.label.contains("Memory Used") {
+                        if sensor.unit == "MiB" {
+                            return sensor.value / 1024.0;
+                        } else if sensor.unit == "GiB" {
+                            return sensor.value;
+                        }
+                    }
+                }
+            }
+        }
+        0.0
+    }
+    
+    pub fn get_vram_total_gb(&self) -> f32 {
+        for group in &self.groups {
+            if group.category == "GPU" {
+                for sensor in &group.sensors {
+                    if sensor.label.contains("VRAM Total") || sensor.label.contains("Memory Total") {
+                        if sensor.unit == "MiB" {
+                            return sensor.value / 1024.0;
+                        } else if sensor.unit == "GiB" {
+                            return sensor.value;
+                        }
+                    }
+                }
+            }
+        }
+        0.0
+    }
+}
+
 // ── HwCollector ───────────────────────────────────────────────────────────────
 
 pub struct HwCollector {
@@ -512,8 +669,10 @@ fn collect_nvidia_nvml() -> Vec<GroupReading> {
             .as_ref()
             .map(|m| m.total as f32 / (1024.0 * 1024.0 * 1024.0))
             .unwrap_or(0.0);
+            
+        let fan_speed = dev.fan_speed(0).unwrap_or(0);
 
-        let sensors: Vec<Reading> = vec![
+        let mut sensors: Vec<Reading> = vec![
             ("Temperature", "°C", temp),
             ("GPU Load", "%", g_util),
             ("Memory Usage", "%", m_util),
@@ -522,6 +681,7 @@ fn collect_nvidia_nvml() -> Vec<GroupReading> {
             ("Memory Clock", "MHz", m_clk),
             ("VRAM Used", "GiB", m_used),
             ("VRAM Total", "GiB", m_total),
+            ("Fan Speed", "%", fan_speed as f32),
         ];
 
         groups.push(("GPU", intern(&gpu_name).to_string(), sensors));

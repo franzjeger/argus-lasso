@@ -762,6 +762,70 @@ impl GamingModeTab {
                 });
             }
 
+            // ── Vulkan Overlay ────────────────────────────────────────────
+            let mut overlay_changed = false;
+            th::card(ui, "Vulkan In-Game Overlay (ARGUS_LASSO_HUD=1)", |ui| {
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut self.config.gaming_mode.overlay.show_overlay, "Enable overlay").changed() {
+                        overlay_changed = true;
+                    }
+                });
+
+                if self.config.gaming_mode.overlay.show_overlay {
+                    ui.add_space(tokens::SPACE_S);
+                    ui.horizontal(|ui| {
+                        ui.label("Scale:");
+                        if ui.add(egui::Slider::new(&mut self.config.gaming_mode.overlay.scale, 1..=4)).changed() {
+                            overlay_changed = true;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Offset X:");
+                        if ui.add(egui::DragValue::new(&mut self.config.gaming_mode.overlay.offset_x).speed(1)).changed() {
+                            overlay_changed = true;
+                        }
+                        ui.add_space(tokens::SPACE_M);
+                        ui.label("Offset Y:");
+                        if ui.add(egui::DragValue::new(&mut self.config.gaming_mode.overlay.offset_y).speed(1)).changed() {
+                            overlay_changed = true;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Text Color:");
+                        let mut tc = [
+                            self.config.gaming_mode.overlay.text_color.0,
+                            self.config.gaming_mode.overlay.text_color.1,
+                            self.config.gaming_mode.overlay.text_color.2,
+                            self.config.gaming_mode.overlay.text_color.3,
+                        ];
+                        if ui.color_edit_button_srgba_unmultiplied(&mut tc).changed() {
+                            self.config.gaming_mode.overlay.text_color = (tc[0], tc[1], tc[2], tc[3]);
+                            overlay_changed = true;
+                        }
+
+                        ui.add_space(tokens::SPACE_M);
+                        ui.label("Background:");
+                        let mut bc = [
+                            self.config.gaming_mode.overlay.bg_color.0,
+                            self.config.gaming_mode.overlay.bg_color.1,
+                            self.config.gaming_mode.overlay.bg_color.2,
+                            self.config.gaming_mode.overlay.bg_color.3,
+                        ];
+                        if ui.color_edit_button_srgba_unmultiplied(&mut bc).changed() {
+                            self.config.gaming_mode.overlay.bg_color = (bc[0], bc[1], bc[2], bc[3]);
+                            overlay_changed = true;
+                        }
+                    });
+                }
+            });
+
+            if overlay_changed {
+                self.events
+                    .push(GamingEvent::ConfigChanged(Box::new(self.config.clone())));
+            }
+
             // ── Activity log (collapsed) ──────────────────────────────────
             if self.show_log {
                 th::card(ui, "Activity log", |ui| {

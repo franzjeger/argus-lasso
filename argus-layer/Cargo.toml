@@ -13,3 +13,5 @@ libc = "0.2"
 lazy_static = "1.4"
 argus-ipc = { path = "../argus-ipc" }
 bincode = "1.3"
+fontdue = "0.9.3"
+bytemuck = "1.25.2"

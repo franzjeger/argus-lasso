@@ -8,14 +8,14 @@ pub mod renderer;
 
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::time::Instant;
 use std::sync::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::thread;
 use std::os::unix::net::UnixStream;
 use std::io::Read;
-use argus_ipc::TelemetryFrame;
+use argus_ipc::{TelemetryFrame, IpcMessage, OverlayConfig};
 use ash::vk;
 use renderer::OverlayState;
 
@@ -28,9 +28,14 @@ lazy_static::lazy_static! {
     // Telemetry data from the Argus-Lasso daemon (received via IPC)
     static ref TELEMETRY: RwLock<TelemetryFrame> = RwLock::new(TelemetryFrame::default());
 
+    // Configuration for the overlay (received via IPC)
+    pub static ref OVERLAY_CONFIG: RwLock<OverlayConfig> = RwLock::new(OverlayConfig::default());
+
     // FPS tracking
     static ref LAST_FRAME_TIME: RwLock<Option<Instant>> = RwLock::new(None);
     static ref CURRENT_FPS: RwLock<f64> = RwLock::new(0.0);
+    static ref FRAME_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static ref FPS_ACCUM: AtomicU64 = AtomicU64::new(0);
 
     // Instance → ash::Instance (we need this to call instance-level functions)
     static ref ASH_INSTANCES: RwLock<HashMap<vk::Instance, ash::Instance>> = RwLock::new(HashMap::new());
@@ -65,15 +70,22 @@ fn start_ipc_thread() {
                     let len = u32::from_le_bytes(len_buf) as usize;
                     let mut data = vec![0u8; len];
                     if stream.read_exact(&mut data).is_ok() {
-                        if let Ok(frame) = bincode::deserialize::<TelemetryFrame>(&data) {
-                            *TELEMETRY.write().unwrap() = frame;
+                        if let Ok(msg) = bincode::deserialize::<IpcMessage>(&data) {
+                            match msg {
+                                IpcMessage::Telemetry(frame) => {
+                                    *TELEMETRY.write().unwrap() = frame;
+                                }
+                                IpcMessage::Config(config) => {
+                                    *OVERLAY_CONFIG.write().unwrap() = config;
+                                }
+                            }
                         }
                     } else {
                         break;
                     }
                 }
             }
-            thread::sleep(std::time::Duration::from_secs(2));
+            thread::sleep(std::time::Duration::from_secs(1));
         }
     });
 }
@@ -518,23 +530,15 @@ pub unsafe extern "system" fn argus_vkQueuePresentKHR(
             let swapchains = std::slice::from_raw_parts(pi.p_swapchains, swapchain_count);
             let image_indices = std::slice::from_raw_parts(pi.p_image_indices, swapchain_count);
 
-            let overlay_states = OVERLAY_STATES.lock().unwrap();
+            let mut overlay_states = OVERLAY_STATES.lock().unwrap();
 
             for i in 0..swapchain_count {
-                if let Some(state) = overlay_states.get(&swapchains[i]) {
+                if let Some(state) = overlay_states.get_mut(&swapchains[i]) {
                     let fps = *CURRENT_FPS.read().unwrap();
                     let tel = TELEMETRY.read().unwrap();
-                    let text = format!(
-                        "FPS:{:.0} CPU:{}% {}C GPU:{}% {}C Park:{}",
-                        fps,
-                        tel.cpu_usage_percent,
-                        tel.cpu_temp_c,
-                        tel.gpu_usage_percent,
-                        tel.gpu_temp_c,
-                        tel.parked_cores,
-                    );
-
-                    if let Some(cb) = state.record_overlay(ash_dev, image_indices[i] as usize, &text) {
+                    let config = OVERLAY_CONFIG.read().unwrap().clone();
+                    
+                    if let Some(cb) = state.record_overlay(ash_dev, image_indices[i] as usize, &tel, &config, fps) {
                         // Submit our overlay command buffer BEFORE present
                         let cbs = [cb];
                         let submit_info = vk::SubmitInfo::default()
@@ -546,9 +550,8 @@ pub unsafe extern "system" fn argus_vkQueuePresentKHR(
                             &submits,
                             state.fences[image_indices[i] as usize],
                         );
-
-                        // Wait for completion before present
-                        let _ = ash_dev.queue_wait_idle(queue);
+                        // Removed queue_wait_idle(queue) because it forces a CPU stall and VSync-like behavior.
+                        // Rely on per-image fences for CPU staging buffer mapping synchronization instead.
                     }
                 }
             }

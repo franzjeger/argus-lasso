@@ -183,6 +183,9 @@ pub struct GamingModeConfig {
     pub auto_detect: bool,
     /// Also park non-preferred CPUs when auto-enabling (requires the helper).
     pub auto_park: bool,
+    /// Vulkan overlay configuration
+    #[serde(default)]
+    pub overlay: argus_ipc::OverlayConfig,
 }
 
 // ── Rule (stored inline in config) ───────────────────────────────────────────
