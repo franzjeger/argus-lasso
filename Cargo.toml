@@ -14,6 +14,7 @@ name = "argus-lasso"
 path = "src/main.rs"
 
 [dependencies]
+argus-ipc = { path = "argus-ipc" }
 # GUI
 # 0.34 flipped the default renderer to wgpu. glow is selected explicitly to
 # keep the OpenGL backend this app has always used — wgpu pulls a much larger
@@ -97,6 +98,6 @@ codegen-units = 1
 strip         = true
 
 [workspace]
-members = [
+members = ["argus-ipc",
     "argus-layer"
 ]
