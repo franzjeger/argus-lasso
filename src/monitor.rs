@@ -803,48 +803,28 @@ fn collect_snapshot(
     detail: bool,
     io_elapsed: f32,
 ) -> (Vec<ProcInfo>, HashMap<u32, u64>, u64) {
-    use procfs::process::all_processes;
-    use procfs::WithCurrentSystemInfo;
-
     let mut new_times: HashMap<u32, u64> = HashMap::new();
     let mut snapshot: Vec<ProcInfo> = Vec::new();
 
-    // Read total system CPU jiffies for CPU% calculation.
-    // sys_delta is summed across ALL CPUs, so we scale by the online CPU count
-    // to get per-core percentages (100% = one core fully busy, like top).
-    // Without this, a busy-loop on a 16-core machine reads ~6% and ProBalance
-    // thresholds (default 85%) can never trigger.
     let sys_total = read_sys_cpu_total();
     let sys_delta = sys_total.saturating_sub(prev_sys_total) as f32;
     let n_cpus = utils::get_online_cpus().len().max(1) as f32;
 
-    let procs = match all_processes() {
-        Ok(p) => p,
-        Err(_) => return (snapshot, new_times, sys_total),
-    };
+    let mut stat_buf = [0u8; 1024];
+    let mut cmd_buf = Vec::with_capacity(1024);
 
-    for proc_result in procs {
-        let proc = match proc_result {
-            Ok(p) => p,
-            Err(_) => continue,
+    for pid in crate::fast_proc::all_pids() {
+        let stat = match crate::fast_proc::read_stat(pid, &mut stat_buf) {
+            Some(s) => s,
+            None => continue,
         };
 
-        let pid = proc.pid() as u32;
+        let ppid = stat.ppid;
 
-        let stat = match proc.stat() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let ppid = stat.ppid as u32;
-
-        // Name and command line are fixed for this process's lifetime, so
-        // read them once and keep them. start_time distinguishes a reused PID
-        // from the same process still running.
         let meta = match caches.meta.get(&pid) {
             Some(m) if m.start_time == stat.starttime => m,
             _ => {
-                let cmdline: Vec<String> = proc.cmdline().unwrap_or_default();
+                let cmdline = crate::fast_proc::read_cmdline(pid, &mut cmd_buf);
                 let entry = ProcMeta {
                     start_time: stat.starttime,
                     name: utils::resolve_name(&stat.comm, &cmdline),
@@ -861,15 +841,13 @@ fn collect_snapshot(
         let prev_ticks = prev_times.get(&pid).copied().unwrap_or(proc_ticks);
         let delta_ticks = proc_ticks.saturating_sub(prev_ticks) as f32;
         let cpu_percent = if sys_delta > 0.0 {
-            // Multithreaded processes can legitimately exceed 100% (one core);
-            // cap at the machine total.
             (delta_ticks / sys_delta * n_cpus * 100.0).min(n_cpus * 100.0)
         } else {
             0.0
         };
 
-        let mem_rss = stat.rss_bytes().get();
-        let nice = stat.nice as i32;
+        let mem_rss = stat.rss_bytes;
+        let nice = stat.nice;
 
         let (affinity, ionice, disk_read_bps, disk_write_bps) = if detail {
             let affinity = utils::get_affinity_str(pid);
@@ -880,11 +858,10 @@ fn collect_snapshot(
                 .insert(pid, (affinity.clone(), ionice.clone()));
             (affinity, ionice, r, w)
         } else {
-            // Reuse the last display pass. A PID first seen on an enforce
-            // tick simply shows blank until the next display tick, which is
-            // sooner than a human can read the row anyway.
-            let (a, i) = caches.display.get(&pid).cloned().unwrap_or_default();
-            (a, i, 0, 0)
+            match caches.display.get(&pid) {
+                Some((a, i)) => (a.clone(), i.clone(), 0, 0),
+                None => (String::new(), String::new(), 0, 0),
+            }
         };
 
         snapshot.push(ProcInfo {
@@ -892,7 +869,7 @@ fn collect_snapshot(
             ppid,
             name,
             cpu_percent,
-            gpu_percent: 0.0, // filled at publish time from NVML
+            gpu_percent: 0.0,
             mem_rss,
             nice,
             affinity,
@@ -905,13 +882,6 @@ fn collect_snapshot(
 
     (snapshot, new_times, sys_total)
 }
-
-/// Per-second disk read/write rates for one PID.
-///
-/// The deltas are divided by the elapsed sample time. They used to be
-/// returned raw and labelled "bytes/s", so the figure was wrong by whatever
-/// the sampling cadence happened to be — twice the real rate at the default
-/// 500 ms.
 fn read_proc_io(pid: u32, io_cache: &mut HashMap<u32, (u64, u64)>, elapsed: f32) -> (u64, u64) {
     let text = match std::fs::read_to_string(format!("/proc/{pid}/io")) {
         Ok(t) => t,
@@ -943,6 +913,7 @@ fn read_proc_io(pid: u32, io_cache: &mut HashMap<u32, (u64, u64)>, elapsed: f32)
         per_sec(write_bytes.saturating_sub(prev_w)),
     )
 }
+
 
 fn read_sys_cpu_total() -> u64 {
     // Read first line of /proc/stat: cpu  user nice system idle iowait irq softirq ...

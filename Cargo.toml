@@ -34,7 +34,6 @@ winit = { version = "0.30", default-features = false, features = [
 ] }
 
 # Process enumeration
-procfs = "0.18"
 
 # Syscalls: sched_setaffinity, signal
 nix = { version = "0.29", features = ["sched", "process", "signal", "fs"] }

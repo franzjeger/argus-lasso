@@ -10,6 +10,7 @@ mod hw_monitor;
 mod icon;
 mod logfile;
 mod mem_bench;
+mod fast_proc;
 mod monitor;
 mod probalance;
 mod rules;
