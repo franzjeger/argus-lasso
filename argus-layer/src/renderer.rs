@@ -171,11 +171,8 @@ impl OverlayState {
         let bg_color = pack_color(0, 0, 0, 0xB0);
         let text_color = pack_color(0, 0xFF, 0x66, 0xFF); // Greenish
 
-        // The game's presentation engine (or DXVK) flips the image vertically.
-        // We only flip the Y-axis in our staging buffer to counteract this.
         let get_px_idx = |x: u32, y: u32| -> usize {
-            let ry = HUD_H - 1 - y;
-            (ry * HUD_W + x) as usize
+            (y * HUD_W + x) as usize
         };
 
         // Fill background
@@ -185,7 +182,7 @@ impl OverlayState {
             }
         }
 
-        // Render glyphs — scale 2x, 4px top padding
+        // Render glyphs
         let pad_top: u32 = 4;
         let scale: u32 = 2;
         for (ci, ch) in text.bytes().enumerate() {
@@ -197,7 +194,7 @@ impl OverlayState {
             for row in 0..font::GLYPH_H {
                 let bits = glyph[row as usize];
                 for col in 0..font::GLYPH_W {
-                    if bits & (0x80 >> col) != 0 {
+                    if (bits >> col) & 1 != 0 {
                         for sy in 0..scale {
                             for sx in 0..scale {
                                 let px = gx + col * scale + sx;
