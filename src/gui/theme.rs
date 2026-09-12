@@ -1035,8 +1035,6 @@ pub fn apply(ctx: &Context, native_ppp: f32) {
     // ── Misc ─────────────────────────────────────────────────────────────
     vis.hyperlink_color = Breeze::LINK;
     vis.window_stroke = Stroke::new(1.0_f32, Breeze::BORDER);
-    vis.window_shadow = egui::epaint::Shadow::NONE;
-    vis.popup_shadow = egui::epaint::Shadow::NONE;
     vis.window_corner_radius = CornerRadius::same(4);
     vis.menu_corner_radius = CornerRadius::same(4);
 
@@ -1137,8 +1135,6 @@ pub fn apply_light(ctx: &Context, native_ppp: f32) {
 
     vis.hyperlink_color = Color32::from_rgb(0x29, 0x80, 0xb9);
     vis.window_stroke = Stroke::new(1.0_f32, border);
-    vis.window_shadow = egui::epaint::Shadow::NONE;
-    vis.popup_shadow = egui::epaint::Shadow::NONE;
     vis.window_corner_radius = CornerRadius::same(4);
     vis.menu_corner_radius = CornerRadius::same(4);
 
@@ -1254,8 +1250,6 @@ pub fn apply_adwaita(ctx: &Context, native_ppp: f32, dark: bool) {
 
     vis.hyperlink_color = link;
     vis.window_stroke = Stroke::new(1.0_f32, border);
-    vis.window_shadow = egui::epaint::Shadow::NONE;
-    vis.popup_shadow = egui::epaint::Shadow::NONE;
     vis.window_corner_radius = CornerRadius::same(6);
     vis.menu_corner_radius = CornerRadius::same(6);
 
