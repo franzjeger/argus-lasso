@@ -1,3 +1,4 @@
+pub mod renderer;
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicUsize, Ordering};
