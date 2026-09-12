@@ -7,8 +7,8 @@
         "api_version": "1.3.200",
         "implementation_version": "1",
         "description": "Argus-Lasso Native FPS Overlay Layer",
-        "disable_environment": {
-            "DISABLE_ARGUS_OVERLAY": "1"
+        "enable_environment": {
+            "ARGUS_LASSO_HUD": "1"
         }
     }
 }
