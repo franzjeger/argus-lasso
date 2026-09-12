@@ -12,8 +12,8 @@ use ash::vk;
 use crate::font;
 
 /// The HUD strip dimensions (pixels).
-pub const HUD_W: u32 = 480; // fits ~60 chars at 8px
-pub const HUD_H: u32 = 12;  // 8px glyph + 2px padding top + 2px padding bottom
+pub const HUD_W: u32 = 800; // fits ~50 chars at 16px
+pub const HUD_H: u32 = 24;  // 16px glyph + padding
 
 /// Per-swapchain overlay state.
 pub struct OverlayState {
@@ -171,13 +171,11 @@ impl OverlayState {
         let bg_color = pack_color(0, 0, 0, 0xB0);
         let text_color = pack_color(0, 0xFF, 0x66, 0xFF); // Greenish
 
-        // We force a 180-degree rotation of the pixels in the buffer because the presentation
-        // engine or game is somehow flipping the image contents, causing our overlay to appear
-        // upside down and backwards.
+        // The game's presentation engine (or DXVK) flips the image vertically.
+        // We only flip the Y-axis in our staging buffer to counteract this.
         let get_px_idx = |x: u32, y: u32| -> usize {
-            let rx = HUD_W - 1 - x;
             let ry = HUD_H - 1 - y;
-            (ry * HUD_W + rx) as usize
+            (ry * HUD_W + x) as usize
         };
 
         // Fill background
@@ -187,11 +185,12 @@ impl OverlayState {
             }
         }
 
-        // Render glyphs — 2px top padding
-        let pad_top: u32 = 2;
+        // Render glyphs — scale 2x, 4px top padding
+        let pad_top: u32 = 4;
+        let scale: u32 = 2;
         for (ci, ch) in text.bytes().enumerate() {
-            let gx = (ci as u32) * font::GLYPH_W;
-            if gx + font::GLYPH_W > HUD_W {
+            let gx = (ci as u32) * font::GLYPH_W * scale;
+            if gx + font::GLYPH_W * scale > HUD_W {
                 break; // off-screen
             }
             let glyph = font::glyph(ch);
@@ -199,10 +198,14 @@ impl OverlayState {
                 let bits = glyph[row as usize];
                 for col in 0..font::GLYPH_W {
                     if bits & (0x80 >> col) != 0 {
-                        let px = gx + col;
-                        let py = pad_top + row;
-                        if py < HUD_H {
-                            pixels[get_px_idx(px, py)] = text_color;
+                        for sy in 0..scale {
+                            for sx in 0..scale {
+                                let px = gx + col * scale + sx;
+                                let py = pad_top + row * scale + sy;
+                                if py < HUD_H {
+                                    pixels[get_px_idx(px, py)] = text_color;
+                                }
+                            }
                         }
                     }
                 }
