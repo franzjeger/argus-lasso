@@ -101,4 +101,4 @@ strip         = true
 [workspace]
 members = ["argus-ipc",
     "argus-layer"
-]
+, "test_nvml"]

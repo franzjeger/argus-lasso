@@ -6,6 +6,11 @@ use argus_ipc::{OverlayConfig, TelemetryFrame};
 pub const MAX_HUD_W: u32 = 800;
 pub const MAX_HUD_H: u32 = 800;
 
+pub struct CachedGlyph {
+    pub metrics: fontdue::Metrics,
+    pub bitmap: Vec<u8>,
+}
+
 pub struct OverlayState {
     pub swapchain: vk::SwapchainKHR,
     pub format: vk::Format,
@@ -43,6 +48,8 @@ pub struct OverlayState {
     pub texture_needs_upload: bool,
     pub frame_times_ms: std::collections::VecDeque<f32>,
     pub last_frame_instant: Option<std::time::Instant>,
+    pub last_update_instant: Option<std::time::Instant>,
+    pub glyph_cache: std::collections::HashMap<(char, u32), CachedGlyph>,
 }
 
 fn find_memory_type(
@@ -281,6 +288,7 @@ impl OverlayState {
             render_pass, descriptor_set_layout, descriptor_pool, descriptor_set, pipeline_layout, pipeline,
             image_views, framebuffers, last_telemetry: None, texture_needs_upload: true,
             frame_times_ms: std::collections::VecDeque::with_capacity(1000), last_frame_instant: None,
+            last_update_instant: None, glyph_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -337,11 +345,15 @@ impl OverlayState {
 
         // Cache check
         let mut needs_update = self.texture_needs_upload;
-        // Always update text if we have more than 10 frames to avoid feeling unresponsive, or just update every 10 frames minimum
-        // wait, we can just update every 10th frame
-        if self.frame_times_ms.len() % 10 == 0 {
+        let should_update = self.last_update_instant
+            .map(|last| now.duration_since(last).as_millis() >= 500)
+            .unwrap_or(true);
+
+        if should_update {
+            self.last_update_instant = Some(now);
             needs_update = true;
         }
+
         if self.last_telemetry.as_ref() != Some(tel) {
             needs_update = true;
             self.last_telemetry = Some(tel.clone());
@@ -367,65 +379,86 @@ impl OverlayState {
             let pad_y = 10.0 * scale as f32;
             let line_h = font_size * 1.25;
             
-            // Precalculate dimensions
-            let actual_w = (360.0 * scale as f32) as u32;
-            let actual_h = (pad_y + font_size + line_h * 15.5 + pad_y) as u32; // ~15.5 lines of text
+            // Layout (compute actual_w, actual_h)
+            let actual_w = (420.0 * scale as f32) as u32; // wider for longer CPU names
             
-            // Clear to transparent black
+            let mut lines_count = 15.5;
+            if config.show_cores && !tel.core_usages.is_empty() {
+                let rows = (tel.core_usages.len() as f32 / 4.0).ceil();
+                lines_count += rows + 1.0;
+            }
+            let actual_h = (pad_y + font_size + line_h * lines_count + pad_y) as u32;
+            
+            // Clear entire buffer to transparent
             for p in pixels.iter_mut() { *p = 0; }
             
-            // Draw background rectangle
+            // Draw background rectangle if opacity > 0
             let bg_color = config.bg_color;
-            let bg_packed = (bg_color.3 as u32) << 24 | (bg_color.2 as u32) << 16 | (bg_color.1 as u32) << 8 | (bg_color.0 as u32);
-            for y in 0..actual_h.min(MAX_HUD_H) {
-                let row_offset = (y * MAX_HUD_W) as usize;
-                for x in 0..actual_w.min(MAX_HUD_W) {
-                    pixels[row_offset + x as usize] = bg_packed;
+            if bg_color.3 > 0 {
+                let bg_packed = (bg_color.3 as u32) << 24 | (bg_color.2 as u32) << 16 | (bg_color.1 as u32) << 8 | (bg_color.0 as u32);
+                for y in 0..actual_h.min(MAX_HUD_H) {
+                    let row_offset = (y * MAX_HUD_W) as usize;
+                    for x in 0..actual_w.min(MAX_HUD_W) {
+                        pixels[row_offset + x as usize] = bg_packed;
+                    }
                 }
             }
             
-            let draw_text = |text: &str, mut cx: f32, cy: f32, size: f32, color: (u8,u8,u8), out_pixels: &mut [u32]| {
+            let mut draw_text_with_shadow = |text: &str, mut cx: f32, cy: f32, size: f32, color: (u8,u8,u8), cache: &mut std::collections::HashMap<(char, u32), CachedGlyph>| {
+                let size_key = (size * 10.0) as u32;
                 for ch in text.chars() {
-                    let (metrics, bitmap) = f.rasterize(ch, size);
-                    let w = metrics.width as i32;
-                    let h = metrics.height as i32;
-                    let start_x = cx as i32 + metrics.xmin;
-                    let start_y = cy as i32 - metrics.ymin - h;
+                    let key = (ch, size_key);
+                    let cg = cache.entry(key).or_insert_with(|| {
+                        let (metrics, bitmap) = f.rasterize(ch, size);
+                        CachedGlyph { metrics, bitmap }
+                    });
                     
-                    for r in 0..h {
-                        for c in 0..w {
-                            let coverage = bitmap[(r * w + c) as usize];
-                            if coverage > 0 {
-                                let px = start_x + c;
-                                let py = start_y + r;
-                                if px >= 0 && px < MAX_HUD_W as i32 && py >= 0 && py < MAX_HUD_H as i32 {
-                                    let idx = (py as u32 * MAX_HUD_W + px as u32) as usize;
-                                    let alpha = coverage as f32 / 255.0;
-                                    let current_bg = out_pixels[idx];
-                                    let bg_a = ((current_bg >> 24) & 0xFF) as f32 / 255.0;
-                                    let bg_b = ((current_bg >> 16) & 0xFF) as f32;
-                                    let bg_g = ((current_bg >> 8) & 0xFF) as f32;
-                                    let bg_r = (current_bg & 0xFF) as f32;
-                                    
-                                    let final_r = (color.0 as f32 * alpha + bg_r * (1.0 - alpha)) as u32;
-                                    let final_g = (color.1 as f32 * alpha + bg_g * (1.0 - alpha)) as u32;
-                                    let final_b = (color.2 as f32 * alpha + bg_b * (1.0 - alpha)) as u32;
-                                    let final_a = (255.0 * alpha.max(bg_a)) as u32;
+                    let w = cg.metrics.width as i32;
+                    let h = cg.metrics.height as i32;
+                    
+                    for is_shadow in [true, false].into_iter() {
+                        let start_x = cx as i32 + cg.metrics.xmin + if is_shadow { 1 } else { 0 };
+                        let start_y = cy as i32 - cg.metrics.ymin - h + if is_shadow { 1 } else { 0 };
+                        
+                        let draw_r = if is_shadow { 0.0 } else { color.0 as f32 };
+                        let draw_g = if is_shadow { 0.0 } else { color.1 as f32 };
+                        let draw_b = if is_shadow { 0.0 } else { color.2 as f32 };
+                        
+                        for r in 0..h {
+                            for c in 0..w {
+                                let coverage = cg.bitmap[(r * w + c) as usize];
+                                if coverage > 0 {
+                                    let px = start_x + c;
+                                    let py = start_y + r;
+                                    if px >= 0 && px < MAX_HUD_W as i32 && py >= 0 && py < MAX_HUD_H as i32 {
+                                        let idx = (py as u32 * MAX_HUD_W + px as u32) as usize;
+                                        let alpha = coverage as f32 / 255.0;
+                                        let alpha = if is_shadow { alpha * 0.7 } else { alpha };
+                                        
+                                        let current_bg = pixels[idx];
+                                        let bg_a = ((current_bg >> 24) & 0xFF) as f32 / 255.0;
+                                        let bg_b = ((current_bg >> 16) & 0xFF) as f32;
+                                        let bg_g = ((current_bg >> 8) & 0xFF) as f32;
+                                        let bg_r = (current_bg & 0xFF) as f32;
+                                        
+                                        let final_r = (draw_r * alpha + bg_r * (1.0 - alpha)) as u32;
+                                        let final_g = (draw_g * alpha + bg_g * (1.0 - alpha)) as u32;
+                                        let final_b = (draw_b * alpha + bg_b * (1.0 - alpha)) as u32;
+                                        let final_a = (255.0 * alpha.max(bg_a)) as u32;
 
-                                    out_pixels[idx] = (final_a << 24) | (final_b << 16) | (final_g << 8) | final_r;
+                                        pixels[idx] = (final_a << 24) | (final_b << 16) | (final_g << 8) | final_r;
+                                    }
                                 }
                             }
                         }
                     }
-                    cx += metrics.advance_width;
+                    cx += cg.metrics.advance_width;
                 }
             };
 
-            // Helpers
             let fmt_val = |v: Option<u32>| -> String { v.map(|x| x.to_string()).unwrap_or_else(|| "—".to_string()) };
             let fmt_f32 = |v: f32, zero_is_na: bool| -> String { if zero_is_na && v == 0.0 { "—".to_string() } else { format!("{v:.0}") } };
             
-            // Stats calc
             let mut avg_fps = 0.0;
             let mut low_1 = 0.0;
             let mut cur_ft = 0.0;
@@ -441,87 +474,101 @@ impl OverlayState {
             let cur_fps = if cur_ft > 0.0 { 1000.0 / cur_ft } else { 0.0 };
 
             let mut cur_y = pad_y + font_size;
-            let line_h = font_size * 1.25;
             
             let c_lbl = (config.text_color.0, config.text_color.1, config.text_color.2);
             let c_val = (255, 255, 255);
-            let c_dim = (150, 150, 150);
 
-            // Columns (explicit X coords based on scale)
             let col0 = pad_x;
-            let col1 = pad_x + 50.0 * scale as f32;
-            let col2 = pad_x + 130.0 * scale as f32;
-            let col3 = pad_x + 180.0 * scale as f32;
-            let col4 = pad_x + 240.0 * scale as f32;
-            let col5 = pad_x + 290.0 * scale as f32;
+            let col1 = pad_x + 60.0 * scale as f32;
+            let col2 = pad_x + 150.0 * scale as f32;
+            let col3 = pad_x + 200.0 * scale as f32;
+            let col4 = pad_x + 290.0 * scale as f32;
+            let col5 = pad_x + 350.0 * scale as f32;
 
-            // GPU Header
-            draw_text("GPU", col0, cur_y, font_size, c_lbl, pixels);
-            draw_text(&tel.gpu_name, col1, cur_y, font_size, c_val, pixels);
+            draw_text_with_shadow("GPU", col0, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            let mut gpu_name = tel.gpu_name.clone();
+            if gpu_name.len() > 30 { gpu_name.truncate(30); gpu_name.push_str("..."); }
+            draw_text_with_shadow(&gpu_name, col1, cur_y, font_size, c_val, &mut self.glyph_cache);
             cur_y += line_h;
 
-            // GPU Row 1
-            draw_text("Load", col0, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>3} %", fmt_f32(tel.gpu_usage_percent as f32, false)), col1, cur_y, font_size, c_val, pixels);
-            draw_text("Temp", col2, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>3} °C", tel.gpu_temp_c), col3, cur_y, font_size, c_val, pixels);
-            draw_text("Power", col4, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>3} W", fmt_f32(tel.gpu_power_w, true)), col5, cur_y, font_size, c_val, pixels);
+            draw_text_with_shadow("Load", col0, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>3} %", fmt_f32(tel.gpu_usage_percent as f32, false)), col1, cur_y, font_size, c_val, &mut self.glyph_cache);
+            draw_text_with_shadow("Temp", col2, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>3} °C", tel.gpu_temp_c), col3, cur_y, font_size, c_val, &mut self.glyph_cache);
+            draw_text_with_shadow("Power", col4, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>3} W", fmt_f32(tel.gpu_power_w, true)), col5, cur_y, font_size, c_val, &mut self.glyph_cache);
             cur_y += line_h;
 
-            // GPU Row 2
-            draw_text("Core", col0, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>4} MHz", fmt_val(tel.gpu_core_clock_mhz)), col1, cur_y, font_size, c_val, pixels);
-            draw_text("Mem", col2, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>4} MHz", fmt_val(tel.gpu_mem_clock_mhz)), col3, cur_y, font_size, c_val, pixels);
-            draw_text("Fan", col4, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>3} %", fmt_val(tel.gpu_fan_speed_percent.map(|x| x as u32))), col5, cur_y, font_size, c_val, pixels);
+            draw_text_with_shadow("Core", col0, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>4} MHz", fmt_val(tel.gpu_core_clock_mhz)), col1, cur_y, font_size, c_val, &mut self.glyph_cache);
+            draw_text_with_shadow("Mem", col2, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>4} MHz", fmt_val(tel.gpu_mem_clock_mhz)), col3, cur_y, font_size, c_val, &mut self.glyph_cache);
+            draw_text_with_shadow("Fan", col4, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>3} %", fmt_val(tel.gpu_fan_speed_percent.map(|x| x as u32))), col5, cur_y, font_size, c_val, &mut self.glyph_cache);
             cur_y += line_h;
 
-            // GPU Row 3
-            draw_text("VRAM", col0, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>4.1} / {:.1} GiB", tel.vram_used_gb, tel.vram_total_gb), col1, cur_y, font_size, c_val, pixels);
+            draw_text_with_shadow("VRAM", col0, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>4.1} / {:.1} GiB", tel.vram_used_gb, tel.vram_total_gb), col1, cur_y, font_size, c_val, &mut self.glyph_cache);
             cur_y += line_h * 1.5;
 
-            // CPU Header
-            draw_text("CPU", col0, cur_y, font_size, c_lbl, pixels);
-            draw_text(&tel.cpu_name, col1, cur_y, font_size, c_val, pixels);
+            draw_text_with_shadow("CPU", col0, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            let mut cpu_name = tel.cpu_name.clone();
+            if cpu_name.len() > 30 { cpu_name.truncate(30); cpu_name.push_str("..."); }
+            draw_text_with_shadow(&cpu_name, col1, cur_y, font_size, c_val, &mut self.glyph_cache);
             cur_y += line_h;
 
-            // CPU Row 1
-            draw_text("Load", col0, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>3} %", tel.cpu_usage_percent), col1, cur_y, font_size, c_val, pixels);
-            draw_text("Temp", col2, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>3} °C", tel.cpu_temp_c), col3, cur_y, font_size, c_val, pixels);
-            draw_text("Power", col4, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>3} W", fmt_f32(tel.cpu_power_w, true)), col5, cur_y, font_size, c_val, pixels);
+            draw_text_with_shadow("Load", col0, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>3} %", tel.cpu_usage_percent), col1, cur_y, font_size, c_val, &mut self.glyph_cache);
+            draw_text_with_shadow("Temp", col2, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>3} °C", tel.cpu_temp_c), col3, cur_y, font_size, c_val, &mut self.glyph_cache);
+            draw_text_with_shadow("Power", col4, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>3} W", fmt_f32(tel.cpu_power_w, true)), col5, cur_y, font_size, c_val, &mut self.glyph_cache);
             cur_y += line_h;
 
-            // CPU Row 2
-            draw_text("Clock", col0, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>4} MHz", fmt_val(tel.cpu_freq_mhz)), col1, cur_y, font_size, c_val, pixels);
-            draw_text("Parked", col2, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>2}", tel.parked_cores), col3, cur_y, font_size, c_val, pixels);
+            draw_text_with_shadow("Clock", col0, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>4} MHz", fmt_val(tel.cpu_freq_mhz)), col1, cur_y, font_size, c_val, &mut self.glyph_cache);
+            draw_text_with_shadow("Parked", col2, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>2}", tel.parked_cores), col3, cur_y, font_size, c_val, &mut self.glyph_cache);
             cur_y += line_h * 1.5;
 
-            // RAM
-            draw_text("RAM", col0, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>4.1} / {:.1} GiB", tel.ram_used_gb, tel.ram_total_gb), col1, cur_y, font_size, c_val, pixels);
-            draw_text("Speed", col3, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>4} MT/s", fmt_val(tel.ram_speed_mts)), col4, cur_y, font_size, c_val, pixels);
+            if config.show_cores && !tel.core_usages.is_empty() {
+                draw_text_with_shadow("Cores", col0, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+                cur_y += line_h;
+                let cols = 4;
+                let cw = 95.0 * scale as f32;
+                for (i, usage) in tel.core_usages.iter().enumerate() {
+                    let freq = tel.core_freqs.get(i).copied().unwrap_or(0);
+                    let r = i / cols;
+                    let c = i % cols;
+                    let tx = col0 + (c as f32) * cw;
+                    let ty = cur_y + (r as f32) * line_h;
+                    let col_val = if *usage > 80 { (255, 100, 100) } else { c_val };
+                    let txt = if freq > 0 {
+                        format!("{:>2}: {:>3}% {:>4}", i, usage, freq)
+                    } else {
+                        format!("{:>2}: {:>3}%", i, usage)
+                    };
+                    draw_text_with_shadow(&txt, tx, ty, font_size, col_val, &mut self.glyph_cache);
+                }
+                cur_y += ((tel.core_usages.len() as f32 / cols as f32).ceil() * line_h) + (line_h * 0.5);
+            }
+
+            draw_text_with_shadow("RAM", col0, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>4.1} / {:.1} GiB", tel.ram_used_gb, tel.ram_total_gb), col1, cur_y, font_size, c_val, &mut self.glyph_cache);
+            draw_text_with_shadow("Speed", col4, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>4} MT/s", fmt_val(tel.ram_speed_mts)), col5, cur_y, font_size, c_val, &mut self.glyph_cache);
             cur_y += line_h * 1.5;
 
-            // FPS
-            draw_text("FPS", col0, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>4.0}", cur_fps), col1, cur_y, font_size, (0, 255, 100), pixels);
-            draw_text("Frame", col2, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>4.1} ms", cur_ft), col3, cur_y, font_size, c_val, pixels);
+            draw_text_with_shadow("FPS", col0, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>4.0}", cur_fps), col1, cur_y, font_size, (0, 255, 100), &mut self.glyph_cache);
+            draw_text_with_shadow("Frame", col2, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>4.1} ms", cur_ft), col3, cur_y, font_size, c_val, &mut self.glyph_cache);
             cur_y += line_h;
 
-            draw_text("AVG", col0, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>4.0}", avg_fps), col1, cur_y, font_size, c_val, pixels);
-            draw_text("1% Low", col2, cur_y, font_size, c_lbl, pixels);
-            draw_text(&format!("{:>4.0}", low_1), col3, cur_y, font_size, c_val, pixels);
+            draw_text_with_shadow("AVG", col0, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>4.0}", avg_fps), col1, cur_y, font_size, c_val, &mut self.glyph_cache);
+            draw_text_with_shadow("1% Low", col2, cur_y, font_size, c_lbl, &mut self.glyph_cache);
+            draw_text_with_shadow(&format!("{:>4.0}", low_1), col3, cur_y, font_size, c_val, &mut self.glyph_cache);
             cur_y += line_h;
 
             device.unmap_memory(self.staging_memories[image_index]);

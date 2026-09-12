@@ -797,6 +797,8 @@ fn run_loop(
                 vram_total_gb: vram_total,
                 active_profile,
                 parked_cores,
+                core_usages: cpu_percents.iter().map(|&v| v as u8).collect(),
+                core_freqs: hw_collector.data.get_all_cpu_freqs(),
             }));
 
             if let Ok(mut s) = state.lock() {

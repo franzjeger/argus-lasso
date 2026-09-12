@@ -15,6 +15,9 @@ pub struct TelemetryFrame {
     pub cpu_temp_c: u8,
     pub cpu_power_w: f32,
     pub cpu_freq_mhz: Option<u32>,
+    pub parked_cores: u32,
+    pub core_usages: Vec<u8>,
+    pub core_freqs: Vec<u32>,
     
     pub gpu_name: String,
     pub gpu_usage_percent: u8,
@@ -30,19 +33,19 @@ pub struct TelemetryFrame {
     
     pub vram_used_gb: f32,
     pub vram_total_gb: f32,
-    
     pub active_profile: String,
-    pub parked_cores: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayConfig {
     pub show_overlay: bool,
     pub scale: u32,
+    pub position: (i32, i32),
     pub offset_x: i32,
     pub offset_y: i32,
     pub text_color: (u8, u8, u8, u8), // RGBA
     pub bg_color: (u8, u8, u8, u8),   // RGBA
+    pub show_cores: bool,
 }
 
 impl Default for OverlayConfig {
@@ -50,10 +53,12 @@ impl Default for OverlayConfig {
         Self {
             show_overlay: true,
             scale: 2,
+            position: (10, 10),
             offset_x: 4,
             offset_y: 4,
             text_color: (0, 0xFF, 0x66, 0xFF), // Greenish
-            bg_color: (0, 0, 0, 0xB0),         // Semi-transparent black
+            bg_color: (0, 0, 0, 0),         // Semi-transparent black
+            show_cores: false,
         }
     }
 }

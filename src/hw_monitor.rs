@@ -117,7 +117,7 @@ impl HwMonitorData {
         for group in &self.groups {
             if group.category == "GPU" {
                 for sensor in &group.sensors {
-                    if sensor.label == "Usage" {
+                    if sensor.label == "Usage" || sensor.label == "GPU Load" {
                         return sensor.value as u8;
                     }
                 }
@@ -223,6 +223,18 @@ impl HwMonitorData {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
             .map(|khz| khz / 1000)
+    }
+
+    pub fn get_all_cpu_freqs(&self) -> Vec<u32> {
+        let mut freqs = Vec::new();
+        for group in &self.groups {
+            if group.category == "CPU" && group.name == "Frequencies" {
+                for sensor in &group.sensors {
+                    freqs.push(sensor.value as u32);
+                }
+            }
+        }
+        freqs
     }
 
     pub fn get_gpu_name(&self) -> String {
