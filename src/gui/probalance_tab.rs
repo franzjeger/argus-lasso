@@ -57,7 +57,7 @@ impl ProBalanceTab {
             .show(ui, |ui| {
 
         // ── Status card: state, plain-language summary, live count ────────
-        card_untitled(ui, |ui| {
+        crate::gui::theme::card_untitled(ui, |ui| {
             ui.horizontal(|ui| {
                 th::toggle(ui, &mut self.cfg.enabled);
                 ui.add_space(tokens::SPACE_S);
@@ -106,7 +106,7 @@ impl ProBalanceTab {
         // reminder that there is nothing to show. The status card above
         // already says so in one line.
         if !throttle_infos.is_empty() {
-            card_untitled(ui, |ui| {
+            crate::gui::theme::card_untitled(ui, |ui| {
                 egui::Grid::new("pb_throttle_rows")
                     .num_columns(5)
                     .min_row_height(tokens::ROW_H_DENSE)
@@ -402,17 +402,3 @@ fn add_chip(ui: &mut Ui, label: &str) -> bool {
     ui.add(btn).clicked()
 }
 
-/// A bordered container with no heading — mockup 2f uses these for the status
-/// card (its hero line is the title) and for the throttle table.
-fn card_untitled(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    let border = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    egui::Frame::new()
-        .fill(crate::gui::theme::card_fill(ui))
-        .stroke(egui::Stroke::new(1.0_f32, border))
-        .inner_margin(egui::Margin::same(8))
-        .corner_radius(egui::CornerRadius::same(4))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            add_contents(ui);
-        });
-}

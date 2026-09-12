@@ -291,7 +291,7 @@ impl SettingsTab {
                     );
                     ui.add_space(tokens::SPACE_S);
 
-                    form_row(ui, "Rule enforce interval", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Rule enforce interval", |ui| {
                         ui.add(
                             egui::DragValue::new(&mut self.config.monitor.rule_enforce_interval_ms)
                                 .range(100..=10000)
@@ -299,7 +299,7 @@ impl SettingsTab {
                         );
                     });
 
-                    form_row(ui, "Display refresh", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Display refresh", |ui| {
                         const PICKS: [u64; 4] = [500, 1000, 2000, 5000];
                         let sel = PICKS
                             .iter()
@@ -322,7 +322,7 @@ impl SettingsTab {
                     );
                     ui.add_space(tokens::SPACE_S);
 
-                    form_row(ui, "Theme", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Theme", |ui| {
                         let prev_theme = self.theme.clone();
                         egui::ComboBox::from_id_salt("theme_picker")
                             .selected_text(self.theme.label())
@@ -341,7 +341,7 @@ impl SettingsTab {
                         }
                     });
 
-                    form_row(ui, "Window opacity", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Window opacity", |ui| {
                         // The track is painted with `inactive.bg_fill`, which
                         // equals the window background — invisible without a
                         // value fill. Enable the trailing fill (accent colour)
@@ -362,7 +362,7 @@ impl SettingsTab {
                         );
                     });
 
-                    form_row(ui, "Scaling governor", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Scaling governor", |ui| {
                         if self.available_governors.is_empty() {
                             ui.label(
                                 egui::RichText::new("(not available)")
@@ -384,7 +384,7 @@ impl SettingsTab {
                         }
                     });
 
-                    form_row(ui, "Energy perf. preference", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Energy perf. preference", |ui| {
                         if self.available_epps.is_empty() {
                             ui.label(
                                 egui::RichText::new("(not available)")
@@ -422,11 +422,11 @@ impl SettingsTab {
                     );
                     ui.add_space(tokens::SPACE_S);
 
-                    form_row(ui, "Desktop notifications", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Desktop notifications", |ui| {
                         ui.checkbox(&mut self.config.ui.notifications_enabled, "Enabled");
                     });
 
-                    form_row(ui, "Temperature alerts", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Temperature alerts", |ui| {
                         ui.checkbox(&mut self.config.hw_alerts.enabled, "Enabled");
                         let on = self.config.hw_alerts.enabled;
                         let weak = ui.visuals().weak_text_color();
@@ -452,7 +452,7 @@ impl SettingsTab {
                         });
                     });
 
-                    form_row(ui, "Start with session", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Start with session", |ui| {
                         ui.checkbox(
                             &mut self.autostart_enabled,
                             "Launch Argus-Lasso automatically with your desktop session",
@@ -471,7 +471,7 @@ impl SettingsTab {
                     );
                     ui.add_space(tokens::SPACE_S);
 
-                    form_row(ui, "Installed version", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Installed version", |ui| {
                         ui.label(
                             egui::RichText::new(format!("v{}", crate::updater::current_version()))
                                 .font(theme::num_font(tokens::FONT_BODY)),
@@ -529,7 +529,7 @@ impl SettingsTab {
                         }
                     });
 
-                    form_row(ui, "Check on startup", |ui| {
+                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Check on startup", |ui| {
                         ui.checkbox(&mut self.config.ui.check_updates_on_start, "Enabled");
                     });
                 });
@@ -554,23 +554,6 @@ impl SettingsTab {
     }
 }
 
-/// Two-column settings row: fixed-width, left-aligned label + control column (§7).
-fn form_row(ui: &mut Ui, label: &str, add_contents: impl FnOnce(&mut Ui)) {
-    ui.horizontal(|ui| {
-        let h = ui.spacing().interact_size.y;
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(tokens::FORM_LABEL_W, h), egui::Sense::hover());
-        ui.painter().text(
-            egui::pos2(rect.left(), rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            label,
-            egui::FontId::proportional(tokens::FONT_BODY),
-            ui.visuals().text_color(),
-        );
-        add_contents(ui);
-    });
-    ui.add_space(tokens::SPACE_XS);
-}
 
 /// Weak, small help line under a group title (§7).
 fn help_text(ui: &mut Ui, text: &str) {

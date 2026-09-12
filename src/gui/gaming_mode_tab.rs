@@ -421,7 +421,7 @@ impl GamingModeTab {
             }
 
             // ── Status hero: state, topology summary, one primary action ──
-            card_untitled(ui, |ui| {
+            crate::gui::theme::card_untitled(ui, |ui| {
                 ui.horizontal(|ui| {
                     status_dot(
                         ui,
@@ -1135,17 +1135,3 @@ fn proc_name_matches(game_name: &str, pid: u32) -> bool {
     false
 }
 
-/// A bordered container with no heading — mockup 2b's status card leads with
-/// its hero line, so a card title above it would just say the same thing.
-fn card_untitled(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    let border = ui.visuals().widgets.noninteractive.bg_stroke.color;
-    egui::Frame::new()
-        .fill(crate::gui::theme::card_fill(ui))
-        .stroke(egui::Stroke::new(1.0_f32, border))
-        .inner_margin(egui::Margin::same(8))
-        .corner_radius(egui::CornerRadius::same(4))
-        .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            add_contents(ui);
-        });
-}

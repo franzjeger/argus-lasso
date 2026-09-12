@@ -710,6 +710,22 @@ pub fn num_font(size: f32) -> egui::FontId {
 
 /// QGroupBox-style bordered card with a top-left title — THE section container
 /// for every tab (single definition; per-tab copies are deprecated).
+
+/// A bordered container with no heading (used for hero cards where the
+/// title is replaced by a large primary value/status).
+pub fn card_untitled(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
+    let border_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    egui::Frame::new()
+        .fill(card_fill(ui))
+        .stroke(egui::Stroke::new(1.0_f32, border_color))
+        .inner_margin(egui::Margin::same(8))
+        .corner_radius(egui::CornerRadius::same(4))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add_contents(ui);
+        });
+}
+
 pub fn card(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     card_hinted(ui, title, "", add_contents)
 }
