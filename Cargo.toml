@@ -82,13 +82,13 @@ wayland-sys      = { version = "0.31", features = ["client"] }
 raw-window-handle = "0.6"
 
 # PNG writing for --ui-tour captures (also a build-dep, for icon embedding)
-png = "0.17"
+png = "0.18"
 ureq = { version = "3.3.0", features = ["rustls"] }
 sha2 = "0.11.0"
 minisign-verify = "0.2.5"
 
 [build-dependencies]
-png = "0.17"
+png = "0.18"
 
 [profile.release]
 opt-level     = 3
