@@ -1,0 +1,13 @@
+[package]
+name = "argus-layer"
+version = "0.1.0"
+edition = "2021"
+authors = ["franzjeger"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Standard ash crate for Vulkan FFI (it gives us access to Vulkan function pointers)
+ash = "0.38"
+libc = "0.2"
