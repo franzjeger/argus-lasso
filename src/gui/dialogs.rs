@@ -386,6 +386,7 @@ impl AffinityDialog {
                         close_as = Some(false);
                     }
                     egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                        ui.set_min_width(ui.available_width());
                         if !offline.is_empty() {
                             let offline_str = cpuset_to_cpulist(offline);
                             ui.colored_label(
@@ -571,6 +572,7 @@ impl NiceDialog {
                         close_as = Some(false);
                     }
                     egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                        ui.set_min_width(ui.available_width());
                         ui.label(
                             "Nice priority: lower = higher priority. Negative values require root.",
                         );
@@ -672,6 +674,7 @@ impl IoNiceDialog {
                         close_as = Some(false);
                     }
                     egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                        ui.set_min_width(ui.available_width());
                         ui.label("I/O class: Realtime requires root. Level 0=highest, 7=lowest.");
                         egui::ComboBox::from_label("I/O Class")
                             .selected_text(match *class {
@@ -837,6 +840,7 @@ impl RuleEditDialog {
                     });
 
                     egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                        ui.set_min_width(ui.available_width());
                         let s = th::sem(ui);
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             th::form_row_w(ui, LW, "Name", |ui| {
@@ -1256,6 +1260,7 @@ impl RulePresetsDialog {
                     });
 
                     egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                        ui.set_min_width(ui.available_width());
                         ui.label(
                             egui::RichText::new(
                                 "Templates pre-fill a rule; you can edit it before saving.",
@@ -1442,6 +1447,7 @@ impl SteamGamePickerDialog {
                         cancelled = true;
                     }
                     egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                        ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.label("Filter:");
                             ui.text_edit_singleline(filter);
@@ -1458,19 +1464,34 @@ impl SteamGamePickerDialog {
                             })
                             .collect();
 
-                        egui::ScrollArea::vertical()
-                            .max_height(400.0)
-                            .show(ui, |ui| {
+                        egui_extras::TableBuilder::new(ui)
+                            .striped(true)
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(egui_extras::Column::exact(80.0))
+                            .column(egui_extras::Column::remainder())
+                            .min_scrolled_height(0.0)
+                            .max_scroll_height(400.0)
+                            .body(|mut body| {
                                 for (orig_i, (appid, name)) in &filtered {
-                                    let sel = *selected == Some(*orig_i);
-                                    let row = format!("{appid:<10} {name}");
-                                    let resp = ui.selectable_label(sel, &row);
-                                    if resp.double_clicked() {
-                                        *selected = Some(*orig_i);
-                                        accepted = true;
-                                    } else if resp.clicked() {
-                                        *selected = Some(*orig_i);
-                                    }
+                                    body.row(24.0, |mut row| {
+                                        let sel = *selected == Some(*orig_i);
+                                        row.set_selected(sel);
+                                        
+                                        row.col(|ui| {
+                                            ui.label(appid.as_str());
+                                        });
+                                        row.col(|ui| {
+                                            ui.label(name.as_str());
+                                        });
+                                        
+                                        let resp = row.response();
+                                        if resp.double_clicked() {
+                                            *selected = Some(*orig_i);
+                                            accepted = true;
+                                        } else if resp.clicked() {
+                                            *selected = Some(*orig_i);
+                                        }
+                                    });
                                 }
                             });
 
@@ -1636,6 +1657,7 @@ impl LutrisGamePickerDialog {
                         cancelled = true;
                     }
                     egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                        ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.label("Filter:");
                             ui.text_edit_singleline(filter);
@@ -1650,18 +1672,30 @@ impl LutrisGamePickerDialog {
                             })
                             .collect();
 
-                        egui::ScrollArea::vertical()
-                            .max_height(400.0)
-                            .show(ui, |ui| {
+                        egui_extras::TableBuilder::new(ui)
+                            .striped(true)
+                            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                            .column(egui_extras::Column::remainder())
+                            .min_scrolled_height(0.0)
+                            .max_scroll_height(400.0)
+                            .body(|mut body| {
                                 for (orig_i, (_, label)) in &filtered {
-                                    let sel = *selected == Some(*orig_i);
-                                    let resp = ui.selectable_label(sel, label.as_str());
-                                    if resp.double_clicked() {
-                                        *selected = Some(*orig_i);
-                                        accepted = true;
-                                    } else if resp.clicked() {
-                                        *selected = Some(*orig_i);
-                                    }
+                                    body.row(24.0, |mut row| {
+                                        let sel = *selected == Some(*orig_i);
+                                        row.set_selected(sel);
+                                        
+                                        row.col(|ui| {
+                                            ui.label(label.as_str());
+                                        });
+                                        
+                                        let resp = row.response();
+                                        if resp.double_clicked() {
+                                            *selected = Some(*orig_i);
+                                            accepted = true;
+                                        } else if resp.clicked() {
+                                            *selected = Some(*orig_i);
+                                        }
+                                    });
                                 }
                             });
 

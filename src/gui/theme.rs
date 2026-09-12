@@ -987,7 +987,7 @@ pub fn apply(ctx: &Context, native_ppp: f32) {
     let mut vis = Visuals::dark();
 
     // ── Backgrounds ──────────────────────────────────────────────────────
-    vis.window_fill = Breeze::WINDOW_BG;
+    vis.window_fill = Breeze::BASE;
     vis.panel_fill = Breeze::WINDOW_BG;
     vis.faint_bg_color = Breeze::ALT_BASE;
     vis.extreme_bg_color = Breeze::BASE;
@@ -1083,7 +1083,7 @@ pub fn apply_light(ctx: &Context, native_ppp: f32) {
     let alt_base = Color32::from_rgb(0xf4, 0xf4, 0xf4); // #f4f4f4  table row odd
     let tab_bar = Color32::from_rgb(0xd5, 0xd9, 0xde); // #d5d9de  tab bar / panel bg
 
-    vis.window_fill = window_bg;
+    vis.window_fill = base;
     vis.panel_fill = tab_bar;
     vis.faint_bg_color = alt_base;
     vis.extreme_bg_color = base;
@@ -1209,7 +1209,7 @@ pub fn apply_adwaita(ctx: &Context, native_ppp: f32, dark: bool) {
             )
         };
 
-    vis.window_fill = window_bg;
+    vis.window_fill = base;
     vis.panel_fill = panel;
     vis.faint_bg_color = alt_base;
     vis.extreme_bg_color = base;
