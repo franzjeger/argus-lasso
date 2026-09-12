@@ -45,6 +45,12 @@ lazy_static::lazy_static! {
     static ref REAL_GET_DEVICE_QUEUE: RwLock<HashMap<ash::vk::Device, ash::vk::PFN_vkGetDeviceQueue>> = RwLock::new(HashMap::new());
     static ref REAL_QUEUE_PRESENT: RwLock<HashMap<ash::vk::Queue, ash::vk::PFN_vkQueuePresentKHR>> = RwLock::new(HashMap::new());
     static ref REAL_CREATE_DEVICE: RwLock<HashMap<ash::vk::PhysicalDevice, ash::vk::PFN_vkCreateDevice>> = RwLock::new(HashMap::new());
+
+    static ref REAL_CREATE_INSTANCE: RwLock<HashMap<ash::vk::Instance, ash::vk::PFN_vkCreateInstance>> = RwLock::new(HashMap::new());
+    static ref REAL_ENUM_PHYSICAL_DEVICES: RwLock<HashMap<ash::vk::Instance, ash::vk::PFN_vkEnumeratePhysicalDevices>> = RwLock::new(HashMap::new());
+    static ref PHYS_TO_INST: RwLock<HashMap<ash::vk::PhysicalDevice, ash::vk::Instance>> = RwLock::new(HashMap::new());
+    static ref DEVICE_TO_PHYS: RwLock<HashMap<ash::vk::Device, ash::vk::PhysicalDevice>> = RwLock::new(HashMap::new());
+    
     static ref LAST_FRAME_TIME: RwLock<Option<Instant>> = RwLock::new(None);
 }
 
