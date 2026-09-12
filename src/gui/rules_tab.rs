@@ -199,11 +199,11 @@ impl RulesTab {
             let avail_w = ui.available_width() - 2.0;
             let table_left = ui.min_rect().left();
             let table_right = table_left + avail_w;
-            let col_pattern = (avail_w * 0.13).clamp(80.0, 200.0);
-            let col_match = (avail_w * 0.08).clamp(70.0, 120.0);
-            let col_aff = (avail_w * 0.11).clamp(70.0, 160.0);
-            let col_nice = (avail_w * 0.05).clamp(44.0, 70.0);
-            let col_io = (avail_w * 0.08).clamp(70.0, 120.0);
+            let col_pattern = (avail_w * 0.13).clamp(40.0, 200.0);
+            let col_match = (avail_w * 0.08).clamp(40.0, 120.0);
+            let col_aff = (avail_w * 0.11).clamp(40.0, 160.0);
+            let col_nice = (avail_w * 0.05).clamp(30.0, 70.0);
+            let col_io = (avail_w * 0.08).clamp(40.0, 120.0);
 
             egui::Frame::new()
                 .stroke(egui::Stroke::new(1.0_f32, border_color))
@@ -544,9 +544,10 @@ impl RulesTab {
                             .desired_width(150.0),
                     );
                     if !self.test_input.is_empty() {
+                        let test_lower = self.test_input.to_lowercase();
                         let matches: Vec<String> = rules
                             .iter()
-                            .filter(|r| r.enabled && r.matches(&self.test_input))
+                            .filter(|r| r.enabled && r.matches(&self.test_input, &test_lower))
                             .map(|r| r.name.clone())
                             .collect();
                         if matches.is_empty() {

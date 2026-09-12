@@ -547,6 +547,8 @@ fn run_loop(
                         &rules,
                         proc.pid,
                         &proc.name,
+                        Some(proc.nice),
+                        crate::utils::get_ionice_raw(proc.pid), // Could be cached, but only queried if rule matches
                         &mut enforce_nice_failed,
                         &log_cb,
                     );

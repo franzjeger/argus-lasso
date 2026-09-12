@@ -959,7 +959,7 @@ impl RuleEditDialog {
                     self.rule.ionice_class = None;
                     self.rule.ionice_level = None;
                 }
-                self.rule.refresh_regex();
+                self.rule.refresh_pattern_caches();
                 self.result = Some(Some(self.rule.clone()));
                 return Some(Some(self.rule.clone()));
             } else {
@@ -1014,8 +1014,11 @@ fn match_summary(
     // logic the engine will, including an invalid regex matching nothing.
     let mut probe = rule.clone();
     probe.enabled = true;
-    probe.refresh_regex();
-    let hits: Vec<&String> = proc_names.iter().filter(|n| probe.matches(n)).collect();
+    probe.refresh_pattern_caches();
+    let hits: Vec<&String> = proc_names.iter().filter(|n| {
+        let lower = n.to_lowercase();
+        probe.matches(n, &lower)
+    }).collect();
     if hits.is_empty() {
         return (
             "Matches no running process".into(),

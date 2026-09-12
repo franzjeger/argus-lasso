@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::process::Command;
 
 // ── cpulist parsing / formatting ──────────────────────────────────────────────
 
@@ -176,57 +175,44 @@ use nix::sched::CpuSet;
 /// Set nice priority via `renice` subprocess.
 /// Negative values require root. Returns true on success.
 pub fn set_nice(pid: u32, nice: i32) -> bool {
-    let output = Command::new("renice")
-        .args(["-n", &nice.to_string(), "-p", &pid.to_string()])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            log::debug!("renice pid={pid} nice={nice}: OK");
-            true
-        }
-        Ok(o) => {
-            log::warn!(
-                "renice pid={pid} nice={nice} failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            false
-        }
-        Err(e) => {
-            log::warn!("renice pid={pid}: {e}");
-            false
-        }
+    use nix::libc;
+    // clear errno just in case, though setpriority returns 0 on success
+    let res = unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice as libc::c_int)
+    };
+    if res == 0 {
+        log::debug!("setpriority pid={pid} nice={nice}: OK");
+        true
+    } else {
+        let err = std::io::Error::last_os_error();
+        log::warn!("setpriority pid={pid} nice={nice} failed: {err}");
+        false
     }
 }
 
 // ── ionice ───────────────────────────────────────────────────────────────────
 
-/// Set I/O priority via `ionice` subprocess.
+/// Set I/O priority via ioprio_set syscall.
 /// class: 1=realtime, 2=best-effort, 3=idle. level: 0-7 (RT and BE only).
 pub fn set_ionice(pid: u32, class: i32, level: Option<i32>) -> bool {
-    let mut cmd = Command::new("ionice");
-    cmd.args(["-c", &class.to_string()]);
-    if let Some(lvl) = level {
-        if class == 1 || class == 2 {
-            cmd.args(["-n", &lvl.to_string()]);
-        }
-    }
-    cmd.args(["-p", &pid.to_string()]);
-    match cmd.output() {
-        Ok(o) if o.status.success() => {
-            log::debug!("ionice pid={pid} class={class} level={level:?}: OK");
-            true
-        }
-        Ok(o) => {
-            log::warn!(
-                "ionice pid={pid} class={class} failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            false
-        }
-        Err(e) => {
-            log::warn!("ionice pid={pid}: {e}");
-            false
-        }
+    use nix::libc;
+    let lvl = level.unwrap_or(0);
+    let prio = (class << 13) | (lvl & 0x1fff);
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            1, /* IOPRIO_WHO_PROCESS */
+            pid as libc::c_int,
+            prio as libc::c_int,
+        )
+    };
+    if res == 0 {
+        log::debug!("ioprio_set pid={pid} class={class} level={level:?}: OK");
+        true
+    } else {
+        let err = std::io::Error::last_os_error();
+        log::warn!("ioprio_set pid={pid} class={class} failed: {err}");
+        false
     }
 }
 

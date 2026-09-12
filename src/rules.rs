@@ -26,10 +26,12 @@ pub struct Rule {
     /// Compiled regex, populated lazily if match_type == "regex"
     cached_regex: Option<Result<Regex, String>>,
     /// The `pattern` that `cached_regex` was compiled from. Lets
-    /// `refresh_regex` skip re-compiling when the pattern is unchanged — the
+    /// `refresh_pattern_caches` skip re-compiling when the pattern is unchanged — the
     /// rule dialog's live match count calls it every frame, and recompiling a
     /// regex per frame was wasted work.
     regex_pattern: String,
+    /// Pre-lowercased pattern for fast "contains" matching
+    pub pattern_lower: String,
 }
 
 impl Rule {
@@ -51,6 +53,7 @@ impl Rule {
             enabled: c.enabled,
             cached_regex,
             regex_pattern: c.pattern.clone(),
+            pattern_lower: c.pattern.to_lowercase(),
         }
     }
 
@@ -81,11 +84,12 @@ impl Rule {
             enabled: true,
             cached_regex: None,
             regex_pattern: String::new(),
+            pattern_lower: String::new(),
         }
     }
 
     /// Returns true if proc_name matches this rule.
-    pub fn matches(&self, proc_name: &str) -> bool {
+    pub fn matches(&self, proc_name: &str, proc_name_lower: &str) -> bool {
         if !self.enabled || self.pattern.is_empty() {
             return false;
         }
@@ -103,9 +107,7 @@ impl Rule {
             }
             _ => {
                 // "contains" — case-insensitive substring
-                proc_name
-                    .to_lowercase()
-                    .contains(&self.pattern.to_lowercase())
+                proc_name_lower.contains(&self.pattern_lower)
             }
         }
     }
@@ -115,7 +117,12 @@ impl Rule {
     /// Skips re-compiling when the pattern is unchanged — the rule dialog's
     /// live match count calls this every frame, and recompiling the regex each
     /// time was pure waste.
-    pub fn refresh_regex(&mut self) {
+    pub fn refresh_pattern_caches(&mut self) {
+        // Always sync the lowercase pattern cache
+        if self.pattern_lower.len() != self.pattern.len() || !self.pattern.eq_ignore_ascii_case(&self.pattern_lower) {
+            self.pattern_lower = self.pattern.to_lowercase();
+        }
+
         if self.match_type != "regex" {
             if self.cached_regex.is_some() {
                 self.cached_regex = None;
@@ -204,16 +211,25 @@ impl RuleEngine {
     /// the action list from apply_to_process (an already-correct process yields
     /// no actions but is still rule-managed).
     pub fn matches_any(&self, proc_name: &str) -> bool {
-        self.rules.iter().any(|r| r.matches(proc_name))
+        let lower = proc_name.to_lowercase();
+        self.rules.iter().any(|r| r.matches(proc_name, &lower))
     }
 
     /// Apply all matching rules to a process. Returns list of action descriptions.
     /// All matching rules are applied (not first-match-stop).
     pub fn apply_to_process(&mut self, pid: u32, proc_name: &str) -> Vec<String> {
         let mut nice_failed = std::mem::take(&mut self.nice_failed);
-        let actions = apply_rules(&self.rules, pid, proc_name, &mut nice_failed, &|m| {
-            self.log(m)
-        });
+        let current_nice = utils::get_nice(pid);
+        let current_ionice = utils::get_ionice_raw(pid);
+        let actions = apply_rules(
+            &self.rules,
+            pid,
+            proc_name,
+            current_nice,
+            current_ionice,
+            &mut nice_failed,
+            &|m| self.log(m)
+        );
         self.nice_failed = nice_failed;
         actions
     }
@@ -229,12 +245,15 @@ pub fn apply_rules(
     rules: &[Rule],
     pid: u32,
     proc_name: &str,
+    current_nice: Option<i32>,
+    current_ionice: Option<(i32, i32)>,
     nice_failed: &mut std::collections::HashSet<(String, u32)>,
     log: &impl Fn(String),
 ) -> Vec<String> {
     let mut actions = Vec::new();
+    let proc_name_lower = proc_name.to_lowercase();
     for rule in rules {
-        if !rule.matches(proc_name) {
+        if !rule.matches(proc_name, &proc_name_lower) {
             continue;
         }
 
@@ -256,7 +275,6 @@ pub fn apply_rules(
         // ── Nice ─────────────────────────────────────────────────────
         if let Some(nice) = rule.nice {
             let fail_key = (rule.rule_id.clone(), pid);
-            let current_nice = utils::get_nice(pid);
             if current_nice != Some(nice) && !nice_failed.contains(&fail_key) {
                 if utils::set_nice(pid, nice) {
                     let msg = format!(
@@ -282,8 +300,7 @@ pub fn apply_rules(
         // ── Ionice ───────────────────────────────────────────────────
         if let Some(class) = rule.ionice_class {
             let target_level = rule.ionice_level.unwrap_or(0);
-            let current = utils::get_ionice_raw(pid);
-            if current != Some((class, target_level))
+            if current_ionice != Some((class, target_level))
                 && utils::set_ionice(pid, class, rule.ionice_level)
             {
                 let msg = format!(
@@ -312,7 +329,7 @@ mod tests {
         let mut r = Rule::new_empty();
         r.pattern = pattern.into();
         r.match_type = match_type.into();
-        r.refresh_regex();
+        r.refresh_pattern_caches();
         r
     }
 
@@ -364,37 +381,37 @@ mod tests {
     }
 
     #[test]
-    fn refresh_regex_recompiles_on_pattern_change() {
+    fn refresh_pattern_caches_recompiles_on_pattern_change() {
         let mut r = rule_with("foo", "regex");
         assert!(r.matches("foo"));
         r.pattern = "bar".into();
-        r.refresh_regex();
+        r.refresh_pattern_caches();
         assert!(r.matches("bar"));
         assert!(!r.matches("foo"));
     }
 
     #[test]
-    fn refresh_regex_keeps_cache_when_pattern_unchanged() {
+    fn refresh_pattern_caches_keeps_cache_when_pattern_unchanged() {
         // The rule dialog calls this every frame; it must be a no-op (and keep
         // matching) when the pattern hasn't changed.
         let mut r = rule_with("foo", "regex");
         assert!(r.matches("foo"));
-        r.refresh_regex();
-        r.refresh_regex();
+        r.refresh_pattern_caches();
+        r.refresh_pattern_caches();
         assert!(r.matches("foo"));
         assert!(!r.matches("bar"));
     }
 
     #[test]
-    fn refresh_regex_clears_cache_when_leaving_regex() {
+    fn refresh_pattern_caches_clears_cache_when_leaving_regex() {
         let mut r = rule_with("foo", "regex");
         assert!(r.cached_regex.is_some());
         r.match_type = "contains".into();
-        r.refresh_regex();
+        r.refresh_pattern_caches();
         assert!(r.cached_regex.is_none());
         // And back to regex recompiles from the current pattern.
         r.match_type = "regex".into();
-        r.refresh_regex();
+        r.refresh_pattern_caches();
         assert!(r.cached_regex.is_some());
         assert!(r.matches("foo"));
     }
