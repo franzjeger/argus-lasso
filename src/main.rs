@@ -265,6 +265,7 @@ fn main() {
                 let mut offline: Vec<u32> = utils::get_offline_cpus().into_iter().collect();
                 offline.sort_unstable();
                 let json = serde_json::json!({
+                    "cpu_percent_scale": "share_of_total_available_capacity",
                     "cpu_model": monitor::read_cpu_model(),
                     "cpus_online": utils::get_online_cpus().len(),
                     "cpus_offline": offline,

@@ -13,14 +13,14 @@ or stopped 0% fan remains a valid value.
 | GPU load, temperature, board power | NVIDIA NVML on tested hardware; %, °C, W |
 | GPU core/memory clocks, fan | NVML; MHz and fan duty %. Fan duty is not RPM |
 | VRAM used/total | NVML memory information; displayed in GiB |
-| CPU overall/logical-thread load | Deltas of `/proc/stat` busy/total counters; each reading 0–100% |
+| CPU overall/logical-thread load | Deltas of `/proc/stat` busy/total counters; weighted overall total excludes offline CPUs, each reading 0–100% |
 | CPU temperature | Available hwmon temperature channels (for example k10temp/coretemp); °C |
 | CPU clock | cpufreq `scaling_cur_freq`, converted from kHz to MHz; overall field currently uses CPU 0, not a package average |
 | Per-thread clock and identity | cpufreq plus Linux CPU topology; MHz, logical CPU ID, physical core/package identity |
 | CPU package power | RAPL package energy delta / actual elapsed time; W, never TDP |
 | RAM used/total | `/proc/meminfo`; used = total − available, displayed in GiB |
 | Configured RAM speed | SMBIOS Type 17 configured speed, MT/s; not the DIMM's advertised maximum |
-| Process CPU% | Process CPU-time deltas on the 100% = one logical CPU scale |
+| Process CPU% | Process CPU-time delta / total available CPU-time delta; 0–100% of the whole system |
 | Parking / Argus mode | Observed CPU online state and Argus daemon mode |
 | Launcher/profile context | Tracked game PID and start time, active launch profile; main-thread affinity/nice and ProBalance state where available |
 

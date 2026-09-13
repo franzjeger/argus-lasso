@@ -1,8 +1,6 @@
-//! ProBalance state machine: throttle CPU hogs via nice, restore when calm.
-//!
-//! Mirrors Python probalance.py exactly:
-//!   - Per-PID state: NORMAL → THROTTLED when CPU > threshold for consecutive_seconds
-//!   - Restore: THROTTLED → NORMAL when CPU < restore_threshold for restore_hysteresis_seconds
+//! System-load-gated ProBalance: reduce eligible process priorities only after
+//! sustained overall pressure; restore under lower pressure or low process use.
+//! All utilization percentages are shares of total available CPU capacity.
 
 use std::collections::HashMap;
 
@@ -119,10 +117,14 @@ fn decide(
     proc: &ProcSnapshot,
     tick_seconds: f32,
     cfg: &ProBalanceConfig,
+    system_cpu: Option<f32>,
 ) -> Decision {
+    let system_cpu = system_cpu.filter(|v| v.is_finite() && (0.0..=100.0).contains(v));
     match entry.state {
         ProcState::Normal => {
-            if proc.cpu_percent > cfg.cpu_threshold_percent {
+            if system_cpu.is_some_and(|v| v > cfg.system_cpu_threshold_percent)
+                && proc.cpu_percent >= cfg.process_min_cpu_percent
+            {
                 entry.consecutive_high += tick_seconds;
                 if entry.consecutive_high >= cfg.consecutive_seconds {
                     let new_nice = (proc.nice + cfg.nice_adjustment).min(cfg.nice_floor);
@@ -132,11 +134,13 @@ fn decide(
                     return Decision::Throttle { new_nice };
                 }
             } else {
-                entry.consecutive_high = (entry.consecutive_high - tick_seconds).max(0.0);
+                entry.consecutive_high = 0.0;
             }
         }
         ProcState::Throttled => {
-            if proc.cpu_percent < cfg.restore_threshold_percent {
+            if system_cpu.is_none_or(|v| v < cfg.system_restore_threshold_percent)
+                || proc.cpu_percent < cfg.process_min_cpu_percent
+            {
                 entry.consecutive_low += tick_seconds;
                 if entry.consecutive_low >= cfg.restore_hysteresis_seconds {
                     let orig = entry.original_nice.unwrap_or(0);
@@ -190,7 +194,8 @@ pub struct ProBalance {
 }
 
 impl ProBalance {
-    pub fn new(cfg: ProBalanceConfig) -> Self {
+    pub fn new(mut cfg: ProBalanceConfig) -> Self {
+        cfg.normalize();
         Self {
             cfg,
             states: HashMap::new(),
@@ -201,7 +206,15 @@ impl ProBalance {
         }
     }
 
-    pub fn update_config(&mut self, cfg: ProBalanceConfig) {
+    pub fn update_config(&mut self, mut cfg: ProBalanceConfig) {
+        cfg.normalize();
+        // Never mix consecutive windows collected under different thresholds.
+        if cfg != self.cfg {
+            for entry in self.states.values_mut() {
+                entry.consecutive_high = 0.0;
+                entry.consecutive_low = 0.0;
+            }
+        }
         // Disabling ProBalance must not strand processes at their penalty
         // nice — restore everything we throttled before dropping the state.
         if !cfg.enabled && self.cfg.enabled {
@@ -405,7 +418,24 @@ impl ProBalance {
 
     /// Called every ~1s with the current process snapshot.
     /// tick_seconds is the elapsed time since the last tick.
-    pub fn tick(&mut self, snapshot: &[ProcSnapshot], tick_seconds: f32) {
+    pub fn tick(
+        &mut self,
+        snapshot: &[ProcSnapshot],
+        tick_seconds: f32,
+        system_cpu: Option<f32>,
+        protected_pids: &std::collections::HashSet<u32>,
+    ) {
+        // A long scheduler pause is not evidence of consecutive high samples.
+        let system_cpu = if tick_seconds.is_finite() && (0.0..=2.5).contains(&tick_seconds) {
+            system_cpu
+        } else {
+            None
+        };
+        let tick_seconds = if tick_seconds.is_finite() {
+            tick_seconds.clamp(0.0, 2.5)
+        } else {
+            0.0
+        };
         // Failed unit restores are retried even while disabled — a unit left
         // at the throttle weight must not depend on ProBalance staying on.
         if !self.unit_refs.is_empty() {
@@ -444,8 +474,27 @@ impl ProBalance {
         }
         self.cgroup_failed_pids.retain(|p| alive.contains(p));
 
+        // Unit-level CPUWeight must never penalize a protected neighbor.
+        let mut protected = protected_pids.clone();
+        protected.extend(
+            snapshot
+                .iter()
+                .filter(|p| self.is_exempt(&p.name))
+                .map(|p| p.pid),
+        );
+        if self.cfg.method != "nice" || !self.unit_refs.is_empty() {
+            let units: std::collections::HashSet<_> = protected
+                .iter()
+                .filter_map(|p| crate::cgroup::unit_for_pid(*p))
+                .collect();
+            for proc in snapshot {
+                if crate::cgroup::unit_for_pid(proc.pid).is_some_and(|unit| units.contains(&unit)) {
+                    protected.insert(proc.pid);
+                }
+            }
+        }
         for proc in snapshot {
-            if self.is_exempt(&proc.name) {
+            if protected.contains(&proc.pid) {
                 // A process exempted *after* being throttled must be restored,
                 // not silently abandoned in its throttled state.
                 if let Some(entry) = self.states.remove(&proc.pid) {
@@ -471,7 +520,7 @@ impl ProBalance {
                     .states
                     .entry(proc.pid)
                     .or_insert_with(|| ProcEntry::new(proc.nice));
-                decide(entry, proc, tick_seconds, &self.cfg)
+                decide(entry, proc, tick_seconds, &self.cfg, system_cpu)
             };
 
             // Apply side effects at the boundary, then finalize entry state.
@@ -556,6 +605,14 @@ impl ProBalance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn decide(
+        entry: &mut ProcEntry,
+        proc: &ProcSnapshot,
+        seconds: f32,
+        cfg: &ProBalanceConfig,
+    ) -> Decision {
+        super::decide(entry, proc, seconds, cfg, Some(proc.cpu_percent))
+    }
     use crate::config::ProBalanceConfig;
 
     fn pat(s: &str) -> Vec<String> {
@@ -608,7 +665,7 @@ mod tests {
             cpu_percent: 99.0,
             nice: 0,
         }];
-        pb.tick(&snap, 1.0);
+        pb.tick(&snap, 1.0, Some(10.0), &Default::default());
         // Disabled → state map stays empty, no syscalls attempted.
         assert_eq!(pb.tracked_pid_count(), 0);
     }
@@ -626,7 +683,7 @@ mod tests {
             cpu_percent: 99.0,
             nice: 0,
         }];
-        pb.tick(&snap, 10.0);
+        pb.tick(&snap, 10.0, Some(10.0), &Default::default());
         // Exempt processes are skipped entirely — no entry created in state map.
         assert_eq!(pb.tracked_pid_count(), 0);
     }
@@ -641,7 +698,7 @@ mod tests {
             cpu_percent: 10.0,
             nice: 0,
         }];
-        pb.tick(&snap, 1.0);
+        pb.tick(&snap, 1.0, Some(10.0), &Default::default());
         assert_eq!(pb.tracked_pid_count(), 1);
         assert!(pb.throttled_pids().is_empty());
     }
@@ -655,11 +712,11 @@ mod tests {
             cpu_percent: 10.0,
             nice: 0,
         }];
-        pb.tick(&snap1, 1.0);
+        pb.tick(&snap1, 1.0, Some(10.0), &Default::default());
         assert_eq!(pb.tracked_pid_count(), 1);
 
         // PID disappears from snapshot → state entry should be cleaned up.
-        pb.tick(&[], 1.0);
+        pb.tick(&[], 1.0, Some(10.0), &Default::default());
         assert_eq!(pb.tracked_pid_count(), 0);
     }
 
@@ -673,11 +730,11 @@ mod tests {
     fn cfg_for_state_tests() -> ProBalanceConfig {
         ProBalanceConfig {
             enabled: true,
-            cpu_threshold_percent: 80.0,
+            system_cpu_threshold_percent: 80.0,
             consecutive_seconds: 3.0,
             nice_adjustment: 5,
             nice_floor: 19,
-            restore_threshold_percent: 30.0,
+            system_restore_threshold_percent: 30.0,
             restore_hysteresis_seconds: 4.0,
             exempt_patterns: vec![],
             ..Default::default()
@@ -694,13 +751,13 @@ mod tests {
     }
 
     #[test]
-    fn decide_below_threshold_decays_counter() {
+    fn decide_below_threshold_resets_consecutive_counter() {
         let cfg = cfg_for_state_tests();
         let mut e = ProcEntry::new(0);
         e.consecutive_high = 2.0;
         let d = decide(&mut e, &snap(1, 10.0, 0), 1.0, &cfg);
         assert_eq!(d, Decision::None);
-        assert!((e.consecutive_high - 1.0).abs() < 1e-6);
+        assert_eq!(e.consecutive_high, 0.0);
         // Doesn't go negative
         let d = decide(&mut e, &snap(1, 10.0, 0), 5.0, &cfg);
         assert_eq!(d, Decision::None);
@@ -869,5 +926,126 @@ mod tests {
         finalize_restore(&mut e, orig);
         assert_eq!(e.state, ProcState::Normal);
         assert_eq!(e.throttle_nice, None);
+    }
+}
+
+#[cfg(test)]
+mod system_pressure_tests {
+    use super::*;
+
+    fn process(cpu_percent: f32) -> ProcSnapshot {
+        ProcSnapshot {
+            pid: 4242,
+            name: "background".into(),
+            cpu_percent,
+            nice: 0,
+        }
+    }
+
+    #[test]
+    fn busy_process_on_idle_system_never_activates_policy() {
+        let cfg = ProBalanceConfig::default();
+        let mut entry = ProcEntry::new(0);
+        for _ in 0..20 {
+            assert_eq!(
+                decide(&mut entry, &process(3.125), 1.0, &cfg, Some(3.125)),
+                Decision::None
+            );
+        }
+        assert_eq!(entry.consecutive_high, 0.0);
+    }
+
+    #[test]
+    fn system_pressure_and_process_share_are_independent_and_sustained() {
+        let cfg = ProBalanceConfig::default();
+        let mut entry = ProcEntry::new(0);
+        assert_eq!(
+            decide(&mut entry, &process(5.0), 1.0, &cfg, Some(85.0)),
+            Decision::None
+        );
+        for load in [90.0, 90.0, 80.0, 90.0, 90.0] {
+            assert_eq!(
+                decide(&mut entry, &process(5.0), 1.0, &cfg, Some(load)),
+                Decision::None
+            );
+        }
+        assert!(matches!(
+            decide(&mut entry, &process(5.0), 1.0, &cfg, Some(90.0)),
+            Decision::Throttle { .. }
+        ));
+        let mut tiny = ProcEntry::new(0);
+        for _ in 0..5 {
+            assert_eq!(
+                decide(&mut tiny, &process(0.2), 1.0, &cfg, Some(100.0)),
+                Decision::None
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_uses_lower_system_threshold_even_when_process_stays_busy() {
+        let cfg = ProBalanceConfig::default();
+        let mut entry = ProcEntry::new(0);
+        finalize_throttle(&mut entry, 10, true);
+        for _ in 0..10 {
+            assert_eq!(
+                decide(&mut entry, &process(5.0), 1.0, &cfg, Some(80.0)),
+                Decision::None
+            );
+        }
+        for _ in 0..4 {
+            assert_eq!(
+                decide(&mut entry, &process(5.0), 1.0, &cfg, Some(70.0)),
+                Decision::None
+            );
+        }
+        assert_eq!(
+            decide(&mut entry, &process(5.0), 1.0, &cfg, Some(70.0)),
+            Decision::Restore { original_nice: 0 }
+        );
+    }
+
+    #[test]
+    fn missing_samples_break_activation_and_release_existing_penalties() {
+        let cfg = ProBalanceConfig::default();
+        let mut entry = ProcEntry::new(0);
+        decide(&mut entry, &process(5.0), 2.0, &cfg, Some(90.0));
+        assert_eq!(
+            decide(&mut entry, &process(5.0), 1.0, &cfg, None),
+            Decision::None
+        );
+        assert_eq!(entry.consecutive_high, 0.0);
+        finalize_throttle(&mut entry, 10, true);
+        assert_eq!(
+            decide(&mut entry, &process(5.0), 5.0, &cfg, None),
+            Decision::Restore { original_nice: 0 }
+        );
+    }
+
+    #[test]
+    fn protected_pid_is_not_a_candidate_at_full_system_load() {
+        let mut policy = ProBalance::new(ProBalanceConfig::default());
+        for _ in 0..6 {
+            policy.tick(
+                &[process(50.0)],
+                1.0,
+                Some(100.0),
+                &[4242].into_iter().collect(),
+            );
+        }
+        assert!(policy.states.is_empty()); // no syscall and no latent candidate timer
+    }
+
+    #[test]
+    fn suspension_gap_and_config_changes_do_not_reuse_activation_time() {
+        let mut policy = ProBalance::new(ProBalanceConfig::default());
+        policy.tick(&[process(5.0)], 1.0, Some(95.0), &Default::default());
+        policy.tick(&[process(5.0)], 30.0, Some(95.0), &Default::default());
+        assert_eq!(policy.states[&4242].consecutive_high, 0.0);
+        policy.tick(&[process(5.0)], 1.0, Some(95.0), &Default::default());
+        let mut cfg = policy.cfg.clone();
+        cfg.system_cpu_threshold_percent = 90.0;
+        policy.update_config(cfg);
+        assert_eq!(policy.states[&4242].consecutive_high, 0.0);
     }
 }

@@ -8,7 +8,9 @@ A Linux process manager and gaming toolkit, written in Rust with egui. Manage CP
 assignments and process priorities, inspect hardware sensors, customize a Vulkan
 HUD, and record game present intervals for performance comparisons.
 
-![Argus-Lasso Processes page](assets/screenshots/processes.png)
+![Argus-Lasso Processes page — CPU as share of total capacity](assets/screenshots/2026-09-13/processes.png)
+
+**Updated screenshots: September 13, 2026.** [Browse every main menu and settings section](docs/screenshots.md).
 
 **This README describes the current source tree.** The latest published release,
 v1.3.1, predates the overlay, recording and navigation work documented here. Build
@@ -27,7 +29,7 @@ from source for these features. The repository was renamed from
 | **Overview** | CPU, RAM, disk and network activity, load averages and busy processes. |
 | **Processes** | Sort/filter live processes, inspect details, pause/resume, end processes, change CPU affinity, nice and disk I/O priority, export CSV/JSON. |
 | **Process rules** | Persistent affinity and priority rules; exact, substring or regex matching; templates, profiles and JSON import/export. |
-| **ProBalance** | Temporarily reduce priority for sustained CPU users. Optional systemd user-unit CPU weight/quota backend; exemptions and restoration controls. |
+| **ProBalance** | Act above 85% overall CPU load, select eligible CPU users separately, and restore below 75%. Detected games/exemptions are protected. |
 | **Gaming** | CPU topology/parking, Steam and Lutris launchers, profiles, overlay customization, frame recording and optional extended sensors. |
 | **Hardware sensors** | Available hwmon, procfs, NVML and powercap readings with session minimum, maximum, average and history. |
 | **Memory benchmarks** | Pointer-chase latency and sequential read/write/copy bandwidth tests. Separate from game recording. |
@@ -116,6 +118,25 @@ DXVK (DX9/10/11) and VKD3D-Proton (DX12) are Vulkan paths the layer is intended 
 work with, but those individual game paths are not yet verified with this build.
 There is no 32-bit layer package or OpenGL/WineD3D overlay implementation.
 The GPU/driver test matrix remains limited. [Tested, implemented and pending](docs/overlay.md#validation-status).
+
+## Current app screenshots
+
+Captured from the installed current build. Click an image to view it at full size.
+The [complete gallery](docs/screenshots.md) includes all main pages and the Gaming
+and Settings subsections.
+
+| ProBalance: system-load activation | Gaming: CPU & performance |
+|---|---|
+| ![ProBalance](assets/screenshots/2026-09-13/probalance.png) | ![Gaming](assets/screenshots/2026-09-13/gaming-mode.png) |
+| **Overlay customization** | **Game recording** |
+| ![Overlay settings](assets/screenshots/2026-09-13/overlay-settings.png) | ![Recording](assets/screenshots/2026-09-13/gamingrecording.png) |
+| **Hardware sensors** | **Appearance settings** |
+| ![Sensors](assets/screenshots/2026-09-13/hw-monitor.png) | ![Settings](assets/screenshots/2026-09-13/settings.png) |
+
+CPU usage is shown consistently as **0–100% of available capacity**. On 32 online
+logical CPUs, one fully busy CPU contributes 3.125% to the total. ProBalance's
+85% threshold applies to the entire system, with a separate minimum share for
+candidate processes. [Calculation and policy details](docs/user-guide.md#probalance).
 
 ## Configuration and CLI
 

@@ -281,13 +281,8 @@ impl ProcessTab {
         }
     }
 
-    pub fn update_cpu(&mut self, pcts: Vec<f32>) {
-        let avg = if pcts.is_empty() {
-            0.0
-        } else {
-            pcts.iter().sum::<f32>() / pcts.len() as f32
-        };
-        self.history.push(avg);
+    pub fn update_cpu(&mut self, pcts: Vec<f32>, total: f32) {
+        self.history.push(total);
         self.bars.update(pcts);
         self.cached_offline = get_offline_cpus();
     }
@@ -406,7 +401,7 @@ impl ProcessTab {
                 (
                     &mut self.chip_high_cpu,
                     "High CPU",
-                    "Only processes using ≥ 25% of a core",
+                    "Only processes using ≥ 25% of total CPU capacity",
                 ),
                 (
                     &mut self.chip_throttled,
@@ -791,8 +786,8 @@ impl ProcessTab {
                                 );
                                 let resp = if *col == SortCol::Cpu {
                                     resp.on_hover_text(
-                                        "Per-core scale, like top: 100% = one core fully busy.\n\
-                                 Multithreaded processes can exceed 100%.",
+                                        "Share of total available CPU capacity: 0–100%.\n\
+                                 Individual logical CPUs have their own 0–100% scale.",
                                     )
                                 } else {
                                     resp
@@ -1348,7 +1343,7 @@ mod tests {
         let snapshot = [ProcInfo {
             pid: 2_147_483_647,
             name: "Long PID regression".into(),
-            cpu_percent: 3200.0,
+            cpu_percent: 100.0,
             mem_rss: 128 * 1024 * 1024 * 1024,
             ..Default::default()
         }];
@@ -1381,7 +1376,7 @@ mod tests {
                 }));
             }
             let shapes = output.unwrap().shapes;
-            for value in ["2147483647", "3200.0"] {
+            for value in ["2147483647", "100.0"] {
                 let text = shapes
                     .iter()
                     .find_map(|shape| match &shape.shape {

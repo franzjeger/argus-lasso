@@ -5,6 +5,11 @@ Status: **rollout steps 1+2 implemented** (config keys + cgroup method behind
 default to `auto` — is blocked on the validation checklist below, which needs
 real desktop hardware.
 
+The activation policy was updated on 2026-09-13: overall system load gates
+per-process candidacy, and protected processes also protect their cgroup unit.
+See [current defaults and CPU units](user-guide.md#probalance). This document
+describes the backend and its remaining validation work.
+
 ## Problem
 
 ProBalance currently throttles CPU hogs by raising their nice value. Nice is weak medicine:

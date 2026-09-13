@@ -26,10 +26,10 @@ impl ProBalanceTab {
     /// Plain-language summary of the thresholds, for the status card.
     fn summary(&self) -> String {
         format!(
-            "Per-process CPU: throttle above {:.0}% for {:.0} s · restore below {:.0}%",
-            self.cfg.cpu_threshold_percent,
+            "System CPU: activate above {:.0}% for {:.0} s · restore below {:.0}%",
+            self.cfg.system_cpu_threshold_percent,
             self.cfg.consecutive_seconds,
-            self.cfg.restore_threshold_percent
+            self.cfg.system_restore_threshold_percent
         )
     }
 
@@ -39,6 +39,7 @@ impl ProBalanceTab {
         ui: &mut Ui,
         snapshot: &[crate::monitor::ProcInfo],
         throttle_infos: &[crate::probalance::ThrottleInfo],
+        system_cpu: f32,
     ) -> Option<ProBalanceConfig> {
         use crate::gui::theme::{self as th, tokens};
         const LABEL_W: f32 = tokens::FORM_LABEL_W;
@@ -76,6 +77,7 @@ impl ProBalanceTab {
                             .size(tokens::FONT_HELP)
                             .color(ui.visuals().weak_text_color()),
                     );
+                    ui.label(format!("Current system CPU: {system_cpu:.1}% of available capacity"));
                     // When nothing is throttled the fact belongs here, under
                     // the state it qualifies — as its own grey strip below a
                     // card it read as an unrelated warning.
@@ -167,11 +169,8 @@ impl ProBalanceTab {
         }
 
         // ── Throttling and restore ────────────────────────────────────────
-        let max_process_cpu = crate::utils::get_cpu_count().max(1) as f32 * 100.0;
-        let throttle_max = max_process_cpu.max(self.cfg.cpu_threshold_percent);
-        let restore_max = max_process_cpu.max(self.cfg.restore_threshold_percent);
-        th::card_hinted(ui, "Throttling and restore",
-            "Per-process scale: 100% = one logical CPU fully busy; 200% = two. Overall CPU pressure is not checked before lowering priority.", |ui| {
+        th::card_hinted(ui, "Activation and recovery",
+            "100% means all available CPU capacity. Act only under sustained system load; protect detected games, their child processes and exemptions.", |ui| {
             egui::Grid::new("pb_thresholds")
                 .num_columns(2)
                 .min_row_height(tokens::ROW_H)
@@ -195,11 +194,11 @@ impl ProBalanceTab {
                         });
                     ui.end_row();
 
-                    form_label(ui, LABEL_W, "Throttle above");
+                    form_label(ui, LABEL_W, "System CPU above");
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::DragValue::new(&mut self.cfg.cpu_threshold_percent)
-                                .range(10.0f32..=throttle_max)
+                            egui::DragValue::new(&mut self.cfg.system_cpu_threshold_percent)
+                                .range(1.0f32..=100.0)
                                 .suffix(" %"),
                         );
                         weak(ui, "for");
@@ -211,6 +210,11 @@ impl ProBalanceTab {
                     });
                     ui.end_row();
 
+                    form_label(ui, LABEL_W, "Minimum process CPU");
+                    ui.add(egui::DragValue::new(&mut self.cfg.process_min_cpu_percent)
+                        .range(0.1..=100.0).speed(0.1).suffix(" % of total"))
+                        .on_hover_text("Only processes consuming at least this share are candidates. This does not activate ProBalance by itself.");
+                    ui.end_row();
                     form_label(ui, LABEL_W, "Nice adjustment");
                     ui.horizontal(|ui| {
                         ui.add(
@@ -223,11 +227,11 @@ impl ProBalanceTab {
                     });
                     ui.end_row();
 
-                    form_label(ui, LABEL_W, "Restore below");
+                    form_label(ui, LABEL_W, "System CPU below");
                     ui.horizontal(|ui| {
                         ui.add(
-                            egui::DragValue::new(&mut self.cfg.restore_threshold_percent)
-                                .range(1.0f32..=restore_max)
+                            egui::DragValue::new(&mut self.cfg.system_restore_threshold_percent)
+                                .range(0.0f32..=99.0)
                                 .suffix(" %"),
                         );
                         weak(ui, "for");
@@ -265,6 +269,7 @@ impl ProBalanceTab {
         });
         ui.add_space(tokens::SPACE_M);
 
+        ui.small("Recovery also starts when a candidate falls below its minimum CPU share. Foreground detection is not universal on Wayland; add an exemption for unrecognized games or important apps.");
         // ── Exempt processes (chips) ──────────────────────────────────────
         th::card(ui, "Exempt processes", |ui| {
             ui.label(
@@ -314,6 +319,7 @@ impl ProBalanceTab {
         });
 
         // ── Apply bar ─────────────────────────────────────────────────────
+        self.cfg.normalize();
         let dirty = self.cfg != self.saved;
         let (discard, apply) = th::apply_bar(ui, dirty);
         if discard {

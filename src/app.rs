@@ -586,7 +586,7 @@ impl eframe::App for ArgusLassoApp {
         // it's far too expensive to run on every 60fps repaint.
         if cpu_gen != self.last_cpu_gen && !cpu_pcts.is_empty() {
             self.last_cpu_gen = cpu_gen;
-            self.process_tab.update_cpu(cpu_pcts.clone());
+            self.process_tab.update_cpu(cpu_pcts.clone(), cpu_avg);
             self.cpu_temp = read_cpu_temp();
         }
 
@@ -661,12 +661,7 @@ impl eframe::App for ArgusLassoApp {
             ui.horizontal(|ui| {
                 ui.label(format!("Processes: {}", self.proc_count));
                 ui.separator();
-                let avg = if cpu_pcts.is_empty() {
-                    0.0
-                } else {
-                    cpu_pcts.iter().sum::<f32>() / cpu_pcts.len() as f32
-                };
-                ui.label(format!("CPU avg: {avg:.0}%"));
+                ui.label(format!("CPU total: {cpu_avg:.0}%"));
                 if let Some(temp) = self.cpu_temp {
                     ui.separator();
                     ui.label(format!("CPU temp: {temp:.0}°C"));
@@ -1123,7 +1118,7 @@ impl eframe::App for ArgusLassoApp {
                 }
 
                 Tab::ProBalance => {
-                    if let Some(pb_cfg) = self.probalance_tab.show(ui, &snapshot, &throttle_infos) {
+                    if let Some(pb_cfg) = self.probalance_tab.show(ui, &snapshot, &throttle_infos, cpu_avg) {
                         if let Ok(mut s) = self.state.lock() {
                             s.config.probalance = pb_cfg.clone();
                         }

@@ -54,6 +54,7 @@ pub struct ProcInfo {
     pub pid: u32,
     pub ppid: u32,
     pub name: String,
+    /// Share of total available CPU time (0–100%, including multicore processes).
     pub cpu_percent: f32,
     /// GPU utilization % (NVML per-process SM util; 0.0 without NVIDIA/NVML)
     pub gpu_percent: f32,
@@ -350,6 +351,7 @@ pub fn spawn_preview(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut hw = HwCollector::new();
+        let mut cpu_sampler = CpuSampler::default();
         let mut times = HashMap::new();
         let mut total = 0;
         let mut caches = SnapshotCaches::default();
@@ -362,10 +364,13 @@ pub fn spawn_preview(
             times = next_times;
             total = next_total;
             hw.update();
-            let cpus = collect_cpu_percents();
+            let (mut cpus, cpu_total) = cpu_sampler.sample(read_percpu_stats());
+            cpus.resize(utils::get_cpu_count() as usize, 0.0);
             if let Ok(mut s) = state.lock() {
                 s.snapshot = Arc::new(snapshot);
-                s.cpu_avg = cpus.iter().sum::<f32>() / cpus.len().max(1) as f32;
+                if let Some(total) = cpu_total {
+                    s.cpu_avg = total;
+                }
                 s.cpu_percents = cpus;
                 s.cpu_generation += 1;
                 let avg = s.cpu_avg;
@@ -541,6 +546,7 @@ fn run_loop(
     let mut hw_collector = HwCollector::new();
     let mut last_sensors = Instant::now() - Duration::from_secs(1);
     let mut cpu_percents = Vec::new();
+    let mut cpu_sampler = CpuSampler::default();
     let mut avg = 0.0;
 
     let log_cb2 = log_cb.clone();
@@ -881,7 +887,14 @@ fn run_loop(
                     nice: p.nice,
                 })
                 .collect();
-            probalance.tick(&pb_snap, pb_tick);
+            let (readings, system_cpu) = cpu_sampler.sample(read_percpu_stats());
+            cpu_percents = readings;
+            cpu_percents.resize(utils::get_cpu_count() as usize, 0.0);
+            if let Some(total) = system_cpu {
+                avg = total;
+            }
+            let protected = protected_processes(&raw_snapshot, &launch_profiles, &manual_overrides);
+            probalance.tick(&pb_snap, pb_tick, system_cpu, &protected);
 
             // Fire desktop notifications for newly throttled / restored PIDs
             let cur_throttled = probalance.throttled_pids();
@@ -917,13 +930,6 @@ fn run_loop(
         }
 
         if now.duration_since(last_sensors) >= Duration::from_secs(1) {
-            cpu_percents = collect_cpu_percents();
-            avg = if cpu_percents.is_empty() {
-                0.0
-            } else {
-                cpu_percents.iter().sum::<f32>() / cpu_percents.len() as f32
-            };
-
             // Update hardware sensor readings
             hw_collector.update();
 
@@ -1124,8 +1130,47 @@ fn hw_io_totals(data: &HwMonitorData) -> ((f32, f32), (f32, f32)) {
 /// Proton wrapper invocations — the launchers/wrappers matched alongside the
 /// game exit together with it, so they don't hold auto-mode on.
 fn is_game_process(p: &ProcInfo) -> bool {
-    let cmd = p.cmdline.as_str();
+    let cmd = p.cmdline.replace('\\', "/").to_ascii_lowercase();
     cmd.contains("steamapps/common") || cmd.contains("/proton ")
+}
+
+/// Wayland has no portable foreground-process API. Protect known games/launch
+/// trees and explicit high-priority/manual targets; user exemptions cover others.
+fn protected_processes(
+    snapshot: &[ProcInfo],
+    launches: &[argus_ipc::LaunchProfile],
+    manual: &HashMap<u32, Instant>,
+) -> HashSet<u32> {
+    let mut protected: HashSet<u32> = snapshot
+        .iter()
+        .filter(|p| {
+            p.pid <= 1
+                || p.pid == std::process::id()
+                || p.nice < 0
+                || is_game_process(p)
+                || manual.contains_key(&p.pid)
+        })
+        .map(|p| p.pid)
+        .collect();
+    for launch in launches {
+        if crate::fast_proc::read_stat(launch.pid, &mut [0; 1024])
+            .is_some_and(|s| s.starttime == launch.start_ticks)
+        {
+            protected.insert(launch.pid);
+        }
+    }
+    loop {
+        let before = protected.len();
+        for p in snapshot {
+            if protected.contains(&p.ppid) && p.ppid > 1 {
+                protected.insert(p.pid);
+            }
+        }
+        if protected.len() == before {
+            break;
+        }
+    }
+    protected
 }
 
 /// Park the non-preferred CPUs (used by both manual SetGamingMode and
@@ -1198,7 +1243,6 @@ fn collect_snapshot(
 
     let sys_total = read_sys_cpu_total();
     let sys_delta = sys_total.saturating_sub(prev_sys_total) as f32;
-    let n_cpus = utils::get_online_cpus().len().max(1) as f32;
 
     let mut stat_buf = [0u8; 1024];
     let mut cmd_buf = Vec::with_capacity(1024);
@@ -1211,6 +1255,10 @@ fn collect_snapshot(
 
         let ppid = stat.ppid;
 
+        let same_process = caches
+            .meta
+            .get(&pid)
+            .is_some_and(|m| m.start_time == stat.starttime);
         let meta = match caches.meta.get(&pid) {
             Some(m) if m.start_time == stat.starttime => m,
             _ => {
@@ -1228,13 +1276,13 @@ fn collect_snapshot(
 
         let proc_ticks = stat.utime + stat.stime;
         new_times.insert(pid, proc_ticks);
-        let prev_ticks = prev_times.get(&pid).copied().unwrap_or(proc_ticks);
-        let delta_ticks = proc_ticks.saturating_sub(prev_ticks) as f32;
-        let cpu_percent = if sys_delta > 0.0 {
-            (delta_ticks / sys_delta * n_cpus * 100.0).min(n_cpus * 100.0)
+        let prev_ticks = if same_process {
+            prev_times.get(&pid).copied().unwrap_or(proc_ticks)
         } else {
-            0.0
+            proc_ticks
         };
+        let delta_ticks = proc_ticks.saturating_sub(prev_ticks) as f32;
+        let cpu_percent = cpu_share(delta_ticks, sys_delta);
 
         let mem_rss = stat.rss_bytes;
         let nice = stat.nice;
@@ -1311,6 +1359,8 @@ fn read_sys_cpu_total() -> u64 {
             return line
                 .split_whitespace()
                 .skip(1)
+                // guest/guest_nice are already included in user/nice.
+                .take(8)
                 .filter_map(|s| s.parse::<u64>().ok())
                 .sum();
         }
@@ -1318,44 +1368,64 @@ fn read_sys_cpu_total() -> u64 {
     0
 }
 
-fn collect_cpu_percents() -> Vec<f32> {
-    // Read per-CPU utilisation from procfs.
-    // Samples are keyed by CPU number (parsed from the "cpuN" label), NOT by
-    // line position: after a park/unpark the set of online CPUs changes, and
-    // diffing consecutive samples by index would attribute one CPU's jiffies
-    // to another for the first sample after every topology change.
-    use std::sync::Mutex as StdMutex;
-
-    static PREV: StdMutex<Option<HashMap<u32, [u64; 10]>>> = StdMutex::new(None);
-
-    let total_cpus = utils::get_cpu_count() as usize;
-    let new_stats = read_percpu_stats();
-    let mut result = vec![0.0f32; total_cpus];
-
-    let mut prev_guard = PREV.lock().unwrap();
-    if let Some(prev_map) = prev_guard.as_ref() {
-        for (cpu_num, new) in &new_stats {
-            let Some(prev) = prev_map.get(cpu_num) else {
-                continue; // CPU just came online — no baseline yet
-            };
-            // Fields: user nice system idle iowait irq softirq steal guest guest_nice
-            let prev_total: u64 = prev[..8].iter().sum();
-            let new_total: u64 = new[..8].iter().sum();
-            let total_delta = new_total.saturating_sub(prev_total) as f32;
-            let idle_delta =
-                new[3].saturating_sub(prev[3]) as f32 + new[4].saturating_sub(prev[4]) as f32;
-            let pct = if total_delta > 0.0 {
-                ((total_delta - idle_delta) / total_delta * 100.0).clamp(0.0, 100.0)
-            } else {
-                0.0
-            };
-            if (*cpu_num as usize) < total_cpus {
-                result[*cpu_num as usize] = pct;
-            }
-        }
+/// CPU-time share, not a frequency/performance estimate or per-core multiple.
+fn cpu_share(busy: f32, total: f32) -> f32 {
+    if total.is_finite() && total > 0.0 && busy.is_finite() {
+        (busy / total * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
     }
-    *prev_guard = Some(new_stats.into_iter().collect());
-    result
+}
+
+#[derive(Default)]
+struct CpuSampler {
+    previous: HashMap<u32, [u64; 10]>,
+}
+
+impl CpuSampler {
+    /// Returns individual logical CPU loads plus a weighted system total.
+    /// A new/removed CPU, counter reset or unreadable sample breaks the baseline;
+    /// ProBalance must not interpret it as proof of sustained system pressure.
+    fn sample(&mut self, stats: Vec<(u32, [u64; 10])>) -> (Vec<f32>, Option<f32>) {
+        let count = stats
+            .iter()
+            .map(|(id, _)| *id as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut per_cpu = vec![0.0; count];
+        let stable = !stats.is_empty()
+            && stats.len() == self.previous.len()
+            && stats.iter().all(|(id, _)| self.previous.contains_key(id));
+        let mut valid = stable;
+        let mut total = 0u64;
+        let mut busy = 0u64;
+        for (id, current) in &stats {
+            let Some(previous) = self.previous.get(id) else {
+                continue;
+            };
+            // Exclude guest fields, which are subsets of user/nice.
+            let old_total: u64 = previous[..8].iter().sum();
+            let new_total: u64 = current[..8].iter().sum();
+            let old_idle = previous[3] + previous[4];
+            let new_idle = current[3] + current[4];
+            let Some(dt) = new_total.checked_sub(old_total).filter(|v| *v > 0) else {
+                valid = false;
+                continue;
+            };
+            let Some(di) = new_idle.checked_sub(old_idle).filter(|v| *v <= dt) else {
+                valid = false;
+                continue;
+            };
+            per_cpu[*id as usize] = cpu_share((dt - di) as f32, dt as f32);
+            total += dt;
+            busy += dt - di;
+        }
+        self.previous = stats.into_iter().collect();
+        (
+            per_cpu,
+            (valid && total > 0).then(|| cpu_share(busy as f32, total as f32)),
+        )
+    }
 }
 
 fn read_percpu_stats() -> Vec<(u32, [u64; 10])> {
@@ -1687,5 +1757,123 @@ mod tests {
         let ((dr, dw), (rx, tx)) = hw_io_totals(&data);
         assert_eq!((dr, dw), (2.0, 1.5));
         assert_eq!((rx, tx), (2.0, 0.25));
+    }
+}
+
+#[cfg(test)]
+mod cpu_accounting_tests {
+    use super::*;
+
+    fn counters(busy: u64, idle: u64) -> [u64; 10] {
+        [busy, 0, 0, idle, 0, 0, 0, 0, 0, 0]
+    }
+
+    #[test]
+    fn one_busy_cpu_is_one_thirty_second_of_total_capacity() {
+        let mut sampler = CpuSampler::default();
+        assert_eq!(
+            sampler
+                .sample((0..32).map(|id| (id, counters(0, 0))).collect())
+                .1,
+            None
+        );
+        let (individual, total) = sampler.sample(
+            (0..32)
+                .map(|id| {
+                    (
+                        id,
+                        if id == 0 {
+                            counters(100, 0)
+                        } else {
+                            counters(0, 100)
+                        },
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(individual[0], 100.0);
+        assert_eq!(total, Some(3.125));
+        assert_eq!(cpu_share(100.0, 3200.0), 3.125);
+        assert_eq!(cpu_share(1600.0, 3200.0), 50.0);
+        assert_eq!(cpu_share(3200.0, 3200.0), 100.0);
+    }
+
+    #[test]
+    fn offline_cpus_do_not_dilute_load_and_hotplug_resets_baseline() {
+        let mut sampler = CpuSampler::default();
+        sampler.sample(vec![(0, counters(0, 0)), (7, counters(0, 0))]);
+        assert_eq!(sampler.sample(vec![(0, counters(100, 0))]).1, None);
+        assert_eq!(sampler.sample(vec![(0, counters(200, 0))]).1, Some(100.0));
+        assert_eq!(
+            sampler
+                .sample(vec![(0, counters(300, 0)), (7, counters(50, 50))])
+                .1,
+            None
+        );
+        assert_eq!(
+            sampler
+                .sample(vec![(0, counters(400, 0)), (7, counters(50, 150))])
+                .1,
+            Some(50.0)
+        );
+    }
+
+    #[test]
+    fn system_percentage_is_weighted_and_guest_time_is_not_counted_twice() {
+        let mut sampler = CpuSampler::default();
+        sampler.sample(vec![(0, counters(0, 0)), (1, counters(0, 0))]);
+        let mut guest = counters(100, 0);
+        guest[8] = 100; // subset of user time, not extra capacity
+        assert_eq!(
+            sampler.sample(vec![(0, guest), (1, counters(0, 300))]).1,
+            Some(25.0)
+        );
+    }
+
+    #[test]
+    fn missing_reset_and_zero_interval_are_not_valid_pressure_samples() {
+        let mut sampler = CpuSampler::default();
+        sampler.sample(vec![(0, counters(100, 100))]);
+        assert_eq!(sampler.sample(vec![(0, counters(100, 100))]).1, None);
+        assert_eq!(sampler.sample(vec![(0, counters(1, 1))]).1, None);
+        assert_eq!(sampler.sample(vec![]).1, None);
+        assert_eq!(sampler.sample(vec![(0, counters(200, 200))]).1, None);
+        assert_eq!(cpu_share(50.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn game_and_descendants_are_protected_without_protecting_every_process() {
+        let snapshot = vec![
+            ProcInfo {
+                pid: 1,
+                ..Default::default()
+            },
+            ProcInfo {
+                pid: 4100,
+                ppid: 1,
+                cmdline: Arc::new("/games/steamapps/common/Game/game".into()),
+                ..Default::default()
+            },
+            ProcInfo {
+                pid: 4101,
+                ppid: 4100,
+                ..Default::default()
+            },
+            ProcInfo {
+                pid: 4102,
+                ppid: 4101,
+                ..Default::default()
+            },
+            ProcInfo {
+                pid: 4200,
+                ppid: 1,
+                ..Default::default()
+            },
+        ];
+        let protected = protected_processes(&snapshot, &[], &HashMap::new());
+        for pid in [4100, 4101, 4102] {
+            assert!(protected.contains(&pid));
+        }
+        assert!(!protected.contains(&4200));
     }
 }

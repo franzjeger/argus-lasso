@@ -41,28 +41,57 @@ widths. Narrow windows offer horizontal scrolling. Hover a truncated name for
 its command line and additional information. Column headers sort; their context
 menu or **Columns** chooses visible fields.
 
-**CPU% uses a per-process, single-logical-CPU scale:** 100% means one logical CPU
-fully busy, 200% means two. On 32 logical CPUs a process can reach 3200%.
-The overall CPU average uses 0–100% across the machine. These scales differ on
-purpose, but must not be compared as if they were the same quantity.
+**CPU% is always 0–100% of the available CPU capacity.** The process table,
+process details, exports and CLI show each process's share of the whole system.
+With 32 online logical CPUs, one fully busy CPU contributes 3.125%; sixteen
+contribute 50%; all 32 contribute 100%. Individual logical CPU tiles still show
+0–100% for their own CPU. These percentages describe scheduled CPU time, not a
+frequency-adjusted performance score.
+
+System usage is the weighted busy-time delta across online CPU counters from
+`/proc/stat`. Idle and I/O-wait time are excluded from busy time. Guest time is
+already included in user/nice and is not added twice. Offline CPUs do not dilute
+the system total. A topology change or invalid counter sample resets the baseline
+and prevents ProBalance activation for that interval. The UI retains its last
+valid system value during this brief warmup.
 
 ## ProBalance
 
-The current algorithm compares each process's CPU% against its configured
-threshold. The default 85% is **0.85 logical CPUs**, not 85% of the whole machine.
-The threshold controls accept values above 100%, up to the host's logical CPU
-capacity (and preserve larger existing settings).
+ProBalance now uses **overall system pressure to activate**, then evaluates
+eligible processes separately. Default controls are:
 
-After sustained high usage, Argus lowers priority using nice, or the optional
-cgroup CPUWeight method. A low-usage recovery window restores it. Nice and
-CPUWeight affect competition for CPU time; they are not absolute CPU usage caps.
-The cgroup configuration also offers a separate quota control.
+| Control | Default | Meaning |
+|---|---:|---|
+| System CPU above | 85% for 3 seconds | Require consecutive high system-load samples |
+| Minimum process CPU | 1% of total | Only processes consuming at least this share are candidates |
+| System CPU below | 75% for 5 seconds | Restore priorities after pressure subsides |
 
-**Current limitation:** decisions are not gated by overall CPU contention.
-A process can be reprioritized while other CPUs are idle. This is a simple
-per-process policy, not a verified implementation of another product's
-responsiveness algorithm. Exemptions and existing user thresholds remain under
-user control. [Cgroup design and validation status](design-cgroup-probalance.md).
+A single busy thread on a 32-thread machine does not activate ProBalance by
+itself. Dropping below the activation threshold resets the high-load timer;
+isolated spikes do not accumulate into a later action. Recovery also begins if
+the individual process falls below its minimum share. Invalid/missing system
+samples prevent new actions and allow existing penalties to recover after the
+configured recovery window. Long sampling gaps break the activation window.
+
+Detected Steam/Proton games, verified Argus launch roots and their descendants
+are protected, along with Argus itself, explicit high-priority/manual targets and
+the configured exemptions. Unit-level cgroup adjustments skip units containing
+a protected process. **Wayland foreground detection is not universal:** an
+unrecognized game or important application needs an explicit exemption. This is
+a system-load policy, not a guarantee of higher FPS or a clone of another tool's
+responsiveness algorithm.
+
+The existing nice and optional cgroup CPUWeight backends remain available. They
+adjust scheduling priority under contention, not the measured CPU percentage.
+Cgroup also offers a separate optional quota. [Backend details](design-cgroup-probalance.md).
+
+Configuration uses `system_cpu_threshold_percent`,
+`system_restore_threshold_percent` and `process_min_cpu_percent` under
+`[probalance]`. Old `cpu_threshold_percent` and `restore_threshold_percent` keys
+used incompatible per-core units; they are superseded by the new defaults rather
+than silently reinterpreted. Existing exemptions, timing, method and nice settings
+are preserved. Subsequent config saves write the new keys. Recovery is constrained
+to stay below activation, and all percentage controls reject non-finite values.
 
 ## Gaming, telemetry and windows
 

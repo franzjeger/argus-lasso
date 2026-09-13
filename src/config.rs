@@ -23,11 +23,14 @@ pub struct CpuConfig {
 #[serde(default)]
 pub struct ProBalanceConfig {
     pub enabled: bool,
-    pub cpu_threshold_percent: f32,
+    /// Whole-system busy CPU time, 0–100% of currently available capacity.
+    pub system_cpu_threshold_percent: f32,
+    /// Minimum process share of that same capacity before it is a candidate.
+    pub process_min_cpu_percent: f32,
     pub consecutive_seconds: f32,
     pub nice_adjustment: i32,
     pub nice_floor: i32,
-    pub restore_threshold_percent: f32,
+    pub system_restore_threshold_percent: f32,
     pub restore_hysteresis_seconds: f32,
     pub exempt_patterns: Vec<String>,
     /// Throttle mechanism: "nice" (default), "cgroup" (per-unit CPUWeight via
@@ -45,11 +48,12 @@ impl Default for ProBalanceConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            cpu_threshold_percent: 85.0,
+            system_cpu_threshold_percent: 85.0,
+            process_min_cpu_percent: 1.0,
             consecutive_seconds: 3.0,
             nice_adjustment: 10,
             nice_floor: 15,
-            restore_threshold_percent: 40.0,
+            system_restore_threshold_percent: 75.0,
             restore_hysteresis_seconds: 5.0,
             exempt_patterns: vec![
                 "kwin".into(),
@@ -65,6 +69,27 @@ impl Default for ProBalanceConfig {
             cgroup_throttle_weight: 25,
             cgroup_quota_percent: 0,
         }
+    }
+}
+
+impl ProBalanceConfig {
+    /// Enforce meaningful hysteresis and finite percentages even for edited TOML.
+    pub fn normalize(&mut self) {
+        let bounded = |v: f32, default: f32, min: f32, max: f32| {
+            if v.is_finite() {
+                v.clamp(min, max)
+            } else {
+                default
+            }
+        };
+        self.system_cpu_threshold_percent =
+            bounded(self.system_cpu_threshold_percent, 85.0, 1.0, 100.0);
+        self.system_restore_threshold_percent =
+            bounded(self.system_restore_threshold_percent, 75.0, 0.0, 99.0)
+                .min(self.system_cpu_threshold_percent - 1.0);
+        self.process_min_cpu_percent = bounded(self.process_min_cpu_percent, 1.0, 0.1, 100.0);
+        self.consecutive_seconds = bounded(self.consecutive_seconds, 3.0, 1.0, 60.0);
+        self.restore_hysteresis_seconds = bounded(self.restore_hysteresis_seconds, 5.0, 1.0, 120.0);
     }
 }
 
@@ -301,7 +326,8 @@ pub fn load() -> Config {
     if path.exists() {
         match fs::read_to_string(&path) {
             Ok(text) => match toml::from_str::<Config>(&text) {
-                Ok(cfg) => {
+                Ok(mut cfg) => {
+                    cfg.probalance.normalize();
                     log::info!("Loaded config from {}", path.display());
                     return cfg;
                 }
@@ -347,7 +373,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.cpu.default_affinity = Some("0-7,16-23".into());
         cfg.probalance.exempt_patterns = vec!["kwin".into(), "some app".into()];
-        cfg.probalance.cpu_threshold_percent = 73.5;
+        cfg.probalance.system_cpu_threshold_percent = 73.5;
         cfg.ui.opacity = 0.85;
         cfg.ui.theme = "BreezeLight".into();
         cfg.ui.col_widths = vec![61.0, 0.0, 91.5];
@@ -379,9 +405,9 @@ mod tests {
             cfg.probalance.exempt_patterns
         );
         assert!(
-            (back.probalance.cpu_threshold_percent - 73.5).abs() < 0.001,
+            (back.probalance.system_cpu_threshold_percent - 73.5).abs() < 0.001,
             "float lost precision: {}",
-            back.probalance.cpu_threshold_percent
+            back.probalance.system_cpu_threshold_percent
         );
         assert!((back.ui.opacity - 0.85).abs() < 0.001);
         assert_eq!(back.ui.theme, "BreezeLight");
@@ -466,5 +492,32 @@ match_type = "exact"
         let cfg: Config = toml::from_str(sample).expect("the shipped config shape must parse");
         assert_eq!(cfg.cpu.default_affinity.as_deref(), Some("8-15,24-31"));
         assert_eq!(cfg.rules.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod cpu_policy_config_tests {
+    use super::*;
+
+    #[test]
+    fn old_per_core_thresholds_are_not_reinterpreted_as_system_percentages() {
+        let config: Config = toml::from_str("[probalance]\ncpu_threshold_percent = 1600.0\nrestore_threshold_percent = 400.0\nnice_adjustment = 7\nexempt_patterns = ['mygame']\n").unwrap();
+        assert_eq!(config.probalance.system_cpu_threshold_percent, 85.0);
+        assert_eq!(config.probalance.system_restore_threshold_percent, 75.0);
+        assert_eq!(config.probalance.nice_adjustment, 7);
+        assert_eq!(config.probalance.exempt_patterns, vec!["mygame"]);
+    }
+
+    #[test]
+    fn invalid_values_cannot_break_hysteresis_or_cpu_range() {
+        let mut cfg = ProBalanceConfig {
+            system_cpu_threshold_percent: 20.0,
+            system_restore_threshold_percent: 80.0,
+            process_min_cpu_percent: f32::NAN,
+            ..Default::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.system_restore_threshold_percent, 19.0);
+        assert_eq!(cfg.process_min_cpu_percent, 1.0);
     }
 }

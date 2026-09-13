@@ -9,6 +9,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Overall CPU-load activation for ProBalance: above 85% for 3 seconds, a separate
+  1% minimum process share, and recovery below 75% for 5 seconds by default.
+  Detected games, verified launch trees, priority/manual targets and exempt
+  processes are protected; cgroup units containing them are protected too.
+- Consistent 0–100% CPU capacity scale across process tables, details, exports and
+  CLI. The status output identifies the scale explicitly.
+
 - Transparent Vulkan graphics HUD with 14 px default text, per-value colors,
   compact logical-CPU columns, independent background opacity and live settings.
 - Versioned IPC with build identification, configuration replay, private runtime
@@ -37,9 +44,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   style updates, and live inheritance for customization, details and benchmark results.
 - Long process PIDs and multicore numbers overflowing table cells: font-aware
   minimum widths, cell clipping and horizontal scrolling for narrow windows.
-- ProBalance's misleading CPU scale: labels explain 100% = one logical CPU;
-  threshold controls now accept multicore values above 100%. The algorithm still
-  uses per-process thresholds without an overall-contention gate.
+- CPU accounting no longer multiplies process shares by logical CPU count or
+  counts guest CPU time twice. Weighted system load excludes offline CPUs;
+  hotplug, reset/missing counters and long sample gaps break activation windows.
+- ProBalance uses separate system and process thresholds with consecutive
+  activation/recovery windows. Legacy per-core threshold keys are superseded
+  without changing exemptions or priority settings.
 
 ### Changed
 
