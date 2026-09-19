@@ -301,13 +301,17 @@ impl OverlayState {
             .render_pass(render_pass)
             .subpass(0);
 
-        let pipeline = device
+        // .first() rather than [0]: a nonconformant ICD returning VK_SUCCESS
+        // with fewer entries than requested would otherwise index-panic
+        // instead of failing gracefully like every other fallible step here.
+        let pipeline = *device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
                 std::slice::from_ref(&pipeline_info),
                 None,
             )
-            .ok()?[0];
+            .ok()?
+            .first()?;
         device.destroy_shader_module(vert_module, None);
         device.destroy_shader_module(frag_module, None);
 
@@ -348,7 +352,7 @@ impl OverlayState {
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(descriptor_pool)
             .set_layouts(std::slice::from_ref(&descriptor_set_layout));
-        let descriptor_set = device.allocate_descriptor_sets(&alloc_info).ok()?[0];
+        let descriptor_set = *device.allocate_descriptor_sets(&alloc_info).ok()?.first()?;
 
         let img_info = vk::DescriptorImageInfo::default()
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
