@@ -95,16 +95,20 @@ impl Rule {
         }
         match self.match_type.as_str() {
             "exact" => proc_name == self.pattern,
-            "regex" => {
-                if let Some(Ok(re)) = &self.cached_regex {
-                    re.is_match(proc_name)
-                } else {
-                    // Try compiling on the fly (shouldn't happen normally)
-                    Regex::new(&self.pattern)
-                        .map(|re| re.is_match(proc_name))
-                        .unwrap_or(false)
-                }
-            }
+            "regex" => match &self.cached_regex {
+                Some(Ok(re)) => re.is_match(proc_name),
+                // A pattern that failed to compile stays cached as the
+                // failure (from_config / refresh_pattern_caches) — retrying
+                // Regex::new on every call here would defeat the point of
+                // caching for exactly the input that needs it most: a bad
+                // pattern the user hasn't fixed yet, re-tried on every
+                // process on every enforcement tick.
+                Some(Err(_)) => false,
+                // Only reachable if the cache was never populated at all.
+                None => Regex::new(&self.pattern)
+                    .map(|re| re.is_match(proc_name))
+                    .unwrap_or(false),
+            },
             _ => {
                 // "contains" — case-insensitive substring
                 proc_name_lower.contains(&self.pattern_lower)
@@ -254,6 +258,17 @@ pub fn apply_rules(
 ) -> Vec<String> {
     let mut actions = Vec::new();
     let proc_name_lower = proc_name.to_lowercase();
+    // Track what we believe the live nice/ionice values are as rules apply,
+    // so a later rule in this same pass sees what an earlier one in this
+    // pass just set — mirroring the affinity check below, which re-reads
+    // from the OS fresh every iteration for the same reason. Without this,
+    // two enabled rules that both set nice (or both set ionice) on the same
+    // process compared against the same pre-loop snapshot, so the second
+    // rule could wrongly believe its target already matched — leaving the
+    // process stuck on the first rule's value, or oscillating between the
+    // two on alternating enforcement ticks.
+    let mut current_nice = current_nice;
+    let mut current_ionice = current_ionice;
     for rule in rules {
         if !rule.matches(proc_name, &proc_name_lower) {
             continue;
@@ -261,10 +276,7 @@ pub fn apply_rules(
 
         // ── Affinity ─────────────────────────────────────────────────
         if let Some(ref aff) = rule.affinity {
-            let target = utils::cpulist_to_set(aff).unwrap_or_default();
-            let current_str = utils::get_affinity_str(pid);
-            let current = utils::cpulist_to_set(&current_str).unwrap_or_default();
-            if current != target && utils::set_affinity(pid, aff) {
+            if utils::set_affinity_if_changed(pid, aff) {
                 let msg = format!(
                     "[Rule:{}] Set affinity={} on {}({})",
                     rule.name, aff, proc_name, pid
@@ -279,6 +291,7 @@ pub fn apply_rules(
             let fail_key = (rule.rule_id.clone(), pid);
             if current_nice != Some(nice) && !nice_failed.contains(&fail_key) {
                 if utils::set_nice(pid, nice) {
+                    current_nice = Some(nice);
                     let msg = format!(
                         "[Rule:{}] Set nice={} on {}({})",
                         rule.name, nice, proc_name, pid
@@ -305,6 +318,7 @@ pub fn apply_rules(
             if current_ionice != Some((class, target_level))
                 && utils::set_ionice(pid, class, rule.ionice_level)
             {
+                current_ionice = Some((class, target_level));
                 let msg = format!(
                     "[Rule:{}] Set ionice class={} level={:?} on {}({})",
                     rule.name, class, rule.ionice_level, proc_name, pid
@@ -488,5 +502,58 @@ mod tests {
         assert_eq!(back.affinity, cfg.affinity);
         assert_eq!(back.nice, cfg.nice);
         assert_eq!(back.enabled, cfg.enabled);
+    }
+
+    /// Regression test for the nice/ionice staleness bug: apply_rules() used
+    /// to dirty-check every rule against the snapshot taken *before* the
+    /// loop, instead of re-checking against what an earlier rule in the same
+    /// pass just set (the way the affinity check re-reads from the OS every
+    /// iteration). Two enabled rules on the same process, second one setting
+    /// nice back to the pre-pass value, reproduces it: under the bug, the
+    /// second rule wrongly compared against the stale snapshot and never
+    /// fired at all, silently leaving the process on the first rule's value.
+    ///
+    /// Targets this test process's own pid with small, always-permitted
+    /// non-negative nice values — no elevated privilege needed — and
+    /// restores the original nice value afterward.
+    #[test]
+    fn apply_rules_lets_a_later_rule_override_an_earlier_ones_nice_in_the_same_pass() {
+        let pid = std::process::id();
+        let starting = utils::get_nice(pid).unwrap_or(0);
+        let bumped = if starting == 1 { 2 } else { 1 };
+
+        let mut rule1 = rule_with("apply-rules-staleness-test", "contains");
+        rule1.rule_id = "r1".into();
+        rule1.nice = Some(bumped);
+        let mut rule2 = rule_with("apply-rules-staleness-test", "contains");
+        rule2.rule_id = "r2".into();
+        rule2.nice = Some(starting);
+
+        let mut nice_failed = std::collections::HashSet::new();
+        let actions = apply_rules(
+            &[rule1, rule2],
+            pid,
+            "apply-rules-staleness-test",
+            Some(starting),
+            None,
+            &mut nice_failed,
+            &|_| {},
+        );
+
+        let ended_at = utils::get_nice(pid);
+        // Always put it back, pass or fail.
+        let _ = utils::set_nice(pid, starting);
+
+        assert_eq!(
+            actions.len(),
+            2,
+            "both rules should have applied a nice change: {actions:?}"
+        );
+        assert_eq!(
+            ended_at,
+            Some(starting),
+            "the second rule must win and restore the pre-pass value, not get \
+             silently skipped for comparing against a stale snapshot"
+        );
     }
 }

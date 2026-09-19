@@ -141,6 +141,21 @@ pub fn set_affinity(pid: u32, cpulist: &str) -> bool {
     any_ok
 }
 
+/// set_affinity(), but a no-op (returning false, without touching the
+/// process) when the process is already on `cpulist` — comparing as sets so
+/// equivalent-but-differently-formatted cpulists don't cause needless
+/// syscalls or "changed" reports. Was previously reimplemented ad hoc at
+/// three call sites with two different behaviours (rules.rs dirty-checked,
+/// monitor.rs's two default-affinity sites didn't); a periodic
+/// ReapplyDefaults loops this over every known process, so skipping the
+/// syscall (and the caller's log line) when nothing would actually change
+/// matters there in particular.
+pub fn set_affinity_if_changed(pid: u32, cpulist: &str) -> bool {
+    let target = cpulist_to_set(cpulist).unwrap_or_default();
+    let current = cpulist_to_set(&get_affinity_str(pid)).unwrap_or_default();
+    current != target && set_affinity(pid, cpulist)
+}
+
 /// Read current affinity of the main thread as a cpulist string.
 pub fn get_affinity_str(pid: u32) -> String {
     use nix::sched::sched_getaffinity;
@@ -565,6 +580,19 @@ fn csv_field(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of set_affinity_if_changed: asking for the affinity a
+    /// process already has must be a no-op, without ever calling
+    /// sched_setaffinity — real breadth-of-effect testing of the "actually
+    /// changes something" branch is left to set_affinity's own behaviour
+    /// (unchanged by this helper) since it would affect every other test
+    /// sharing this process.
+    #[test]
+    fn set_affinity_if_changed_is_a_noop_when_already_on_target() {
+        let pid = std::process::id();
+        let current = get_affinity_str(pid);
+        assert!(!set_affinity_if_changed(pid, &current));
+    }
 
     #[test]
     fn cpulist_parses_ranges_and_items() {
