@@ -636,8 +636,16 @@ fn run_loop(
             ipc.broadcast(&argus_ipc::IpcMessage::Config(
                 config.gaming_mode.overlay.clone(),
             ));
+            // Merge just the field this toggle actually changed into shared
+            // state, not the whole Config: `config` here is this loop's own
+            // mirror, refreshed only by DaemonCmd::UpdateConfig, so it can't
+            // see GUI-only fields (column widths, rules, opacity/theme) the
+            // GUI thread writes directly into s.config between UpdateConfig
+            // calls. Overwriting the whole struct raced those writes and
+            // could silently discard them — including, in the rules case, a
+            // user's just-edited rule definitions on the next config save.
             if let Ok(mut s) = state.lock() {
-                s.config = config.clone();
+                s.config.gaming_mode.overlay = config.gaming_mode.overlay.clone();
             }
             log_cb(format!(
                 "Overlay visibility toggled to {}",
