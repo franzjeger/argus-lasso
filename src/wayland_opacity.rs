@@ -160,5 +160,10 @@ impl WaylandOpacity {
 impl Drop for WaylandOpacity {
     fn drop(&mut self) {
         self.surface_alpha.destroy();
+        // Without this, the destroy request can sit in the client-side
+        // buffer unsent if nothing flushes before the connection itself
+        // gets torn down — set() already flushes after every request for
+        // the same reason.
+        let _ = self.conn.flush();
     }
 }
