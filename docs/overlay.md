@@ -10,9 +10,17 @@ layer for selected games with this Steam launch option:
 ARGUS_LASSO_HUD=1 %command%
 ```
 
-The global-loading switch changes the installed manifest's loading conditions
-while preserving the versioned library path. Restart a game after changing
-loading conditions. To force the layer off for a comparison:
+**Automatically show in detected Vulkan games** changes the installed manifest's
+loading conditions while preserving the versioned library path. The layer then
+enables its HUD and recording worker only for detected Steam/Proton games (Steam
+game IDs or an executable under `steamapps/common`), or applications explicitly
+launched with `ARGUS_LASSO_HUD=1`. Other Vulkan applications are passed through
+without HUD resources or telemetry connections. Known terminals, launchers and
+desktop compositors are excluded even if they inherit game launch variables.
+Detection is heuristic; standalone and other launcher games may need the explicit
+launch option above. Restart applications after changing loading conditions or
+installing an updated layer, including terminals that already show an overlay.
+To force the layer off for a comparison:
 
 ```text
 ARGUS_LASSO_HUD_DISABLE=1 %command%

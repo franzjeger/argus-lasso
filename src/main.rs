@@ -136,6 +136,8 @@ enum Cmd {
         /// CPU list, e.g. "0-7" or "0,2,4"
         mask: String,
     },
+    /// Toggle the visibility of the overlay HUD
+    ToggleOverlay,
     /// Print a JSON status snapshot (system + top processes) and exit
     Status {
         /// Include only the top N processes by CPU (0 = all)
@@ -281,6 +283,15 @@ fn main() {
                     })).collect::<Vec<_>>(),
                 });
                 println!("{}", serde_json::to_string_pretty(&json).unwrap());
+                return;
+            }
+            Cmd::ToggleOverlay => {
+                let path = config::config_dir().join("toggle_overlay");
+                if let Err(e) = std::fs::write(&path, "") {
+                    eprintln!("Failed to request toggle: {e}");
+                    std::process::exit(1);
+                }
+                println!("Overlay toggle requested.");
                 return;
             }
         }

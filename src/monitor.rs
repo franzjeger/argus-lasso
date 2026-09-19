@@ -427,6 +427,12 @@ fn get_ram_speed_mts() -> Option<u32> {
     use std::sync::OnceLock;
     static RAM_SPEED: OnceLock<Option<u32>> = OnceLock::new();
     *RAM_SPEED.get_or_init(|| {
+        // First try the root sensor daemon, which runs dmidecode for us
+        if let Some(mts) = crate::sensor_data::read().ok().and_then(|s| s.ram_speed_mts) {
+            return Some(mts);
+        }
+        
+        // Fallback to calling dmidecode directly if we happen to have privileges
         let out = std::process::Command::new("dmidecode")
             .arg("-t")
             .arg("memory")
@@ -607,6 +613,25 @@ fn run_loop(
     let mut enforce_nice_failed: HashSet<(String, u32)> = HashSet::new();
 
     loop {
+        // ── Check for CLI overlay toggle ────────────────────────────────────
+        let toggle_path = crate::config::config_dir().join("toggle_overlay");
+        if toggle_path.exists() {
+            let _ = std::fs::remove_file(&toggle_path);
+            config.gaming_mode.overlay.show_overlay = !config.gaming_mode.overlay.show_overlay;
+            let cfg_save = config.clone();
+            // Fire-and-forget save; we're in the daemon loop, we don't want to block long
+            if let Err(e) = crate::config::save(&cfg_save) {
+                log::error!("Failed to save config after toggling overlay: {e}");
+            }
+            ipc.broadcast(&argus_ipc::IpcMessage::Config(
+                config.gaming_mode.overlay.clone(),
+            ));
+            if let Ok(mut s) = state.lock() {
+                s.config = config.clone();
+            }
+            log_cb(format!("Overlay visibility toggled to {}", config.gaming_mode.overlay.show_overlay));
+        }
+
         // ── Drain commands from GUI ─────────────────────────────────────────
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {

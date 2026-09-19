@@ -31,6 +31,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Global Vulkan HUD activation now filters for detected Steam/Proton games or
+  explicit per-game opt-in; known terminals and desktop hosts are excluded even
+  when they inherit game launch variables.
 - Wrong installed overlay library selection, silent IPC schema mismatch and missed
   initial configuration; missing sensors no longer masquerade as measured zeroes.
 - Per-frame rasterization after the old frame deque saturated; text caching and

@@ -3,6 +3,7 @@
 //! Hooks: vkCreateInstance, vkEnumeratePhysicalDevices, vkCreateDevice,
 //!        vkGetDeviceQueue, vkCreateSwapchainKHR, vkQueuePresentKHR.
 
+mod activation;
 mod capture;
 pub mod font;
 pub mod hud;
@@ -29,7 +30,8 @@ lazy_static::lazy_static! {
     static ref GRAPHICS_QUEUES: RwLock<HashMap<vk::Queue, bool>> = RwLock::new(HashMap::new());
     static ref LOADER_DATA: RwLock<HashMap<vk::Device, unsafe extern "system" fn(vk::Device, *mut c_void) -> vk::Result>> = RwLock::new(HashMap::new());
     static ref QUEUE_FAMILIES: RwLock<HashMap<vk::Queue, u32>> = RwLock::new(HashMap::new());
-    static ref PASSTHROUGH: bool = std::env::var("ARGUS_LASSO_DRAW").as_deref() == Ok("0");
+    static ref ACTIVE: bool = activation::enabled();
+    static ref PASSTHROUGH: bool = !*ACTIVE || std::env::var("ARGUS_LASSO_DRAW").as_deref() == Ok("0");
 
     // Configuration for the overlay (received via IPC)
     pub static ref OVERLAY_CONFIG: RwLock<OverlayConfig> = RwLock::new(OverlayConfig::default());
@@ -743,7 +745,7 @@ pub unsafe extern "system" fn argus_vkQueuePresentKHR(
     queue: vk::Queue,
     info: *const vk::PresentInfoKHR,
 ) -> vk::Result {
-    let ticket = capture::ticket();
+    let ticket = if *ACTIVE { capture::ticket() } else { 0 };
     let begin = (ticket != 0).then(Instant::now);
     let result = present_impl(queue, info);
     if let Some(at) = begin {
@@ -1096,7 +1098,9 @@ pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
             argus_ipc::PROTOCOL_VERSION,
             !*PASSTHROUGH
         );
-        start_ipc_thread();
+        if *ACTIVE {
+            start_ipc_thread();
+        }
     });
 
     if p_version_struct.is_null() {

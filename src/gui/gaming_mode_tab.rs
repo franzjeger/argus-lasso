@@ -789,12 +789,13 @@ impl GamingModeTab {
                     overlay_changed = crate::gui::overlay_settings::show(ui, &mut self.config.gaming_mode.overlay, &mut self.overlay_settings_open, crate::utils::get_cpu_count());
                     ui.separator();
                     let mut global = self.config.ui.global_overlay;
-                    if ui.checkbox(&mut global, "Load in all Vulkan games").on_hover_text("Applies to games started after this change. Individual games can use ARGUS_LASSO_HUD_DISABLE=1.").changed() {
+                    if ui.checkbox(&mut global, "Automatically show in detected Vulkan games").on_hover_text("Detects Steam/Proton games. Terminal windows and desktop applications are skipped. Restart applications after changing this setting. Other games can opt in with ARGUS_LASSO_HUD=1; disable an individual game with ARGUS_LASSO_HUD_DISABLE=1.").changed() {
                         match crate::gui::overlay_install::set_global(global) {
                             Ok(()) => { self.config.ui.global_overlay = global; overlay_changed = true; self.overlay_install_status = "Saved. Restart running games to change layer loading.".into(); }
                             Err(e) => self.overlay_install_status = format!("Could not change layer loading: {e}"),
                         }
                     }
+                    ui.label("For other games, use launch option: ARGUS_LASSO_HUD=1 %command%");
                     if !self.overlay_install_status.is_empty() { ui.label(&self.overlay_install_status); }
                 });
                 if overlay_changed { self.events.push(GamingEvent::ConfigChanged(Box::new(self.config.clone()))); }

@@ -3,6 +3,12 @@ use argus_ipc::{OverlayConfig, TelemetryFrame};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+const ROW_SPACING: u32 = 3;
+const DIVIDER_HEIGHT: u32 = 9;
+const GRAPH_HEIGHT: u32 = 40;
+const GRAPH_MIN_WIDTH: u32 = 240;
+const DIVIDER_COLOR: (u8, u8, u8) = (160, 174, 192);
+
 #[derive(Default, Clone)]
 pub struct FrameStats {
     last: Option<Instant>,
@@ -264,7 +270,7 @@ fn content_rows(
             [
                 f.fps.then(|| cell(Fps, "FPS", format!("{fps:>5.0}"))),
                 f.frametime
-                    .then(|| cell(Frametime, "Frame", format!("{ms:>6.2} ms"))),
+                    .then(|| cell(Frametime, "FRAME", format!("{ms:>6.2} ms"))),
             ],
         );
         add_row(
@@ -273,7 +279,7 @@ fn content_rows(
                 f.average_fps
                     .then(|| cell(AverageFps, "AVG", format!("{avg:>5.0} [10 s]"))),
                 f.low_1
-                    .then(|| cell(Low1, "1% low", format!("{low:>5.0} [10 s]"))),
+                    .then(|| cell(Low1, "1% LOW", format!("{low:>5.0} [10 s]"))),
             ],
         );
     }
@@ -290,14 +296,14 @@ fn content_rows(
                     f.gpu_usage.then(|| {
                         cell(
                             GpuUsage,
-                            "Load",
+                            "LOAD",
                             format!("{:>3} %", value(t.gpu_usage_percent)),
                         )
                     }),
                     f.gpu_temp
-                        .then(|| cell(GpuTemp, "Temp", format!("{:>3} °C", value(t.gpu_temp_c)))),
+                        .then(|| cell(GpuTemp, "TEMP", format!("{:>3} °C", value(t.gpu_temp_c)))),
                     f.gpu_power
-                        .then(|| cell(GpuPower, "Power", format!("{:>4} W", watts(t.gpu_power_w)))),
+                        .then(|| cell(GpuPower, "POWER", format!("{:>4} W", watts(t.gpu_power_w)))),
                 ],
             );
             add_row(
@@ -306,21 +312,21 @@ fn content_rows(
                     f.gpu_core_clock.then(|| {
                         cell(
                             GpuCoreClock,
-                            "Core",
+                            "CORE",
                             format!("{:>5} MHz", value(t.gpu_core_clock_mhz)),
                         )
                     }),
                     f.gpu_mem_clock.then(|| {
                         cell(
                             GpuMemClock,
-                            "Mem",
+                            "MEM",
                             format!("{:>5} MHz", value(t.gpu_mem_clock_mhz)),
                         )
                     }),
                     f.gpu_fan.then(|| {
                         cell(
                             GpuFan,
-                            "Fan",
+                            "FAN",
                             format!("{:>3} %", value(t.gpu_fan_speed_percent)),
                         )
                     }),
@@ -345,11 +351,11 @@ fn content_rows(
                 &mut part,
                 [
                     f.cpu_usage
-                        .then(|| cell(CpuUsage, "Load", format!("{:>3} %", t.cpu_usage_percent))),
+                        .then(|| cell(CpuUsage, "LOAD", format!("{:>3} %", t.cpu_usage_percent))),
                     f.cpu_temp
-                        .then(|| cell(CpuTemp, "Temp", format!("{:>3} °C", value(t.cpu_temp_c)))),
+                        .then(|| cell(CpuTemp, "TEMP", format!("{:>3} °C", value(t.cpu_temp_c)))),
                     f.cpu_power
-                        .then(|| cell(CpuPower, "Power", format!("{:>4} W", watts(t.cpu_power_w)))),
+                        .then(|| cell(CpuPower, "POWER", format!("{:>4} W", watts(t.cpu_power_w)))),
                 ],
             );
             add_row(
@@ -357,7 +363,7 @@ fn content_rows(
                 [f.cpu_frequency.then(|| {
                     cell(
                         CpuFrequency,
-                        "Clock",
+                        "CLOCK",
                         format!("{:>5} MHz", value(t.cpu_freq_mhz)),
                     )
                 })],
@@ -380,7 +386,7 @@ fn content_rows(
             .filter(|cpu| !config.hidden_cpu_ids.contains(&cpu.id))
             .collect();
         if config.show_cores && !cpus.is_empty() {
-            let mut heading = "CPU threads".to_string();
+            let mut heading = "CPU THREADS".to_string();
             if f.thread_usage {
                 heading.push_str(" · load %");
             }
@@ -441,7 +447,7 @@ fn content_rows(
                     f.ram_speed.then(|| {
                         cell(
                             RamSpeed,
-                            "Speed",
+                            "SPEED",
                             format!("{:>5} MT/s", value(t.ram_speed_mts)),
                         )
                     }),
@@ -460,9 +466,9 @@ fn content_rows(
             &mut part,
             [
                 f.argus_mode
-                    .then(|| cell(ArgusMode, "Argus", t.active_profile.clone())),
+                    .then(|| cell(ArgusMode, "ARGUS", t.active_profile.clone())),
                 f.parked
-                    .then(|| cell(Parked, "Parked", format!("{:>2} threads", t.parked_cores))),
+                    .then(|| cell(Parked, "PARKED", format!("{:>2} threads", t.parked_cores))),
             ],
         );
         if let Some(game) = &t.game {
@@ -538,7 +544,7 @@ impl Rasterizer {
             };
         }
         let margin = config.margin.min(32);
-        let row_h = px + 3;
+        let row_h = px + ROW_SPACING;
         let width = (rows
             .iter()
             .map(|r| {
@@ -554,36 +560,35 @@ impl Rasterizer {
             + margin * 2
             + 2;
         let width = if config.show_graph {
-            width.max(240)
+            width.max(GRAPH_MIN_WIDTH)
         } else {
             width
         };
-        let graph_h = if config.show_graph { 40 } else { 0 };
-        let divider_h = 9;
+        let graph_h = if config.show_graph { GRAPH_HEIGHT } else { 0 };
         let height = rows.len() as u32 * row_h
-            + rows.iter().filter(|r| r.divider).count() as u32 * divider_h
+            + rows.iter().filter(|r| r.divider).count() as u32 * DIVIDER_HEIGHT
             + margin * 2
             + graph_h;
         let bg = config.bg_color;
         let mut image = HudImage {
             width,
             height,
-            graph_y: config.show_graph.then(|| height - margin - 40),
+            graph_y: config.show_graph.then(|| height - margin - GRAPH_HEIGHT),
             pixels: vec![over(0, (bg.0, bg.1, bg.2), bg.3 as u32); (width * height) as usize],
         };
         let mut top = margin;
         for row in &rows {
             if row.divider {
-                let y = top + divider_h / 2;
+                let y = top + DIVIDER_HEIGHT / 2;
                 for x in margin..width - margin {
                     let i = (y * width + x) as usize;
                     image.pixels[i] = over(
                         image.pixels[i],
-                        (160, 174, 192),
+                        DIVIDER_COLOR,
                         config.text_color.3 as u32 / 4,
                     );
                 }
-                top += divider_h;
+                top += DIVIDER_HEIGHT;
             }
             let y = top + px;
             top += row_h;
@@ -697,7 +702,7 @@ mod tests {
             .join("\n");
         assert!(rows.contains("Temp  42 °C"));
         assert!(rows.contains("CPU 19"));
-        for absent in ["GPU MODEL", "Power", "MHz", "CPU 03", "5100", "Argus"] {
+        for absent in ["GPU MODEL", "POWER", "MHz", "CPU 03", "5100", "ARGUS"] {
             assert!(!rows.contains(absent), "{rows}");
         }
         c.show_gpu = false;
