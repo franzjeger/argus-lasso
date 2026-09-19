@@ -109,6 +109,10 @@ fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(NET_TIMEOUT))
         .user_agent(USER_AGENT)
+        // Belt and suspenders: every URL here already comes from GitHub's
+        // API/CDN over https, but refusing to follow a redirect down to
+        // plain http removes the class of concern for free.
+        .https_only(true)
         .build()
         .into()
 }
@@ -330,6 +334,10 @@ fn install_blocking(update: &Update) -> Result<(), String> {
     let staged = dir.join(".argus-lasso.update");
     std::fs::write(&staged, &binary).map_err(|e| format!("could not stage the update: {e}"))?;
     set_executable(&staged)?;
+    if let Err(e) = verify_staged_binary_is_an_upgrade(&staged) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e);
+    }
     std::fs::rename(&staged, &target).map_err(|e| {
         let _ = std::fs::remove_file(&staged);
         format!("could not replace the binary: {e}")
@@ -340,6 +348,53 @@ fn install_blocking(update: &Update) -> Result<(), String> {
     // log line, not a failed install.
     for note in refresh_support_files(&tarball, &target) {
         log::info!("update: {note}");
+    }
+    Ok(())
+}
+
+/// Refuse to install unless the staged binary's own reported version is
+/// genuinely newer than what is running now.
+///
+/// The checksum and signature checks above only prove the tarball is
+/// byte-for-byte what the release key signed — they say nothing about
+/// *which* release that was. `latest_release()` takes the displayed
+/// `version` straight from the GitHub API's `tag_name`, which has no
+/// cryptographic link to the tarball's content. An attacker who compromises
+/// only release-upload access (a stolen PAT, not the offline minisign
+/// secret) can re-publish an old, genuinely-signed tarball — together with
+/// its own already-public `.sha256`/`.minisig`, no private key needed — under
+/// a fabricated newer tag, and every check above this one passes, because it
+/// really is validly signed, just for stale content. A rollback to old,
+/// possibly-vulnerable code would then look like a normal upgrade.
+///
+/// The one thing that can't be forged without breaking the signature is the
+/// binary's own compiled-in version string, so ask the binary we are about
+/// to become — read-only, via its own --version flag — instead of trusting
+/// the release metadata for this decision.
+fn verify_staged_binary_is_an_upgrade(staged: &Path) -> Result<(), String> {
+    let output = std::process::Command::new(staged)
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("could not run the downloaded build to check its version: {e}"))?;
+    if !output.status.success() {
+        return Err("the downloaded build did not respond to --version; refusing to install"
+            .to_string());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // clap's `#[command(version)]` prints "<bin-name> <version>".
+    let reported = stdout
+        .trim()
+        .rsplit(' ')
+        .next()
+        .filter(|s| !s.is_empty())
+        .ok_or("the downloaded build reported no version; refusing to install")?;
+    if !is_newer(reported, current_version()) {
+        return Err(format!(
+            "downloaded build reports version {reported}, which is not newer \
+             than the running {} — refusing to install (this looks like a \
+             downgrade, not an upgrade)",
+            current_version()
+        ));
     }
     Ok(())
 }
@@ -370,12 +425,16 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
     let mut reader = resp.body_mut().as_reader();
     let mut chunk = [0u8; 8192];
     loop {
-        if buf.len() as u64 >= MAX_DOWNLOAD_BYTES {
+        let remaining = MAX_DOWNLOAD_BYTES.saturating_sub(buf.len() as u64);
+        if remaining == 0 {
             return Err(format!(
                 "download exceeds the {MAX_DOWNLOAD_BYTES}-byte limit"
             ));
         }
-        match reader.read(&mut chunk) {
+        // Never ask for more than the remaining budget, so `buf` can't grow
+        // past MAX_DOWNLOAD_BYTES even by one chunk's worth.
+        let want = remaining.min(chunk.len() as u64) as usize;
+        match reader.read(&mut chunk[..want]) {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(e) => return Err(format!("download failed: {e}")),
@@ -555,6 +614,35 @@ fn refresh_support_files(tarball: &[u8], target: &Path) -> Vec<String> {
     notes
 }
 
+/// Open `path` for writing, refusing to follow a pre-existing file there —
+/// symlink or otherwise — instead of silently writing through it the way
+/// plain `fs::write` would.
+///
+/// `path` lives under a predictable, PID-derived name in the shared, often
+/// world-writable temp dir, so a local co-resident user can guess it and
+/// pre-plant a symlink pointing at a file they want overwritten. `create_new`
+/// (O_CREAT|O_EXCL) fails rather than following such a symlink. If the name
+/// is already taken — a stale leftover from a previous run at the same PID,
+/// or exactly such a symlink — `remove_file` only ever unlinks the name
+/// itself (it never follows it), so retrying once after that is safe either
+/// way.
+fn create_new_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(path);
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        }
+        other => other,
+    }
+}
+
 /// Refresh installed icons from the tarball's vector masters.
 ///
 /// Mirrors the Makefile's tiering: below 48px the full artwork turns to
@@ -595,9 +683,16 @@ fn refresh_icons(tarball: &[u8], home: &Path) -> Vec<String> {
         let Some(svg) = extract_member(tarball, member) else {
             continue;
         };
-        if std::fs::write(&tmp, &svg).is_err() {
+        let Ok(mut file) = create_new_exclusive(&tmp) else {
+            continue;
+        };
+        use std::io::Write as _;
+        if file.write_all(&svg).is_err() {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
             continue;
         }
+        drop(file);
         for &size in sizes {
             let dest = hicolor.join(format!("{size}x{size}/apps/argus-lasso.png"));
             if !dest.exists() {
@@ -607,8 +702,8 @@ fn refresh_icons(tarball: &[u8], home: &Path) -> Vec<String> {
                 notes.push(format!("refreshed {size}px icon"));
             }
         }
+        let _ = std::fs::remove_file(&tmp);
     }
-    let _ = std::fs::remove_file(&tmp);
     notes
 }
 
@@ -666,7 +761,89 @@ pub fn restart() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_binary, is_newer, sha256_hex, strip_deleted_suffix, verify_signature};
+    use super::{
+        extract_binary, is_newer, sha256_hex, strip_deleted_suffix, verify_signature,
+        verify_staged_binary_is_an_upgrade,
+    };
+
+    fn write_fake_binary(name: &str, script: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        std::fs::write(&path, script).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// The whole point of this check: a validly-signed OLD build re-offered
+    /// under a fabricated newer release tag must still be refused, because
+    /// its own --version output can't be forged without breaking the
+    /// signature the way the release tag's metadata can be.
+    #[test]
+    fn refuses_a_binary_reporting_an_older_version_than_this_one() {
+        let bin = write_fake_binary(
+            "argus-updater-test-rollback",
+            "#!/bin/sh\necho 'argus-lasso 0.0.1'\n",
+        );
+        let err = verify_staged_binary_is_an_upgrade(&bin).unwrap_err();
+        assert!(
+            err.contains("not newer"),
+            "unexpected error message: {err}"
+        );
+        std::fs::remove_file(&bin).ok();
+    }
+
+    #[test]
+    fn accepts_a_binary_reporting_a_genuinely_newer_version() {
+        let bin = write_fake_binary(
+            "argus-updater-test-upgrade",
+            "#!/bin/sh\necho 'argus-lasso 999.0.0'\n",
+        );
+        assert!(verify_staged_binary_is_an_upgrade(&bin).is_ok());
+        std::fs::remove_file(&bin).ok();
+    }
+
+    #[test]
+    fn refuses_a_binary_that_does_not_support_version() {
+        let bin = write_fake_binary("argus-updater-test-noversion", "#!/bin/sh\nexit 1\n");
+        assert!(verify_staged_binary_is_an_upgrade(&bin).is_err());
+        std::fs::remove_file(&bin).ok();
+    }
+
+    /// The whole point of create_new_exclusive: a pre-planted symlink at the
+    /// target path must not have its target overwritten.
+    #[test]
+    fn create_new_exclusive_refuses_to_follow_a_pre_planted_symlink() {
+        let dir = std::env::temp_dir().join(format!(
+            "argus-updater-symlink-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"original contents").unwrap();
+        let link = dir.join("attacker-planted-link.svg");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let mut file = super::create_new_exclusive(&link)
+            .expect("must still succeed by removing the symlink and creating a real file");
+        use std::io::Write as _;
+        file.write_all(b"new icon bytes").unwrap();
+        drop(file);
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "original contents",
+            "the symlink's target must be untouched"
+        );
+        assert_eq!(std::fs::read(&link).unwrap(), b"new icon bytes");
+        assert!(
+            !std::fs::symlink_metadata(&link).unwrap().is_symlink(),
+            "the symlink must have been replaced by a real file, not written through"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn strips_kernel_deleted_suffix() {
