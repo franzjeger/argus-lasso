@@ -1499,22 +1499,10 @@ fn read_percpu_stats() -> Vec<(u32, [u64; 10])> {
 }
 
 fn read_ionice(pid: u32) -> String {
-    // Read /proc/<pid>/io_prio or use ioprio_get syscall via nix
-    // For display, we use the raw ioprio value decoded
-    use nix::libc;
-    let prio = unsafe {
-        libc::syscall(
-            libc::SYS_ioprio_get,
-            1, /* IOPRIO_WHO_PROCESS */
-            pid as libc::c_int,
-        )
-    };
-    if prio < 0 {
-        return String::new();
+    match utils::get_ionice_raw(pid) {
+        Some((class, level)) => format!("{class}/{level}"),
+        None => String::new(),
     }
-    let class = (prio as u32 >> 13) & 0x7;
-    let level = prio as u32 & 0x1fff;
-    format!("{class}/{level}")
 }
 
 // ── New PID handling ──────────────────────────────────────────────────────────
