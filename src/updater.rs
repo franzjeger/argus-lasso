@@ -380,7 +380,13 @@ fn verify_staged_binary_is_an_upgrade(staged: &Path) -> Result<(), String> {
         return Err("the downloaded build did not respond to --version; refusing to install"
             .to_string());
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    check_reported_version_is_an_upgrade(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The actual decision, pulled out of verify_staged_binary_is_an_upgrade so
+/// it's testable without spawning a real process: takes the captured
+/// `--version` stdout and decides whether it represents a genuine upgrade.
+fn check_reported_version_is_an_upgrade(stdout: &str) -> Result<(), String> {
     // clap's `#[command(version)]` prints "<bin-name> <version>".
     let reported = stdout
         .trim()
@@ -762,66 +768,53 @@ pub fn restart() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_binary, is_newer, sha256_hex, strip_deleted_suffix, verify_signature,
-        verify_staged_binary_is_an_upgrade,
+        check_reported_version_is_an_upgrade, current_version, extract_binary, is_newer,
+        sha256_hex, strip_deleted_suffix, verify_signature,
     };
-
-    /// A pid-only suffix isn't unique enough for a file we then exec: rapid
-    /// successive `cargo test` invocations can reuse a pid before the kernel
-    /// fully releases a previous run's identically-named executable,
-    /// intermittently failing the write with ETXTBSY. Nanosecond time is
-    /// unique enough in practice that this doesn't recur.
-    fn unique_temp_name(name: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()))
-    }
-
-    fn write_fake_binary(name: &str, script: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = unique_temp_name(name);
-        std::fs::write(&path, script).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        path
-    }
 
     /// The whole point of this check: a validly-signed OLD build re-offered
     /// under a fabricated newer release tag must still be refused, because
     /// its own --version output can't be forged without breaking the
     /// signature the way the release tag's metadata can be.
+    ///
+    /// Exercises check_reported_version_is_an_upgrade() directly with
+    /// literal --version-shaped text rather than actually spawning a
+    /// process: writing a shebang script and exec'ing it here raced against
+    /// this same test binary's OWN concurrently-running tests that spawn
+    /// processes (cpu_park.rs's helper tests, tar invocations, ...) — fork()
+    /// duplicates every thread's open file descriptors, so a sibling test's
+    /// process spawn could inherit a not-yet-closed writable fd to this
+    /// test's freshly-written script and make exec'ing it fail with
+    /// ETXTBSY. verify_staged_binary_is_an_upgrade's own process-spawning
+    /// half is a thin, untested wrapper around std::process::Command;
+    /// what's actually worth testing here is the version-comparison logic.
     #[test]
-    fn refuses_a_binary_reporting_an_older_version_than_this_one() {
-        let bin = write_fake_binary(
-            "argus-updater-test-rollback",
-            "#!/bin/sh\necho 'argus-lasso 0.0.1'\n",
-        );
-        let err = verify_staged_binary_is_an_upgrade(&bin).unwrap_err();
+    fn refuses_a_reported_version_older_than_this_one() {
+        let err = check_reported_version_is_an_upgrade("argus-lasso 0.0.1").unwrap_err();
         assert!(
             err.contains("not newer"),
             "unexpected error message: {err}"
         );
-        std::fs::remove_file(&bin).ok();
     }
 
     #[test]
-    fn accepts_a_binary_reporting_a_genuinely_newer_version() {
-        let bin = write_fake_binary(
-            "argus-updater-test-upgrade",
-            "#!/bin/sh\necho 'argus-lasso 999.0.0'\n",
-        );
-        assert!(verify_staged_binary_is_an_upgrade(&bin).is_ok());
-        std::fs::remove_file(&bin).ok();
+    fn accepts_a_reported_version_genuinely_newer_than_this_one() {
+        assert!(check_reported_version_is_an_upgrade("argus-lasso 999.0.0").is_ok());
     }
 
     #[test]
-    fn refuses_a_binary_that_does_not_support_version() {
-        let bin = write_fake_binary("argus-updater-test-noversion", "#!/bin/sh\nexit 1\n");
-        assert!(verify_staged_binary_is_an_upgrade(&bin).is_err());
-        std::fs::remove_file(&bin).ok();
+    fn refuses_empty_or_garbage_version_output() {
+        assert!(check_reported_version_is_an_upgrade("").is_err());
+        assert!(check_reported_version_is_an_upgrade("   \n").is_err());
+    }
+
+    #[test]
+    fn accepts_exactly_the_current_version_is_still_refused_as_not_an_upgrade() {
+        // is_newer() is strict: reporting the exact version already running
+        // is not itself a downgrade, but it's not an upgrade either, and
+        // installing it would be pointless at best.
+        let same = format!("argus-lasso {}", current_version());
+        assert!(check_reported_version_is_an_upgrade(&same).is_err());
     }
 
     /// The whole point of create_new_exclusive: a pre-planted symlink at the
