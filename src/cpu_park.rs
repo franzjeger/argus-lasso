@@ -191,7 +191,6 @@ pub enum TopologyKind {
 
 #[derive(Debug, Clone)]
 pub struct CpuTopology {
-    #[allow(dead_code)]
     pub kind: TopologyKind,
     pub preferred: HashSet<u32>,
     pub non_preferred: HashSet<u32>,
@@ -671,6 +670,21 @@ pub fn is_pkexec_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Allowlist a path for unquoted-adjacent interpolation into a shell command
+/// that `pkexec` runs as root. Every caller still single-quotes the value on
+/// top of this — belt and suspenders, since either one alone has a history
+/// of missed edge cases in shell-command construction.
+fn validate_shell_safe_path(s: &str) -> Result<&str, String> {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+    {
+        Ok(s)
+    } else {
+        Err("Staging path contains unsafe characters.".into())
+    }
+}
+
 /// Stage the helper scripts and the polkit policy in the user's own config
 /// directory, and build the root command that installs them.
 ///
@@ -682,9 +696,15 @@ fn stage_install() -> Result<(String, std::path::PathBuf), String> {
     let _ = fs::remove_dir_all(&stage);
     fs::create_dir_all(&stage).map_err(|e| format!("Failed to create staging dir: {e}"))?;
 
+    // `dir` is interpolated into a string that pkexec runs via `sh -c`, so it
+    // is as good as attacker input: it comes from $HOME (config_dir()), which
+    // isn't necessarily trustworthy just because we're running as our own
+    // uid. An allowlist (rather than blocking a few known-bad characters) and
+    // single-quoting every use below are both required — either alone has a
+    // history of missed edge cases in shell-command construction.
     let dir = match stage.to_str() {
-        Some(s) if !s.contains('\'') && !s.contains(char::is_whitespace) => s.to_string(),
-        _ => return Err("Staging path contains unsafe characters.".into()),
+        Some(s) => validate_shell_safe_path(s)?.to_string(),
+        None => return Err("Staging path is not valid UTF-8.".into()),
     };
 
     for (name, body) in [
@@ -700,14 +720,19 @@ fn stage_install() -> Result<(String, std::path::PathBuf), String> {
     // Removing the predecessor is part of the install, not a separate step:
     // leaving the old NOPASSWD sudoers rule in place would keep the very hole
     // this replaces open.
+    //
+    // Every path is single-quoted, including the compile-time HELPER_DIR/
+    // POLICY_PATH constants: those are trusted, but quoting them too is free
+    // and keeps this command safe even if a packager ever bakes in a path
+    // containing a space.
     let cmd = format!(
         "set -e && \
-         install -d -m 755 -o root -g root {HELPER_DIR} && \
-         install -m 755 -o root -g root {dir}/{OP_PARK} {HELPER_DIR}/{OP_PARK} && \
-         install -m 755 -o root -g root {dir}/{OP_POWER} {HELPER_DIR}/{OP_POWER} && \
-         install -m 755 -o root -g root {dir}/{OP_RENICE} {HELPER_DIR}/{OP_RENICE} && \
-         install -D -m 644 -o root -g root {dir}/policy.xml {POLICY_PATH} && \
-         rm -f {LEGACY_SUDOERS} {LEGACY_HELPER} && \
+         install -d -m 755 -o root -g root '{HELPER_DIR}' && \
+         install -m 755 -o root -g root '{dir}/{OP_PARK}' '{HELPER_DIR}/{OP_PARK}' && \
+         install -m 755 -o root -g root '{dir}/{OP_POWER}' '{HELPER_DIR}/{OP_POWER}' && \
+         install -m 755 -o root -g root '{dir}/{OP_RENICE}' '{HELPER_DIR}/{OP_RENICE}' && \
+         install -D -m 644 -o root -g root '{dir}/policy.xml' '{POLICY_PATH}' && \
+         rm -f '{LEGACY_SUDOERS}' '{LEGACY_HELPER}' && \
          echo INSTALL_OK"
     );
     Ok((cmd, stage))
@@ -1005,5 +1030,36 @@ mod tests {
         for body in [PARK_SCRIPT, POWER_SCRIPT, RENICE_SCRIPT] {
             assert!(body.contains(HELPER_VERSION), "missing version marker");
         }
+    }
+
+    /// stage_install() interpolates this value into a string that pkexec
+    /// runs as root via `sh -c`. It comes from $HOME (config_dir()), which
+    /// is not inherently trustworthy — each of these must be rejected, not
+    /// just the literal single-quote the old blocklist-only check caught.
+    #[test]
+    fn staging_path_validation_rejects_shell_metacharacters() {
+        for bad in [
+            "",
+            "/home/user;rm -rf /",
+            "/home/user$(whoami)",
+            "/home/user`whoami`",
+            "/home/user|cat /etc/shadow",
+            "/home/user&background",
+            "/home/user name/with space",
+            "/home/user'quote",
+            "/home/user\"quote",
+            "/home/user\nnewline",
+        ] {
+            assert!(
+                validate_shell_safe_path(bad).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn staging_path_validation_accepts_normal_paths() {
+        let good = "/home/user/.config/argus-lasso/helper-stage";
+        assert_eq!(validate_shell_safe_path(good), Ok(good));
     }
 }
