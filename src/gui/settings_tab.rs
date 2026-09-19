@@ -611,23 +611,54 @@ fn read_available_governors() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn set_governor(governor: &str) -> Result<(), String> {
-    // Try direct sysfs write first, fall back to privileged helper.
-    let cpu_count = crate::utils::get_cpu_count();
+/// Write `value` to `path_suffix` under every CPU's cpufreq directory (e.g.
+/// "cpufreq/scaling_governor"), falling back to the privileged polkit helper
+/// — which owns the privileged path and covers every core itself — if ANY
+/// core's direct write failed, not only if every one of them did. A
+/// non-uniform sysfs permission setup (or one core in an unexpected state)
+/// previously reported success while silently leaving some cores on their
+/// old value, because the fallback only fired when EVERY core failed.
+fn write_sysfs_all_cpus(
+    path_suffix: &str,
+    value: &str,
+    fallback: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    write_sysfs_all_cpus_at(
+        std::path::Path::new("/sys/devices/system/cpu"),
+        crate::utils::get_cpu_count(),
+        path_suffix,
+        value,
+        fallback,
+    )
+}
+
+fn write_sysfs_all_cpus_at(
+    base: &std::path::Path,
+    cpu_count: u32,
+    path_suffix: &str,
+    value: &str,
+    fallback: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
     let mut errors = 0usize;
     for i in 0..cpu_count {
-        let path = format!("/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_governor");
-        if std::fs::write(&path, governor).is_err() {
+        let path = base.join(format!("cpu{i}")).join(path_suffix);
+        if std::fs::write(&path, value).is_err() {
             errors += 1;
         }
     }
-    if errors == cpu_count as usize {
-        // Every direct sysfs write was refused — fall back to the polkit
-        // helper, which owns the privileged path now.
-        crate::cpu_park::set_governor_via_helper(governor)
+    if errors > 0 {
+        fallback(value)
     } else {
         Ok(())
     }
+}
+
+fn set_governor(governor: &str) -> Result<(), String> {
+    write_sysfs_all_cpus(
+        "cpufreq/scaling_governor",
+        governor,
+        crate::cpu_park::set_governor_via_helper,
+    )
 }
 
 fn read_epp() -> String {
@@ -645,20 +676,11 @@ fn read_available_epps() -> Vec<String> {
 }
 
 fn set_epp(epp: &str) -> Result<(), String> {
-    // Try direct sysfs write first, fall back to privileged helper.
-    let cpu_count = crate::utils::get_cpu_count();
-    let mut errors = 0usize;
-    for i in 0..cpu_count {
-        let path = format!("/sys/devices/system/cpu/cpu{i}/cpufreq/energy_performance_preference");
-        if std::fs::write(&path, epp).is_err() {
-            errors += 1;
-        }
-    }
-    if errors == cpu_count as usize {
-        crate::cpu_park::set_epp_via_helper(epp)
-    } else {
-        Ok(())
-    }
+    write_sysfs_all_cpus(
+        "cpufreq/energy_performance_preference",
+        epp,
+        crate::cpu_park::set_epp_via_helper,
+    )
 }
 
 fn check_autostart_enabled() -> bool {
@@ -742,4 +764,93 @@ fn disable_autostart() -> std::io::Result<String> {
     };
 
     Ok(format!("Autostart disabled (XDG{systemd_note})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_sysfs_all_cpus_at;
+    use std::cell::Cell;
+
+    fn fake_cpu_dir(root: &std::path::Path, writable_cpus: &[u32], cpu_count: u32) {
+        std::fs::create_dir_all(root).unwrap();
+        for i in 0..cpu_count {
+            if writable_cpus.contains(&i) {
+                // A regular directory: the write below will succeed.
+                std::fs::create_dir_all(root.join(format!("cpu{i}"))).unwrap();
+            }
+            // Cores not in `writable_cpus` get no directory at all, so
+            // writing "cpu{i}/governor" fails with NotFound — standing in
+            // for a real permission failure without needing root to set up
+            // an actually-unwritable file.
+        }
+    }
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "argus-settings-tab-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn no_fallback_when_every_core_writes_successfully() {
+        let root = temp_root("all-ok");
+        fake_cpu_dir(&root, &[0, 1, 2], 3);
+        let fallback_called = Cell::new(false);
+        let result = write_sysfs_all_cpus_at(&root, 3, "governor", "performance", |_| {
+            fallback_called.set(true);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(!fallback_called.get(), "fallback must not run when nothing failed");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The bug this exists for: previously the fallback only ran when EVERY
+    /// core failed. One failure out of several must still trigger it.
+    #[test]
+    fn fallback_runs_when_only_one_of_several_cores_fails() {
+        let root = temp_root("one-fails");
+        fake_cpu_dir(&root, &[0, 2], 3); // cpu1 has no directory -> its write fails
+        let fallback_called = Cell::new(false);
+        let result = write_sysfs_all_cpus_at(&root, 3, "governor", "performance", |_| {
+            fallback_called.set(true);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(
+            fallback_called.get(),
+            "a single core's failed write must still trigger the fallback"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fallback_runs_when_every_core_fails() {
+        let root = temp_root("all-fail");
+        fake_cpu_dir(&root, &[], 3); // no cpu directories at all
+        let fallback_called = Cell::new(false);
+        let result = write_sysfs_all_cpus_at(&root, 3, "governor", "performance", |_| {
+            fallback_called.set(true);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(fallback_called.get());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fallback_error_propagates() {
+        let root = temp_root("fallback-fails");
+        fake_cpu_dir(&root, &[], 1);
+        let result = write_sysfs_all_cpus_at(&root, 1, "governor", "performance", |_| {
+            Err("helper unavailable".to_string())
+        });
+        assert_eq!(result, Err("helper unavailable".to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
