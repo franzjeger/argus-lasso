@@ -50,10 +50,21 @@ pub struct CacheSizes {
 
 impl CacheSizes {
     pub fn read() -> Self {
-        let base = Path::new("/sys/devices/system/cpu/cpu0/cache");
+        Self::read_from(Path::new("/sys/devices/system/cpu/cpu0/cache"))
+    }
+
+    fn read_from(base: &Path) -> Self {
         let mut l1d = 32 * 1024;
         let mut l2 = 512 * 1024;
-        let mut l3 = 32 * 1024 * 1024;
+        // `None` until a real L3 entry is seen, rather than pre-seeding with
+        // the fallback default: seeding with 32 MiB and only overwriting on
+        // `sz > l3` meant any CPU whose real L3 was <= 32 MiB (common on
+        // plenty of client/older parts) could never satisfy that comparison,
+        // so the fallback silently stuck instead of the true, smaller,
+        // detected size. Some cache topologies do report L3 across more than
+        // one index node (e.g. segmented/partitioned L3), so still take the
+        // max across whatever index entries are actually found.
+        let mut l3: Option<usize> = None;
 
         for idx in 0..=8 {
             let dir = base.join(format!("index{idx}"));
@@ -63,12 +74,16 @@ impl CacheSizes {
                 match (level, ctype.as_str()) {
                     (1, "Data") => l1d = sz,
                     (2, _) => l2 = sz,
-                    (3, _) if sz > l3 => l3 = sz,
+                    (3, _) => l3 = Some(l3.map_or(sz, |cur| cur.max(sz))),
                     _ => {}
                 }
             }
         }
-        Self { l1d, l2, l3 }
+        Self {
+            l1d,
+            l2,
+            l3: l3.unwrap_or(32 * 1024 * 1024),
+        }
     }
 }
 
@@ -132,7 +147,9 @@ impl MemLatencyBench {
         // concurrent start() calls can't both pass the check and spawn two
         // workers racing on the same result (and a second ≥512 MiB alloc).
         {
-            let mut r = self.result.lock().unwrap();
+            let Ok(mut r) = self.result.lock() else {
+                return;
+            };
             if r.running {
                 return;
             }
@@ -158,7 +175,7 @@ impl MemLatencyBench {
     }
 
     pub fn snapshot(&self) -> MemLatencyResult {
-        self.result.lock().unwrap().clone()
+        self.result.lock().map(|r| r.clone()).unwrap_or_default()
     }
 }
 
@@ -172,22 +189,24 @@ fn run_bench(result: Arc<Mutex<MemLatencyResult>>, cancel: Arc<AtomicBool>) {
             break;
         }
 
-        {
-            let mut r = result.lock().unwrap();
+        if let Ok(mut r) = result.lock() {
             r.progress = i as f32 / n as f32;
             r.current_size = Some(size);
         }
 
         if let Some(lat) = measure_latency(size, &cancel) {
-            let mut r = result.lock().unwrap();
-            r.points.push(LatencyPoint {
-                size_bytes: size,
-                latency_ns: lat,
-            });
+            if let Ok(mut r) = result.lock() {
+                r.points.push(LatencyPoint {
+                    size_bytes: size,
+                    latency_ns: lat,
+                });
+            }
         }
     }
 
-    let mut r = result.lock().unwrap();
+    let Ok(mut r) = result.lock() else {
+        return;
+    };
     r.running = false;
     r.complete = !cancel.load(Ordering::Relaxed);
     // A cancelled run keeps its partial progress — forcing 1.0 would show a
@@ -500,5 +519,76 @@ fn mark_done(result: &Arc<Mutex<BandwidthResult>>, complete: bool) {
         r.running = false;
         r.complete = complete;
         r.progress = if complete { 1.0 } else { r.progress };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_cache_dir(
+        root: &Path,
+        entries: &[(u32, u32, &str, &str)], // (index, level, type, size)
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(root).unwrap();
+        for &(idx, level, ctype, size) in entries {
+            let dir = root.join(format!("index{idx}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("level"), level.to_string()).unwrap();
+            std::fs::write(dir.join("type"), ctype).unwrap();
+            std::fs::write(dir.join("size"), size).unwrap();
+        }
+        root.to_path_buf()
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("argus-mem-bench-test-{name}-{}", std::process::id()))
+    }
+
+    /// The bug this test exists for: a real L3 at or under the 32 MiB
+    /// fallback default used to be silently discarded in favour of the
+    /// fallback, because the old code only overwrote it on `sz > 32MiB`.
+    #[test]
+    fn read_from_reports_a_small_l3_instead_of_the_fallback_default() {
+        let root = temp_dir("small-l3");
+        fake_cache_dir(
+            &root,
+            &[
+                (0, 1, "Data", "32K"),
+                (1, 1, "Instruction", "32K"),
+                (2, 2, "Unified", "512K"),
+                (3, 3, "Unified", "8M"), // real L3 well under the 32 MiB default
+            ],
+        );
+        let sizes = CacheSizes::read_from(&root);
+        assert_eq!(sizes.l3, 8 * 1024 * 1024);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_from_takes_the_max_across_multiple_l3_index_entries() {
+        let root = temp_dir("multi-l3");
+        fake_cache_dir(
+            &root,
+            &[
+                (0, 1, "Data", "32K"),
+                (2, 2, "Unified", "1M"),
+                (3, 3, "Unified", "16M"),
+                (4, 3, "Unified", "32M"), // segmented L3 reporting: take the max
+            ],
+        );
+        let sizes = CacheSizes::read_from(&root);
+        assert_eq!(sizes.l3, 32 * 1024 * 1024);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn read_from_falls_back_to_defaults_when_nothing_is_found() {
+        let root = temp_dir("missing");
+        let _ = std::fs::remove_dir_all(&root);
+        let sizes = CacheSizes::read_from(&root);
+        assert_eq!(sizes.l1d, 32 * 1024);
+        assert_eq!(sizes.l2, 512 * 1024);
+        assert_eq!(sizes.l3, 32 * 1024 * 1024);
     }
 }

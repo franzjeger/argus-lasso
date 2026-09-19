@@ -766,9 +766,22 @@ mod tests {
         verify_staged_binary_is_an_upgrade,
     };
 
+    /// A pid-only suffix isn't unique enough for a file we then exec: rapid
+    /// successive `cargo test` invocations can reuse a pid before the kernel
+    /// fully releases a previous run's identically-named executable,
+    /// intermittently failing the write with ETXTBSY. Nanosecond time is
+    /// unique enough in practice that this doesn't recur.
+    fn unique_temp_name(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()))
+    }
+
     fn write_fake_binary(name: &str, script: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let path = unique_temp_name(name);
         std::fs::write(&path, script).unwrap();
         let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
