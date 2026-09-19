@@ -481,7 +481,12 @@ impl AffinityDialog {
 
                         ui.separator();
                         ui.horizontal(|ui| {
-                            if ui.button("OK").clicked() {
+                            // An empty selection has nothing to apply;
+                            // disable rather than silently re-opening on
+                            // click with no indication of why nothing
+                            // happened.
+                            let has_selection = checkboxes.iter().any(|&b| b);
+                            if ui.add_enabled(has_selection, egui::Button::new("OK")).clicked() {
                                 close_as = Some(true);
 
                             }
@@ -510,8 +515,11 @@ impl AffinityDialog {
                     self.result = Some(cpulist.clone());
                     return Some(cpulist);
                 }
-                // empty selection — keep open
-                self.open = true;
+                // The OK button is disabled for an empty selection, so
+                // this should be unreachable — treat it the same as
+                // Cancel rather than silently re-opening with no result.
+                self.result = Some(String::new());
+                return Some(String::new());
             } else {
                 self.result = Some(String::new());
                 return Some(String::new());
@@ -822,7 +830,16 @@ impl RuleEditDialog {
                                     .fill(s.accent);
                                     // A rule with no pattern matches nothing,
                                     // so saving one is never what was meant.
-                                    if ui.add_enabled(!rule.pattern.is_empty(), save).clicked() {
+                                    // Likewise, "CPU assignment: on" with an
+                                    // empty core selection would silently
+                                    // save as if the checkbox were off (no
+                                    // affinity restriction at all) — visible
+                                    // intent and saved result must not
+                                    // diverge like that.
+                                    let affinity_would_be_empty =
+                                        *affinity_enabled && picker.cpulist().is_empty();
+                                    let can_save = !rule.pattern.is_empty() && !affinity_would_be_empty;
+                                    if ui.add_enabled(can_save, save).clicked() {
                                         close_as = Some(true);
                                     }
                                     if ui.button("Cancel").clicked() {
