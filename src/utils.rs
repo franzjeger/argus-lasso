@@ -167,16 +167,12 @@ use nix::sched::CpuSet;
 /// Negative values require root/CAP_SYS_NICE. Returns true on success.
 pub fn set_nice(pid: u32, nice: i32) -> bool {
     use nix::libc;
-    // clear errno before call, because setpriority can legitimately return -1
-    // (if the previous nice was -1), so we must check if errno changed.
-    // However, we only care about success (res == 0) for the most part,
-    // but wait, setpriority returns 0 on success according to POSIX,
-    // actually it returns the new nice value on Linux sometimes?
-    // POSIX says: Upon successful completion, setpriority() shall return 0.
-    // Let's use it as standard.
-    unsafe {
-        *libc::__errno_location() = 0;
-    }
+    // Unlike getpriority(2), whose -1 is ambiguous with a legitimate return
+    // value of -1, setpriority(2) unambiguously returns 0 on success and -1
+    // (with errno set) on failure — no errno-clearing dance needed first.
+    //
+    // SAFETY: only plain integers cross the FFI boundary; no pointers or
+    // lifetimes are involved.
     let res =
         unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice as libc::c_int) };
     if res == 0 {
@@ -199,6 +195,8 @@ pub fn set_ionice(pid: u32, class: i32, level: Option<i32>) -> bool {
     let data_val = (level.unwrap_or(0) as u32) & 0x1fff;
     let prio = (class_val << 13) | data_val;
 
+    // SAFETY: only plain integers cross the FFI boundary; no pointers or
+    // lifetimes are involved.
     let res = unsafe {
         libc::syscall(
             libc::SYS_ioprio_set,
@@ -237,6 +235,8 @@ pub fn get_nice(pid: u32) -> Option<i32> {
 /// Returns None if the syscall fails (e.g., process gone, unsupported).
 pub fn get_ionice_raw(pid: u32) -> Option<(i32, i32)> {
     use nix::libc;
+    // SAFETY: only plain integers cross the FFI boundary; no pointers or
+    // lifetimes are involved.
     let prio = unsafe {
         libc::syscall(
             libc::SYS_ioprio_get,
