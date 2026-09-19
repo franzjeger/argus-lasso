@@ -5,11 +5,11 @@ use egui::{RichText, Ui};
 
 pub struct ProBalanceTab {
     pub cfg: ProBalanceConfig,
-    /// Buffer behind the "+ add pattern" chip.
+    /// Buffer behind the "+ Add pattern" chip.
     new_exempt: String,
     /// Last applied config — the apply bar is enabled only while `cfg` differs.
     saved: ProBalanceConfig,
-    /// True while the "+ add pattern" chip is expanded into a text field.
+    /// True while the "+ Add pattern" chip is expanded into a text field.
     adding_exempt: bool,
 }
 
@@ -307,7 +307,7 @@ impl ProBalanceTab {
                         self.new_exempt.clear();
                         self.adding_exempt = false;
                     }
-                } else if add_chip(ui, "+ add pattern") {
+                } else if add_chip(ui, "+ Add pattern") {
                     self.adding_exempt = true;
                 }
             });

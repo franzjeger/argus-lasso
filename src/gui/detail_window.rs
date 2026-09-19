@@ -78,7 +78,7 @@ impl DetailWindow {
                                 }
                                 row(
                                     "Memory (RSS)",
-                                    &format!("{:.1} MB", p.mem_rss as f64 / 1_048_576.0),
+                                    &format!("{:.1} MiB", p.mem_rss as f64 / 1_048_576.0),
                                 );
                                 row("Nice", &p.nice.to_string());
                                 row("Affinity", &p.affinity);
@@ -86,7 +86,7 @@ impl DetailWindow {
                                     row(
                                         "Disk I/O",
                                         &format!(
-                                            "read {:.1} KB/s, write {:.1} KB/s",
+                                            "read {:.1} KiB/s, write {:.1} KiB/s",
                                             p.disk_read_bps as f64 / 1024.0,
                                             p.disk_write_bps as f64 / 1024.0
                                         ),
@@ -101,7 +101,7 @@ impl DetailWindow {
                                 row("Executable", &details.exe);
                             }
                             if !details.cwd.is_empty() {
-                                row("Working dir", &details.cwd);
+                                row("Working directory", &details.cwd);
                             }
                         });
 
@@ -164,7 +164,7 @@ impl DetailWindow {
                                             ui.label(
                                                 egui::RichText::new(format!("{tid:>8}  {name}"))
                                                     .monospace()
-                                                    .size(11.0),
+                                                    .size(crate::gui::theme::tokens::FONT_SMALL),
                                             );
                                         }
                                         if details.thread_count > details.threads.len() {

@@ -294,6 +294,8 @@ pub mod tokens {
     pub const FONT_BODY: f32 = 15.0;
     /// Section headings inside cards
     pub const FONT_HEADING: f32 = 16.0;
+    /// Page title
+    pub const FONT_PAGE: f32 = 22.0;
     /// Hero status headline (Gaming Mode / ProBalance status cards)
     pub const FONT_HERO: f32 = 20.0;
     /// KPI card value
@@ -334,14 +336,19 @@ pub fn divider(ui: &mut egui::Ui) {
     ui.add_space(tokens::SPACE_XS);
 }
 
-pub fn page_intro(ui: &mut egui::Ui, title: &str, description: &str) {
-    ui.add_space(tokens::SPACE_S);
-    ui.label(bold(ui, title, 22.0));
+/// Secondary explanatory text, shared across pages and dialogs.
+pub fn help_text(ui: &mut egui::Ui, text: impl Into<String>) {
     ui.label(
-        egui::RichText::new(description)
+        egui::RichText::new(text.into())
             .size(tokens::FONT_HELP)
             .color(ui.visuals().weak_text_color()),
     );
+}
+
+pub fn page_intro(ui: &mut egui::Ui, title: &str, description: &str) {
+    ui.add_space(tokens::SPACE_S);
+    ui.label(bold(ui, title, tokens::FONT_PAGE));
+    help_text(ui, description);
     ui.add_space(tokens::SPACE_M);
 }
 
@@ -665,7 +672,7 @@ pub fn apply_bar(ui: &mut egui::Ui, dirty: bool) -> (bool, bool) {
             let apply_btn = egui::Button::new(
                 egui::RichText::new("Apply changes")
                     .color(s.on_accent)
-                    .strong(),
+                    .font(bold_font(tokens::FONT_BODY)),
             )
             .fill(s.accent);
             if ui.add_enabled(dirty, apply_btn).clicked() {

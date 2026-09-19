@@ -31,6 +31,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Completed the shared process-string and reusable snapshot migration across
+  the GUI, JSON exports and read-only preview so the workspace builds again.
+- Restored independent one-second sensor sampling and the existing weighted CPU
+  readings for overlay telemetry after the performance refactor.
+- Sensor sparklines iterate the ring buffer directly without temporary history
+  or point vectors; history order is tested across repeated wraps.
+- CLI overlay toggles use separate queued requests, preserving rapid/concurrent
+  invocations; unsuccessful request removal no longer toggles repeatedly.
+
 - Global Vulkan HUD activation now filters for detected Steam/Proton games or
   explicit per-game opt-in; known terminals and desktop hosts are excluded even
   when they inherit game launch variables.
@@ -55,6 +64,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   without changing exemptions or priority settings.
 
 ### Changed
+
+- Unified GUI heading/button weights with the bundled bold face, secondary text
+  styling and readable small-label sizes; CPU selection grids adapt to width.
+- Standardized dialog and action capitalization, corrected binary memory/I/O
+  unit labels, and removed obsolete helper instructions and duplicate overlay
+  setup text. Overview PID columns now fit long process IDs.
 
 - Repository renamed to `franzjeger/argus-lasso`, preserving Git history and releases.
 - Old screenshots replaced; staged investigation moved to a dated archive.

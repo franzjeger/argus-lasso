@@ -354,7 +354,7 @@ fn group_header_row(ui: &mut Ui, group: &SensorGroup) {
     let galley = egui::WidgetText::from(
         egui::RichText::new(title)
             .size(tokens::FONT_BODY)
-            .strong()
+            .font(theme::bold_font(tokens::FONT_BODY))
             .color(crate::gui::theme::strong_color(ui)),
     )
     .into_galley(
@@ -448,7 +448,7 @@ fn sensor_row(
         draw_sparkline(
             ui,
             spark_rect,
-            &sensor.ordered_history(),
+            sensor.ordered_history(),
             now_color.gamma_multiply(0.6),
         );
     }
@@ -482,7 +482,7 @@ fn fmt_val(v: f32, unit: &str) -> String {
         "MHz" => format!("{v:.0} MHz"),
         "GiB" => format!("{v:.2} GiB"),
         "MB" => format!("{v:.0} MB"),
-        "MB/s" => format!("{v:.2} MB/s"),
+        "MiB/s" => format!("{v:.2} MiB/s"),
         "%" => format!("{v:.1}%"),
         "Wh" => format!("{v:.2} Wh"),
         "" => format!("{v:.2}"),
@@ -518,18 +518,18 @@ fn temp_pct(c: f32) -> f32 {
 fn draw_sparkline(
     ui: &mut Ui,
     rect: egui::Rect,
-    history: &[f32],
+    history: impl Iterator<Item = f32> + Clone,
     color: Color32,
 ) {
-    if history.len() < 2 {
+    if history.clone().nth(1).is_none() {
         return;
     }
 
     let painter = ui.painter_at(rect);
     let vals = history;
 
-    let lo = vals.iter().cloned().fold(f32::INFINITY, f32::min);
-    let hi = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let lo = vals.clone().fold(f32::INFINITY, f32::min);
+    let hi = vals.clone().fold(f32::NEG_INFINITY, f32::max);
     let range = (hi - lo).max(0.001);
 
     let w = rect.width();
@@ -540,13 +540,11 @@ fn draw_sparkline(
 
     painter.rect_filled(rect, 2.0, theme::tint(color, 20));
 
-    let points: Vec<egui::Pos2> = vals
-        .iter()
-        .enumerate()
-        .map(|(i, &v)| egui::pos2(px(i), py(v)))
-        .collect();
-
-    for pair in points.windows(2) {
-        painter.line_segment([pair[0], pair[1]], Stroke::new(1.0_f32, color));
+    let mut points = vals.enumerate().map(|(i, v)| egui::pos2(px(i), py(v)));
+    if let Some(mut previous) = points.next() {
+        for point in points {
+            painter.line_segment([previous, point], Stroke::new(1.0_f32, color));
+            previous = point;
+        }
     }
 }

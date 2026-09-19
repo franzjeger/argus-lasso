@@ -34,6 +34,8 @@ a user report alone is not a controlled game-performance result. State which
 Steam/Proton/driver paths were actually tested.
 
 Update current guides, the Unreleased changelog and affected screenshots together.
+Follow [the GUI style conventions](docs/ui-style.md) when changing interface text,
+fonts, colors or layout.
 Keep dated investigation notes in `docs/archive/`; do not present old test builds
 as current installation state. Do not commit local diagnostic captures, private
 configuration, credentials or build output.

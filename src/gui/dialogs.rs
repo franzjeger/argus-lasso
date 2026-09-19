@@ -813,9 +813,11 @@ impl RuleEditDialog {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     let save = egui::Button::new(
-                                        egui::RichText::new("Save rule")
-                                            .color(s.on_accent)
-                                            .strong(),
+                                        egui::RichText::new("Save rule").color(s.on_accent).font(
+                                            crate::gui::theme::bold_font(
+                                                crate::gui::theme::tokens::FONT_BODY,
+                                            ),
+                                        ),
                                     )
                                     .fill(s.accent);
                                     // A rule with no pattern matches nothing,
@@ -1198,7 +1200,7 @@ impl RulePresetsDialog {
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("rule_presets_dialog"),
                 ViewportBuilder::default()
-                    .with_title("Rule Templates")
+                    .with_title("Rule templates")
                     .with_app_id("argus-lasso")
                     .with_icon(egui::IconData {
                         rgba: crate::icon::RGBA.to_vec(),
@@ -1234,7 +1236,9 @@ impl RulePresetsDialog {
                                     let use_btn = egui::Button::new(
                                         egui::RichText::new("Use template")
                                             .color(s.on_accent)
-                                            .strong(),
+                                            .font(crate::gui::theme::bold_font(
+                                                crate::gui::theme::tokens::FONT_BODY,
+                                            )),
                                     )
                                     .fill(s.accent);
                                     if ui.add_enabled(selected.is_some(), use_btn).clicked() {
@@ -1418,7 +1422,7 @@ impl SteamGamePickerDialog {
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("steam_game_picker"),
                 ViewportBuilder::default()
-                    .with_title("Pick Steam Game")
+                    .with_title("Choose Steam game")
                     .with_app_id("argus-lasso")
                     .with_icon(egui::IconData {
                         rgba: crate::icon::RGBA.to_vec(),
@@ -1625,7 +1629,7 @@ impl LutrisGamePickerDialog {
             ctx.show_viewport_immediate(
                 ViewportId::from_hash_of("lutris_game_picker"),
                 ViewportBuilder::default()
-                    .with_title("Pick Lutris Game")
+                    .with_title("Choose Lutris game")
                     .with_app_id("argus-lasso")
                     .with_icon(egui::IconData {
                         rgba: crate::icon::RGBA.to_vec(),

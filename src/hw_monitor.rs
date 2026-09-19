@@ -1,10 +1,10 @@
 //! Hardware sensor collection: reads hwmon sysfs, procfs, DRM sysfs, and nvidia-smi.
 //!
 //! `HwCollector` owns the persistent state (min/max/history). Call `update()` each
-//! display-refresh tick; it merges new readings into `self.data` in-place so history
+//! sensor-sampling tick; it merges new readings into `self.data` in-place so history
 //! is preserved across samples.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -21,9 +21,9 @@ pub struct Sensor {
     pub max: f32,
     avg_sum: f64,
     avg_count: u64,
-    pub history: [f32; HISTORY_LEN],
-    pub history_start: usize,
-    pub history_len: usize,
+    history: [f32; HISTORY_LEN],
+    history_start: usize,
+    history_len: usize,
 }
 
 impl Default for Sensor {
@@ -80,12 +80,13 @@ impl Sensor {
         }
     }
 
-    pub fn ordered_history(&self) -> Vec<f32> {
-        let mut res = Vec::with_capacity(self.history_len);
-        for i in 0..self.history_len {
-            res.push(self.history[(self.history_start + i) % HISTORY_LEN]);
-        }
-        res
+    /// Iterate from oldest to newest without copying the ring buffer.
+    pub fn ordered_history(&self) -> impl Iterator<Item = f32> + Clone + '_ {
+        let first_len = self.history_len.min(HISTORY_LEN - self.history_start);
+        self.history[self.history_start..self.history_start + first_len]
+            .iter()
+            .chain(self.history[..self.history_len - first_len].iter())
+            .copied()
     }
 
     pub fn avg(&self) -> f32 {
@@ -1046,7 +1047,7 @@ fn collect_disk_io(
         groups.push((
             "Storage",
             format!("I/O [{label}]"),
-            vec![("Read", "MB/s", read_mb), ("Write", "MB/s", write_mb)],
+            vec![("Read", "MiB/s", read_mb), ("Write", "MiB/s", write_mb)],
         ));
     }
     groups
@@ -1106,7 +1107,7 @@ fn collect_net_io(
         groups.push((
             "Network",
             format!("I/O [{iface}]"),
-            vec![("Receive", "MB/s", rx), ("Transmit", "MB/s", tx)],
+            vec![("Receive", "MiB/s", rx), ("Transmit", "MiB/s", tx)],
         ));
     }
     groups
@@ -1234,6 +1235,23 @@ fn build_core_id_to_cpu_map() -> HashMap<u32, u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sensor_history_keeps_newest_samples_in_order_after_wraps() {
+        let mut sensor = Sensor::new("Temperature", "°C");
+        assert_eq!(sensor.ordered_history().count(), 0);
+        for value in 0..(HISTORY_LEN * 3 + 7) {
+            sensor.push(value as f32);
+            let first = (value + 1).saturating_sub(HISTORY_LEN);
+            assert!(sensor
+                .ordered_history()
+                .eq((first..=value).map(|v| v as f32)));
+        }
+        let before: Vec<_> = sensor.ordered_history().collect();
+        sensor.push(f32::NAN);
+        sensor.push(f32::INFINITY);
+        assert!(sensor.ordered_history().eq(before));
+    }
 
     #[test]
     fn rapl_watts_normal_delta() {

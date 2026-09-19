@@ -99,9 +99,9 @@ pub struct AppState {
     pub cpu_generation: u64,
     /// Rolling average CPU history (120 samples)
     pub cpu_history: std::collections::VecDeque<f32>,
-    /// Rolling totals across all disks: (read MB/s, write MB/s), 120 samples
+    /// Rolling totals across all disks: (read MiB/s, write MiB/s), 120 samples
     pub disk_io_history: std::collections::VecDeque<(f32, f32)>,
-    /// Rolling totals across all NICs: (rx MB/s, tx MB/s), 120 samples
+    /// Rolling totals across all NICs: (rx MiB/s, tx MiB/s), 120 samples
     pub net_io_history: std::collections::VecDeque<(f32, f32)>,
     /// Throttled PID set from ProBalance
     pub throttled_pids: HashSet<u32>,
@@ -354,18 +354,19 @@ pub fn spawn_preview(
         let mut total = 0;
         let mut caches = SnapshotCaches::default();
         let mut last = Instant::now();
+        let mut snapshot = Vec::new();
         loop {
             let elapsed = last.elapsed().as_secs_f32().max(0.001);
             last = Instant::now();
-            let (snapshot, next_times, next_total) =
-                collect_snapshot(&mut times, total, &mut caches, true, elapsed);
+            let (next_times, next_total) =
+                collect_snapshot(&mut snapshot, &mut times, total, &mut caches, true, elapsed);
             times = next_times;
             total = next_total;
             hw.update();
             let (mut cpus, cpu_total) = cpu_sampler.sample(read_percpu_stats());
             cpus.resize(utils::get_cpu_count() as usize, 0.0);
             if let Ok(mut s) = state.lock() {
-                s.snapshot = Arc::new(snapshot);
+                s.snapshot = Arc::new(snapshot.clone());
                 if let Some(total) = cpu_total {
                     s.cpu_avg = total;
                 }
@@ -428,10 +429,13 @@ fn get_ram_speed_mts() -> Option<u32> {
     static RAM_SPEED: OnceLock<Option<u32>> = OnceLock::new();
     *RAM_SPEED.get_or_init(|| {
         // First try the root sensor daemon, which runs dmidecode for us
-        if let Some(mts) = crate::sensor_data::read().ok().and_then(|s| s.ram_speed_mts) {
+        if let Some(mts) = crate::sensor_data::read()
+            .ok()
+            .and_then(|s| s.ram_speed_mts)
+        {
             return Some(mts);
         }
-        
+
         // Fallback to calling dmidecode directly if we happen to have privileges
         let out = std::process::Command::new("dmidecode")
             .arg("-t")
@@ -612,15 +616,12 @@ fn run_loop(
     // once, not every 500ms tick; pruned when the PID dies.
     let mut enforce_nice_failed: HashSet<(String, u32)> = HashSet::new();
 
+    let toggle_dir = crate::config::config_dir();
     loop {
         // ── Check for CLI overlay toggle ────────────────────────────────────
-        let toggle_path = crate::config::config_dir().join("toggle_overlay");
-        if toggle_path.exists() {
-            let _ = std::fs::remove_file(&toggle_path);
+        if !crate::overlay_toggle::drain(&toggle_dir).is_multiple_of(2) {
             config.gaming_mode.overlay.show_overlay = !config.gaming_mode.overlay.show_overlay;
-            let cfg_save = config.clone();
-            // Fire-and-forget save; we're in the daemon loop, we don't want to block long
-            if let Err(e) = crate::config::save(&cfg_save) {
+            if let Err(e) = crate::config::save(&config) {
                 log::error!("Failed to save config after toggling overlay: {e}");
             }
             ipc.broadcast(&argus_ipc::IpcMessage::Config(
@@ -629,7 +630,10 @@ fn run_loop(
             if let Ok(mut s) = state.lock() {
                 s.config = config.clone();
             }
-            log_cb(format!("Overlay visibility toggled to {}", config.gaming_mode.overlay.show_overlay));
+            log_cb(format!(
+                "Overlay visibility toggled to {}",
+                config.gaming_mode.overlay.show_overlay
+            ));
         }
 
         // ── Drain commands from GUI ─────────────────────────────────────────
@@ -925,7 +929,7 @@ fn run_loop(
                 // Build a name lookup from the current snapshot
                 let name_map: HashMap<u32, &str> = raw_snapshot
                     .iter()
-                    .map(|p| (p.pid, p.name.as_str()))
+                    .map(|p| (p.pid, p.name.as_ref()))
                     .collect();
 
                 // Newly throttled
@@ -952,25 +956,7 @@ fn run_loop(
             last_pb = now;
         }
 
-        let refresh = Duration::from_millis(config.monitor.display_refresh_interval_ms);
-        if now.duration_since(last_snapshot) >= refresh {
-            let throttled = probalance.throttled_pids();
-            let pb_snap_for_infos: Vec<crate::probalance::ProcSnapshot> = raw_snapshot
-                .iter()
-                .map(|p| crate::probalance::ProcSnapshot {
-                    pid: p.pid,
-                    name: p.name.to_string(),
-                    cpu_percent: p.cpu_percent,
-                    nice: p.nice,
-                })
-                .collect();
-            let throttle_infos = probalance.throttle_infos(&pb_snap_for_infos);
-            let cpu_percents = collect_cpu_percents();
-            let avg = if cpu_percents.is_empty() {
-                0.0
-            } else {
-                cpu_percents.iter().sum::<f32>() / cpu_percents.len() as f32
-            };
+        if now.duration_since(last_sensors) >= Duration::from_secs(1) {
             // Update hardware sensor readings
             hw_collector.update();
 
@@ -1076,7 +1062,7 @@ fn run_loop(
                 .iter()
                 .map(|p| crate::probalance::ProcSnapshot {
                     pid: p.pid,
-                    name: p.name.clone(),
+                    name: p.name.to_string(),
                     cpu_percent: p.cpu_percent,
                     nice: p.nice,
                 })
@@ -1138,14 +1124,22 @@ pub fn oneshot_snapshot() -> Vec<ProcInfo> {
     let mut caches = SnapshotCaches::default();
     // The CLI prints affinity, so both passes ask for detail.
     let mut snap = Vec::new();
-    let (times, sys_total) = collect_snapshot(&mut snap, &mut prev_times, 0, &mut caches, true, 0.0);
+    let (times, sys_total) =
+        collect_snapshot(&mut snap, &mut prev_times, 0, &mut caches, true, 0.0);
     prev_times = times;
     std::thread::sleep(Duration::from_millis(500));
-    let (_, _) = collect_snapshot(&mut snap, &mut prev_times, sys_total, &mut caches, true, 0.5);
+    let (_, _) = collect_snapshot(
+        &mut snap,
+        &mut prev_times,
+        sys_total,
+        &mut caches,
+        true,
+        0.5,
+    );
     snap
 }
 
-/// Sum current disk (read, write) and network (rx, tx) MB/s across all
+/// Sum current disk (read, write) and network (rx, tx) MiB/s across all
 /// devices from the hw-monitor readings, for the Overview graphs.
 fn hw_io_totals(data: &HwMonitorData) -> ((f32, f32), (f32, f32)) {
     let mut disk = (0.0f32, 0.0f32);
@@ -1777,7 +1771,7 @@ mod tests {
         use crate::hw_monitor::{Sensor, SensorGroup};
 
         fn sensor(label: &'static str, v: f32) -> Sensor {
-            let mut s = Sensor::new(label, "MB/s");
+            let mut s = Sensor::new(label, "MiB/s");
             s.push(v);
             s
         }

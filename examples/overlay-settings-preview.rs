@@ -105,7 +105,8 @@ fn main() -> eframe::Result {
             ..Default::default()
         },
         Box::new(|cc| {
-            cc.egui_ctx.set_embed_viewports(false);
+            cc.egui_ctx
+                .set_embed_viewports(std::env::args().any(|a| a == "--embedded"));
             theme::apply_theme(
                 &cc.egui_ctx,
                 1.0,

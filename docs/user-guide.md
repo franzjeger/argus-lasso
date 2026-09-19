@@ -3,6 +3,9 @@
 This guide describes the current source tree. The UI uses English labels.
 [Install](installation.md) · [Screenshot gallery](screenshots.md)
 
+Memory values use binary units (MiB/GiB). Disk and network rates use MiB/s;
+memory bandwidth benchmarks report decimal GB/s. Temperature readings use °C.
+
 ## Navigation
 
 | Menu | Purpose |

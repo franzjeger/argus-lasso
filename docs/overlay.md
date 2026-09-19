@@ -39,6 +39,12 @@ and variation. Turning off the entire daemon would confound this comparison.
 
 ## Rendering and update rates
 
+Run `argus-lasso toggle-overlay` to queue a visibility toggle, for example from
+a desktop keyboard shortcut. Each invocation queues a separate request; two
+toggles cancel each other. The running monitor consumes requests on its next
+tick and saves the resulting visibility. If Argus is stopped, requests wait
+until it starts. A successful CLI exit confirms queuing, not application.
+
 The background defaults to **0% opacity**. Empty texture pixels have zero alpha;
 only text, optional dividers and enabled background pixels affect the image.
 Text opacity and optional background opacity are independent. Text defaults to
@@ -46,7 +52,8 @@ Text opacity and optional background opacity are independent. Text defaults to
 Names occupy heading rows; values and units have reserved columns. Logical CPUs
 use explicit thread/core labels and compact selectable columns.
 
-Sensors update at about 1 Hz. A worker caches glyphs and composes text roughly
+Sensors update at about 1 Hz, independently of the process-table refresh setting.
+A worker caches glyphs and composes text roughly
 every 250 ms. Frame intervals are collected on **every present**, retained in a
 rolling 10-second statistics window. The graph has its own default 60 Hz refresh
 (30–120 adjustable) and five-second history: each 1/60-second bucket preserves

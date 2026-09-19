@@ -163,8 +163,12 @@ impl RulesTab {
                 const NEW: &str = "+ New rule";
                 const BROWSE: &str = "Browse templates";
                 let row_w = {
-                    let font = egui::TextStyle::Button.resolve(ui.style());
                     let text_w = |t: &str| {
+                        let font = if t == NEW {
+                            theme::bold_font(tokens::FONT_BODY)
+                        } else {
+                            egui::TextStyle::Button.resolve(ui.style())
+                        };
                         ui.painter()
                             .layout_no_wrap(t.to_owned(), font.clone(), egui::Color32::WHITE)
                             .size()
@@ -177,8 +181,12 @@ impl RulesTab {
                     egui::Vec2::new(row_w, 0.0),
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
-                        let btn = egui::Button::new(RichText::new(NEW).color(s.on_accent).strong())
-                            .fill(s.accent);
+                        let btn = egui::Button::new(
+                            RichText::new(NEW)
+                                .color(s.on_accent)
+                                .font(theme::bold_font(tokens::FONT_BODY)),
+                        )
+                        .fill(s.accent);
                         if ui.add(btn).clicked() {
                             self.open_add_dialog(None);
                         }
@@ -526,9 +534,12 @@ impl RulesTab {
             .inner_margin(egui::Margin::symmetric(0, 4))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let new_btn =
-                        egui::Button::new(RichText::new("+ New rule").color(s.on_accent).strong())
-                            .fill(s.accent);
+                    let new_btn = egui::Button::new(
+                        RichText::new("+ New rule")
+                            .color(s.on_accent)
+                            .font(theme::bold_font(tokens::FONT_BODY)),
+                    )
+                    .fill(s.accent);
                     if ui.add(new_btn).clicked() {
                         self.open_add_dialog(None);
                     }
@@ -540,7 +551,7 @@ impl RulesTab {
 
                     ui.add(
                         egui::TextEdit::singleline(&mut self.test_input)
-                            .hint_text("🔍  test pattern")
+                            .hint_text("🔍  Test pattern")
                             .desired_width(150.0),
                     );
                     if !self.test_input.is_empty() {

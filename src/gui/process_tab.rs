@@ -61,15 +61,15 @@ fn fmt_ionice(s: &str) -> String {
     }
 }
 
-/// Format bytes/s compactly: "1.2 MB/s", "456 KB/s", "—"
+/// Format bytes/s compactly: "1.2 MiB/s", "456 KiB/s", "—"
 fn fmt_bps(bytes: u64) -> String {
     if bytes == 0 {
         return "—".into();
     }
     if bytes >= 1_048_576 {
-        format!("{:.1} MB/s", bytes as f64 / 1_048_576.0)
+        format!("{:.1} MiB/s", bytes as f64 / 1_048_576.0)
     } else if bytes >= 1024 {
-        format!("{:.0} KB/s", bytes as f64 / 1024.0)
+        format!("{:.0} KiB/s", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B/s")
     }
@@ -385,7 +385,7 @@ impl ProcessTab {
             ui.add_space(theme::tokens::SPACE_S);
 
             // Port filter — show only processes bound to this local port.
-            ui.label("port");
+            ui.label("Port");
             ui.add(
                 egui::TextEdit::singleline(&mut self.port_filter)
                     .hint_text("e.g. 8080")
@@ -641,7 +641,7 @@ impl ProcessTab {
                     if let Some(proc) = sorted.iter().find(|p| p.pid == sel_pid) {
                         action = TableAction::Kill {
                             pid: sel_pid,
-                            name: proc.name.clone(),
+                            name: proc.name.to_string(),
                             force: false,
                         };
                     }
@@ -803,7 +803,7 @@ impl ProcessTab {
                                 }
                                 // Right-click any header → column chooser
                                 resp.context_menu(|ui| {
-                                    ui.label(RichText::new("Columns ▾").strong());
+                                    ui.label(RichText::new("Columns ▾").font(crate::gui::theme::bold_font(crate::gui::theme::tokens::FONT_BODY)));
                                     for (ci, c) in COLS.iter().enumerate() {
                                         if ci == 1 {
                                             continue; // Name is always shown
@@ -1049,7 +1049,7 @@ impl ProcessTab {
                                             };
                                             let text: std::borrow::Cow<str> = match ci {
                                                 0 => pid.to_string().into(),
-                                                1 => name.as_str().into(),
+                                                1 => name.as_ref().into(),
                                                 2 => format!("{:.1}", cpu).into(),
                                                 3 => {
                                                     if proc.gpu_percent > 0.0 {
@@ -1186,14 +1186,15 @@ impl ProcessTab {
                                                     egui::Id::new(("proc_tip", pid)),
                                                     |ui| {
                                                         ui.label(
-                                                            egui::RichText::new(&name).strong(),
+                                                            egui::RichText::new(name.as_ref())
+                                                                .font(crate::gui::theme::bold_font(crate::gui::theme::tokens::FONT_BODY)),
                                                         );
                                                         if !cmdline.is_empty() {
                                                             ui.label(
                                                                 egui::RichText::new(
                                                                     cmdline.as_str(),
                                                                 )
-                                                                .size(11.5)
+                                                                .size(crate::gui::theme::tokens::FONT_HELP)
                                                                 .color(
                                                                     ui.visuals().weak_text_color(),
                                                                 ),
@@ -1239,13 +1240,13 @@ impl ProcessTab {
                                     row_resp.context_menu(|ui| {
                                         ui.label(
                                             egui::RichText::new(format!("{name} · PID {pid}"))
-                                                .strong(),
+                                                .font(crate::gui::theme::bold_font(crate::gui::theme::tokens::FONT_BODY)),
                                         );
                                         ui.separator();
                                         if ui.button("End process").clicked() {
                                             action = TableAction::Kill {
                                                 pid,
-                                                name: name.clone(),
+                                                name: name.to_string(),
                                                 force: false,
                                             };
                                             ui.close();
@@ -1253,7 +1254,7 @@ impl ProcessTab {
                                         if ui.button("Force quit process").clicked() {
                                             action = TableAction::Kill {
                                                 pid,
-                                                name: name.clone(),
+                                                name: name.to_string(),
                                                 force: true,
                                             };
                                             ui.close();
@@ -1261,7 +1262,7 @@ impl ProcessTab {
                                         if ui.button("End process and children").clicked() {
                                             action = TableAction::KillTree {
                                                 pid,
-                                                name: name.clone(),
+                                                name: name.to_string(),
                                             };
                                             ui.close();
                                         }
@@ -1269,14 +1270,14 @@ impl ProcessTab {
                                             if ui.button("Resume process").clicked() {
                                                 action = TableAction::Resume {
                                                     pid,
-                                                    name: name.clone(),
+                                                    name: name.to_string(),
                                                 };
                                                 ui.close();
                                             }
                                         } else if ui.button("Pause process").clicked() {
                                             action = TableAction::Suspend {
                                                 pid,
-                                                name: name.clone(),
+                                                name: name.to_string(),
                                             };
                                             ui.close();
                                         }
@@ -1284,15 +1285,15 @@ impl ProcessTab {
                                         if ui.button("CPU assignment…").clicked() {
                                             action = TableAction::SetAffinity {
                                                 pid,
-                                                name: name.clone(),
-                                                current: aff.clone(),
+                                                name: name.to_string(),
+                                                current: aff.to_string(),
                                             };
                                             ui.close();
                                         }
                                         if ui.button("CPU priority…").clicked() {
                                             action = TableAction::SetNice {
                                                 pid,
-                                                name: name.clone(),
+                                                name: name.to_string(),
                                                 current: nice,
                                             };
                                             ui.close();
@@ -1300,13 +1301,15 @@ impl ProcessTab {
                                         if ui.button("Disk I/O priority…").clicked() {
                                             action = TableAction::SetIonice {
                                                 pid,
-                                                name: name.clone(),
+                                                name: name.to_string(),
                                             };
                                             ui.close();
                                         }
                                         ui.separator();
                                         if ui.button("Create process rule…").clicked() {
-                                            action = TableAction::AddRule { name: name.clone() };
+                                            action = TableAction::AddRule {
+                                                name: name.to_string(),
+                                            };
                                             ui.close();
                                         }
                                     });

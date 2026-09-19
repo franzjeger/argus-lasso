@@ -212,7 +212,7 @@ impl OverviewTab {
                         rect.right_top() + Vec2::new(-4.0, 4.0),
                         egui::Align2::RIGHT_TOP,
                         format!("{cpu_avg:.0}%"),
-                        egui::FontId::proportional(12.0),
+                        egui::FontId::proportional(tokens::FONT_SMALL),
                         crate::gui::theme::strong_color(ui),
                     );
                 });
@@ -273,11 +273,24 @@ impl OverviewTab {
 
                 let avail_w = ui.available_width();
                 let row_h = 24.0;
-                let bar_col_w = avail_w * 0.35;
                 let name_w = avail_w * 0.30;
-                let pid_w = 60.0;
+                let pid_w = top
+                    .iter()
+                    .map(|p| {
+                        ui.painter()
+                            .layout_no_wrap(
+                                p.pid.to_string(),
+                                th::num_font(tokens::FONT_BODY),
+                                ui.visuals().text_color(),
+                            )
+                            .size()
+                            .x
+                            + 20.0
+                    })
+                    .fold(60.0_f32, f32::max);
                 let cpu_w = 60.0;
                 let mem_w = 80.0;
+                let bar_col_w = (avail_w - name_w - pid_w - cpu_w - mem_w - 8.0).max(16.0);
 
                 // Header — weak, not accent (§3); numeric columns right-aligned
                 let hdr_bg = ui.visuals().widgets.noninteractive.bg_fill;
@@ -291,7 +304,7 @@ impl OverviewTab {
                     ("PID", pid_w, true),
                     ("NAME", name_w, false),
                     ("CPU%", cpu_w, true),
-                    ("MEM (MB)", mem_w, true),
+                    ("RAM (MiB)", mem_w, true),
                     ("LOAD", bar_col_w, false),
                 ] {
                     let (pos, align) = if numeric {
@@ -342,7 +355,7 @@ impl OverviewTab {
                         let truncated: String = proc.name.chars().take(21).collect();
                         format!("{truncated}…")
                     } else {
-                        proc.name.clone()
+                        proc.name.to_string()
                     };
                     ui.painter().text(
                         egui::pos2(rx, rr.center().y),
@@ -445,7 +458,7 @@ fn dual_io_graph(
         .inner_margin(egui::Margin::same(8))
         .show(ui, |ui| {
             // The row zeroes item_spacing.x so its own arithmetic is exact,
-            // and child uis inherit that — which would run "0.2" and "MB/s"
+            // and child uis inherit that — which would run "0.2" and "MiB/s"
             // together. Restore the theme default for the card's contents.
             ui.spacing_mut().item_spacing.x = ui.ctx().global_style().spacing.item_spacing.x;
             let content_w = (outer_width - PANEL_CHROME).max(0.0);
@@ -462,7 +475,7 @@ fn dual_io_graph(
                     // Right-to-left: the label is added before its swatch so the
                     // swatch ends up on the left of the text.
                     ui.label(
-                        RichText::new("MB/s")
+                        RichText::new("MiB/s")
                             .size(crate::gui::theme::tokens::FONT_HELP)
                             .color(ui.visuals().weak_text_color()),
                     );

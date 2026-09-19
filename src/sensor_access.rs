@@ -1,5 +1,7 @@
 //! Systemd owns service activation and uses the desktop's normal polkit agent.
 //! GUI never executes as root; no shell command or sensor path comes from input.
+
+use crate::gui::theme::{self, tokens};
 #[derive(Default)]
 pub struct SensorAccess {
     pending: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
@@ -20,8 +22,11 @@ impl SensorAccess {
         }
         let mut enabled = std::path::Path::new(crate::sensor_data::CACHE).exists();
         ui.heading("Extended sensor access");
-        ui.label("Allows measured CPU package power and configured RAM speed when the hardware exposes them.");
-        ui.add_space(12.0);
+        theme::help_text(
+            ui,
+            "Read CPU package power and RAM speed when supported by your hardware.",
+        );
+        ui.add_space(tokens::SPACE_S);
         if ui
             .add_enabled(
                 self.pending.is_none(),
@@ -67,14 +72,14 @@ impl SensorAccess {
             ));
         }
         if enabled && self.latest.is_none() {
-            ui.colored_label(egui::Color32::YELLOW, "Sensor data is stale or invalid. Disable and re-enable access to restart the reader.");
+            ui.colored_label(theme::sem(ui).warning, "Sensor data is stale or invalid. Disable and re-enable access to restart the reader.");
         }
         if !self.status.is_empty() {
-            ui.colored_label(egui::Color32::LIGHT_RED, &self.status);
+            ui.colored_label(theme::sem(ui).negative, &self.status);
         }
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.small("A restricted system service reads sensors once per second. GUI and game remain unprivileged. Enabled until stopped or the system restarts; root access cannot add unsupported sensors.");
+        theme::help_text(ui, "Sensor access remains enabled until you turn it off or restart the system. Unavailable readings may not be supported by your hardware.");
     }
 }

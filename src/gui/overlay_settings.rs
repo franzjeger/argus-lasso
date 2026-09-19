@@ -68,8 +68,10 @@ pub fn show(ui: &mut Ui, config: &mut OverlayConfig, open: &mut bool, _cpu_count
     if !config.show_overlay {
         *open = false;
     }
-    ui.small("Choose which readings appear and how they look in Customize overlay.");
-    ui.small("Steam launch option: ARGUS_LASSO_HUD=1 %command%");
+    super::theme::help_text(
+        ui,
+        "Choose readings, colors and layout in Customize overlay.",
+    );
     changed
 }
 pub fn window(
@@ -85,7 +87,7 @@ pub fn window(
     let mut changed = false;
     ctx.show_viewport_immediate(
         egui::ViewportId::from_hash_of("gaming_overlay_settings"),
-        egui::ViewportBuilder::default().with_title("Argus — Overlay settings").with_transparent(true).with_app_id("argus-lasso")
+        egui::ViewportBuilder::default().with_title("Argus-Lasso — Overlay settings").with_transparent(true).with_app_id("argus-lasso")
             .with_inner_size([660.0, 730.0]).with_min_inner_size([560.0, 400.0]),
         |root_ui, class| {
             super::theme::apply_viewport_opacity(root_ui, window_opacity);
@@ -93,7 +95,7 @@ pub fn window(
             let mut contents = |ui: &mut Ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
-            ui.label("Choose the values you want. Changes are saved and applied while the game runs.");
+            super::theme::help_text(ui, "Choose the readings to display. Changes are saved and applied immediately.");
             ui.add_space(6.0);
             ui.separator();
             ui.add_space(6.0);

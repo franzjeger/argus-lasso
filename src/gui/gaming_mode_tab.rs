@@ -184,9 +184,9 @@ impl GamingModeTab {
         self.helper_status_text = if self.helper_ok {
             "Helper installed — parking + nice -1 available".into()
         } else if self.helper_outdated {
-            "Helper needs update — click 'Install / Update Helper'".into()
+            "CPU control needs an update. Use Set up CPU control to continue.".into()
         } else {
-            "Helper not installed — click 'Install / Update Helper' to enable parking".into()
+            "Set up CPU control to enable core parking and priority changes.".into()
         };
     }
 
@@ -509,7 +509,7 @@ impl GamingModeTab {
                             "Enable Gaming Mode"
                         };
                         let btn =
-                            egui::Button::new(RichText::new(label).strong().color(s.on_accent))
+                            egui::Button::new(RichText::new(label).font(th::bold_font(tokens::FONT_BODY)).color(s.on_accent))
                                 .fill(if self.parked { s.negative } else { s.accent })
                                 .min_size(egui::vec2(110.0, 30.0));
                         if ui.add_enabled(enabled, btn).clicked() {
@@ -738,7 +738,7 @@ impl GamingModeTab {
                     ui.horizontal(|ui| {
                         let can_launch = !self.game_name.is_empty() && !self.command.is_empty();
                         let launch =
-                            egui::Button::new(RichText::new("Launch").strong().color(s.on_accent))
+                            egui::Button::new(RichText::new("Launch").font(th::bold_font(tokens::FONT_BODY)).color(s.on_accent))
                                 .fill(s.accent);
                         if ui.add_enabled(can_launch, launch).clicked() {
                             self.launch_game();
@@ -795,7 +795,8 @@ impl GamingModeTab {
                             Err(e) => self.overlay_install_status = format!("Could not change layer loading: {e}"),
                         }
                     }
-                    ui.label("For other games, use launch option: ARGUS_LASSO_HUD=1 %command%");
+                    th::help_text(ui, "For manual activation, add this to the game’s Steam launch options:");
+                    ui.monospace("ARGUS_LASSO_HUD=1 %command%");
                     if !self.overlay_install_status.is_empty() { ui.label(&self.overlay_install_status); }
                 });
                 if overlay_changed { self.events.push(GamingEvent::ConfigChanged(Box::new(self.config.clone()))); }
@@ -1037,9 +1038,10 @@ fn core_map(
     interactive: bool,
 ) {
     use crate::gui::theme::{self as th, tokens};
-    const CELL: f32 = 34.0;
+    const CELL: f32 = 40.0;
     const GAP: f32 = 4.0;
-    const COLS: usize = 16;
+    let max_cols = ((ui.available_width() + GAP) / (CELL + GAP)).floor() as usize;
+    let columns = max_cols.clamp(1, 16);
 
     let s = th::sem(ui);
     let mut cells: Vec<(u32, bool)> = preferred
@@ -1052,8 +1054,8 @@ fn core_map(
         return;
     }
 
-    let rows = cells.len().div_ceil(COLS);
-    let cols = cells.len().min(COLS);
+    let rows = cells.len().div_ceil(columns);
+    let cols = cells.len().min(columns);
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(
             cols as f32 * (CELL + GAP) - GAP,
@@ -1063,7 +1065,7 @@ fn core_map(
     );
 
     for (i, &(cpu, is_pref)) in cells.iter().enumerate() {
-        let (r, c) = (i / COLS, i % COLS);
+        let (r, c) = (i / columns, i % columns);
         let cell = egui::Rect::from_min_size(
             rect.min + egui::vec2(c as f32 * (CELL + GAP), r as f32 * (CELL + GAP)),
             egui::vec2(CELL, CELL),
@@ -1111,7 +1113,7 @@ fn core_map(
             ui.visuals().weak_text_color()
         };
         ui.painter().text(
-            cell.center() - egui::vec2(0.0, 5.0),
+            cell.center() - egui::vec2(0.0, 8.0),
             egui::Align2::CENTER_CENTER,
             cpu.to_string(),
             th::num_font(tokens::FONT_LABEL),
@@ -1119,10 +1121,10 @@ fn core_map(
         );
         let tag = if smt.contains(&cpu) { "SMT" } else { "CPU" };
         ui.painter().text(
-            cell.center() + egui::vec2(0.0, 7.0),
+            cell.center() + egui::vec2(0.0, 8.0),
             egui::Align2::CENTER_CENTER,
             tag,
-            egui::FontId::proportional(9.0),
+            egui::FontId::proportional(tokens::FONT_SMALL),
             ui.visuals().weak_text_color(),
         );
 

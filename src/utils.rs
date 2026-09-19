@@ -2,7 +2,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::process::Command;
 
 // ── cpulist parsing / formatting ──────────────────────────────────────────────
 
@@ -187,9 +186,8 @@ pub fn set_nice(pid: u32, nice: i32) -> bool {
     unsafe {
         *libc::__errno_location() = 0;
     }
-    let res = unsafe {
-        libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice as libc::c_int)
-    };
+    let res =
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice as libc::c_int) };
     if res == 0 {
         log::debug!("setpriority pid={pid} nice={nice}: OK");
         true
@@ -547,13 +545,13 @@ pub fn export_json(procs: &[crate::monitor::ProcInfo]) -> String {
             serde_json::json!({
                 "pid": p.pid,
                 "ppid": p.ppid,
-                "name": p.name,
+                "name": p.name.as_ref(),
                 "cpu_percent": (p.cpu_percent * 10.0).round() / 10.0,
                 "gpu_percent": (p.gpu_percent * 10.0).round() / 10.0,
                 "mem_rss_mb": p.mem_rss / 1024 / 1024,
                 "nice": p.nice,
-                "affinity": p.affinity,
-                "ionice": p.ionice,
+                "affinity": p.affinity.as_ref(),
+                "ionice": p.ionice.as_ref(),
                 "disk_read_bps": p.disk_read_bps,
                 "disk_write_bps": p.disk_write_bps,
                 "cmdline": p.cmdline.as_str(),
@@ -668,11 +666,15 @@ mod tests {
         let p = crate::monitor::ProcInfo {
             pid: 7,
             name: "bash".into(),
+            affinity: "0-3".into(),
+            ionice: "best-effort:4".into(),
             ..Default::default()
         };
         let out = export_json(&[p]);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["processes"][0]["pid"], 7);
         assert_eq!(v["processes"][0]["name"], "bash");
+        assert_eq!(v["processes"][0]["affinity"], "0-3");
+        assert_eq!(v["processes"][0]["ionice"], "best-effort:4");
     }
 }

@@ -1,4 +1,6 @@
 //! Game capture controls and desktop-authorized global shortcut registration.
+
+use crate::gui::theme::{self, tokens};
 use argus_ipc::capture::{self, Summary};
 use std::{
     path::PathBuf,
@@ -56,7 +58,7 @@ impl GameBenchmark {
             self.checked = Some(Instant::now());
         }
         ui.heading("Game benchmark recording");
-        ui.label("Record game performance for a repeatable comparison. Results are saved locally as CSV and a summary.");
+        theme::help_text(ui, "Record game performance for comparison. Results are saved locally as CSV and a summary.");
         ui.add_space(10.0);
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -93,7 +95,7 @@ impl GameBenchmark {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("Keyboard shortcut").strong());
+        ui.label(theme::bold(ui, "Keyboard shortcut", tokens::FONT_HEADING));
         ui.horizontal_wrapped(|ui| {
             let registered = self.shortcut_live.load(Ordering::Relaxed);
             if ui
@@ -109,16 +111,19 @@ impl GameBenchmark {
                 self.stop.store(true, Ordering::Relaxed);
             }
         });
-        ui.small("Suggested: Shift+F2. Your desktop confirms the actual shortcut.");
+        theme::help_text(
+            ui,
+            "Suggested: Shift+F2. Your desktop confirms the actual shortcut.",
+        );
         if !self.error.is_empty() {
-            ui.colored_label(egui::Color32::LIGHT_RED, &self.error);
+            ui.colored_label(theme::sem(ui).negative, &self.error);
         }
         if !self.status.is_empty() {
             ui.label(self.status());
         }
         ui.add_space(12.0);
         egui::CollapsingHeader::new("Measurement details & files").show(ui, |ui| {
-        ui.small("CPU present intervals, not GPU time or displayed / generated frames. 1% low = reciprocal of the mean slowest 1%; p99 = nearest-rank frametime. No data is uploaded.");
+        theme::help_text(ui, "CPU present intervals, not GPU time or displayed / generated frames. 1% low = reciprocal of the mean slowest 1%; p99 = nearest-rank frametime. No data is uploaded.");
 
             ui.label("Every Vulkan present interval is recorded. Each application and swapchain has a separate result.");
             ui.monospace(capture::directory().display().to_string());
@@ -126,7 +131,7 @@ impl GameBenchmark {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("Recent recordings").strong());
+        ui.label(theme::bold(ui, "Recent recordings", tokens::FONT_HEADING));
         if self.results.is_empty() {
             ui.weak("Your completed recordings will appear here.");
         }
@@ -139,7 +144,7 @@ impl GameBenchmark {
                 if result.complete {
                     ""
                 } else {
-                    " · INCOMPLETE"
+                    " · Incomplete"
                 }
             ))
             .id_salt(path)
@@ -158,7 +163,7 @@ impl GameBenchmark {
                     result.dropped_samples, result.failed_presents
                 ));
                 ui.label(&result.executable);
-                ui.small(&result.metric);
+                theme::help_text(ui, &result.metric);
                 if ui.button("Open recording folder").clicked() {
                     let _ = std::process::Command::new("xdg-open")
                         .arg(capture::directory())

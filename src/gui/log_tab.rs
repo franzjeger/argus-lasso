@@ -184,7 +184,7 @@ impl LogTab {
 
         // show_rows virtualizes the list — only visible rows are laid out,
         // instead of all 2000 buffered lines on every repaint.
-        let font = egui::FontId::monospace(11.0);
+        let font = crate::gui::theme::num_font(tokens::FONT_SMALL);
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(14.0);
         let weak = ui.visuals().weak_text_color();
         let text_col = ui.visuals().text_color();

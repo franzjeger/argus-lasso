@@ -70,7 +70,7 @@ impl CpuBarsWidget {
         let cell_bg = ui.visuals().extreme_bg_color;
         let offline_bg = ui.visuals().faint_bg_color;
         let dark = ui.visuals().dark_mode;
-        let font = egui::FontId::monospace(11.0);
+        let font = crate::gui::theme::num_font(crate::gui::theme::tokens::FONT_SMALL);
         let hover_pos = resp.hover_pos();
         let mut hovered_cpu: Option<usize> = None;
 

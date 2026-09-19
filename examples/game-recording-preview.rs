@@ -5,6 +5,12 @@ mod game_benchmark;
 mod sensor_access;
 #[path = "../src/sensor_data.rs"]
 mod sensor_data;
+#[allow(dead_code)]
+#[path = "../src/gui/theme.rs"]
+pub(crate) mod theme;
+mod gui {
+    pub(crate) use crate::theme;
+}
 struct Preview {
     bench: game_benchmark::GameBenchmark,
     sensors: sensor_access::SensorAccess,
@@ -45,7 +51,8 @@ fn main() -> eframe::Result {
                 .with_inner_size([850.0, 650.0]),
             ..Default::default()
         },
-        Box::new(move |_| {
+        Box::new(move |cc| {
+            theme::apply_theme(&cc.egui_ctx, 1.0, &theme::AppTheme::AdwaitaDark);
             Ok(Box::new(Preview {
                 bench,
                 sensors: Default::default(),

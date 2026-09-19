@@ -8,7 +8,7 @@ A Linux process manager and gaming toolkit, written in Rust with egui. Manage CP
 assignments and process priorities, inspect hardware sensors, customize a Vulkan
 HUD, and record game present intervals for performance comparisons.
 
-![Argus-Lasso Processes page — CPU as share of total capacity](assets/screenshots/2026-09-13/processes.png)
+![Argus-Lasso Processes page — CPU as share of total capacity](assets/screenshots/2026-09-19/processes.png)
 
 **Updated screenshots: September 13, 2026.** [Browse every main menu and settings section](docs/screenshots.md).
 
@@ -127,11 +127,11 @@ and Settings subsections.
 
 | ProBalance: system-load activation | Gaming: CPU & performance |
 |---|---|
-| ![ProBalance](assets/screenshots/2026-09-13/probalance.png) | ![Gaming](assets/screenshots/2026-09-13/gaming-mode.png) |
+| ![ProBalance](assets/screenshots/2026-09-19/probalance.png) | ![Gaming](assets/screenshots/2026-09-19/gaming-mode.png) |
 | **Overlay customization** | **Game recording** |
-| ![Overlay settings](assets/screenshots/2026-09-13/overlay-settings.png) | ![Recording](assets/screenshots/2026-09-13/gamingrecording.png) |
+| ![Overlay settings](assets/screenshots/2026-09-13/overlay-settings.png) | ![Recording](assets/screenshots/2026-09-19/gamingrecording.png) |
 | **Hardware sensors** | **Appearance settings** |
-| ![Sensors](assets/screenshots/2026-09-13/hw-monitor.png) | ![Settings](assets/screenshots/2026-09-13/settings.png) |
+| ![Sensors](assets/screenshots/2026-09-19/hw-monitor.png) | ![Settings](assets/screenshots/2026-09-19/settings.png) |
 
 CPU usage is shown consistently as **0–100% of available capacity**. On 32 online
 logical CPUs, one fully busy CPU contributes 3.125% to the total. ProBalance's

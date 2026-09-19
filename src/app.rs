@@ -664,7 +664,7 @@ impl eframe::App for ArgusLassoApp {
                 ui.label(format!("CPU total: {cpu_avg:.0}%"));
                 if let Some(temp) = self.cpu_temp {
                     ui.separator();
-                    ui.label(format!("CPU temp: {temp:.0}°C"));
+                    ui.label(format!("CPU temp: {temp:.0} °C"));
                 }
                 if !self.cpu_model.is_empty() {
                     ui.separator();
@@ -723,7 +723,11 @@ impl eframe::App for ArgusLassoApp {
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
                         .show(|ui| {
                             ui.set_min_width(420.0);
-                            ui.label(RichText::new("Recent events").strong());
+                            ui.label(crate::gui::theme::bold(
+                                ui,
+                                "Recent events",
+                                crate::gui::theme::tokens::FONT_HEADING,
+                            ));
                             ui.separator();
                             if notable_events.is_empty() {
                                 ui.label(RichText::new("Nothing yet.").weak());
@@ -1084,7 +1088,7 @@ impl eframe::App for ArgusLassoApp {
                     let mut profiles_changed = false;
                     let mut rule_profiles = config.rule_profiles.clone();
                     // Process names for the rule dialog's live match count.
-                    let proc_names: Vec<String> = snapshot.iter().map(|p| p.name.clone()).collect();
+                    let proc_names: Vec<String> = snapshot.iter().map(|p| p.name.to_string()).collect();
                     self.rules_tab.show(
                         ui,
                         ctx,

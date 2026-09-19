@@ -13,6 +13,7 @@ mod icon;
 mod logfile;
 mod mem_bench;
 mod monitor;
+mod overlay_toggle;
 mod probalance;
 mod rules;
 mod sensor_access;
@@ -275,19 +276,18 @@ fn main() {
                     "process_count": total_count,
                     "processes": procs.iter().map(|p| serde_json::json!({
                         "pid": p.pid,
-                        "name": p.name,
+                        "name": p.name.as_ref(),
                         "cpu_percent": (p.cpu_percent as f64 * 10.0).round() / 10.0,
                         "mem_bytes": p.mem_rss,
                         "nice": p.nice,
-                        "affinity": p.affinity,
+                        "affinity": p.affinity.as_ref(),
                     })).collect::<Vec<_>>(),
                 });
                 println!("{}", serde_json::to_string_pretty(&json).unwrap());
                 return;
             }
             Cmd::ToggleOverlay => {
-                let path = config::config_dir().join("toggle_overlay");
-                if let Err(e) = std::fs::write(&path, "") {
+                if let Err(e) = overlay_toggle::request(&config::config_dir()) {
                     eprintln!("Failed to request toggle: {e}");
                     std::process::exit(1);
                 }

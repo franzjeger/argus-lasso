@@ -700,7 +700,7 @@ mod tests {
             .map(Row::text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rows.contains("Temp  42 °C"));
+        assert!(rows.contains("TEMP  42 °C"));
         assert!(rows.contains("CPU 19"));
         for absent in ["GPU MODEL", "POWER", "MHz", "CPU 03", "5100", "ARGUS"] {
             assert!(!rows.contains(absent), "{rows}");

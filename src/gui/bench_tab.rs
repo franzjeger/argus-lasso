@@ -87,7 +87,7 @@ impl BenchTab {
                         ui.label(
                             RichText::new(format!("{pct:.0}%"))
                                 .font(theme::num_font(tokens::FONT_BODY))
-                                .strong(),
+                                .color(theme::strong_color(ui)),
                         );
                         ui.label(
                             RichText::new(format!("current: {size_str}"))
@@ -482,13 +482,17 @@ fn show_results(
             Pos2::new(graph_rect.left() - 5.0, y),
             egui::Align2::RIGHT_CENTER,
             format!("{ns:.0} ns"),
-            theme::num_font(10.0),
+            theme::num_font(tokens::FONT_SMALL),
             weak,
         );
     }
 
+    // Keep larger axis labels readable when the result window is narrow.
+    let label_stride = ((TEST_SIZES.len() as f32 * 52.0) / graph_rect.width().max(1.0))
+        .ceil()
+        .max(1.0) as usize;
     // X grid
-    for &size in TEST_SIZES {
+    for (index, &size) in TEST_SIZES.iter().enumerate() {
         let x = to_x(size);
         painter.line_segment(
             [
@@ -497,11 +501,14 @@ fn show_results(
             ],
             Stroke::new(1.0_f32, theme::tint(weak, 35)),
         );
+        if !index.is_multiple_of(label_stride) {
+            continue;
+        }
         painter.text(
             Pos2::new(x, graph_rect.bottom() + 5.0),
             egui::Align2::CENTER_TOP,
             fmt_size_short(size),
-            theme::num_font(9.5),
+            theme::num_font(tokens::FONT_SMALL),
             weak,
         );
     }
@@ -573,7 +580,7 @@ fn show_results(
     // ── Detail table ──────────────────────────────────────────────────────────
     ui.label(
         RichText::new("Details")
-            .strong()
+            .font(theme::bold_font(tokens::FONT_BODY))
             .size(tokens::FONT_HEADING)
             .color(crate::gui::theme::strong_color(ui)),
     );
@@ -689,7 +696,7 @@ fn bench_card(
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new(title)
-                        .strong()
+                        .font(theme::bold_font(tokens::FONT_BODY))
                         .size(tokens::FONT_HEADING)
                         .color(crate::gui::theme::strong_color(ui)),
                 );
@@ -697,8 +704,12 @@ fn bench_card(
                     let s = theme::sem(ui);
                     for (i, (label, primary)) in buttons.iter().enumerate() {
                         let btn = if *primary {
-                            egui::Button::new(RichText::new(*label).color(s.on_accent).strong())
-                                .fill(s.accent)
+                            egui::Button::new(
+                                RichText::new(*label)
+                                    .color(s.on_accent)
+                                    .font(theme::bold_font(tokens::FONT_BODY)),
+                            )
+                            .fill(s.accent)
                         } else {
                             egui::Button::new(RichText::new(*label))
                         };
@@ -754,8 +765,7 @@ fn level_card(
                         Some(v) => format!("{v:.1} ns"),
                         None => "—".into(),
                     })
-                    .font(theme::num_font(19.0))
-                    .strong()
+                    .font(theme::num_font(tokens::FONT_HERO))
                     .color(color),
                 );
             });
@@ -787,8 +797,8 @@ fn bandwidth_card(ui: &mut egui::Ui, outer_w: f32, label: &str, value: f64, prev
                 );
                 ui.label(
                     RichText::new(format!("{value:.2} GB/s"))
-                        .font(theme::num_font(19.0))
-                        .strong(),
+                        .font(theme::num_font(tokens::FONT_HERO))
+                        .color(theme::strong_color(ui)),
                 );
                 let (text, color) = match prev {
                     Some(p) => {
@@ -803,7 +813,7 @@ fn bandwidth_card(ui: &mut egui::Ui, outer_w: f32, label: &str, value: f64, prev
                         }
                     }
                     None => (
-                        "no previous run".to_string(),
+                        "No previous run".to_string(),
                         ui.visuals().weak_text_color(),
                     ),
                 };

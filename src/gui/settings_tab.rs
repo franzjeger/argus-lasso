@@ -330,7 +330,7 @@ impl SettingsTab {
                             .iter()
                             .position(|ms| *ms == self.config.monitor.display_refresh_interval_ms)
                             .unwrap_or(usize::MAX);
-                        if let Some(i) = theme::segmented(ui, &["0.5s", "1s", "2s", "5s"], sel) {
+                        if let Some(i) = theme::segmented(ui, &["0.5 s", "1 s", "2 s", "5 s"], sel) {
                             self.config.monitor.display_refresh_interval_ms = PICKS[i];
                         }
                     });
@@ -594,11 +594,7 @@ impl SettingsTab {
 
 /// Weak, small help line under a group title (§7).
 fn help_text(ui: &mut Ui, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .size(tokens::FONT_HELP)
-            .color(ui.visuals().weak_text_color()),
-    );
+    theme::help_text(ui, text);
 }
 
 // ── CPU governor / EPP sysfs helpers ─────────────────────────────────────────
