@@ -77,15 +77,6 @@ pub fn cpuset_to_cpulist(cpus: &HashSet<u32>) -> String {
     ranges.join(",")
 }
 
-#[allow(dead_code)]
-pub fn validate_cpulist(cpulist: &str) -> bool {
-    let max_cpu = get_cpu_count().saturating_sub(1);
-    match cpulist_to_set(cpulist) {
-        Ok(set) if !set.is_empty() => set.iter().all(|&c| c <= max_cpu),
-        _ => false,
-    }
-}
-
 // ── Thread enumeration ────────────────────────────────────────────────────────
 
 /// Return all thread IDs (TIDs) for a process by reading /proc/<pid>/task/.

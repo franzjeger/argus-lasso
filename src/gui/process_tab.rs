@@ -218,9 +218,6 @@ pub struct ProcessTab {
     // Name column auto-fills; user can drag handles to resize others.
     pub col_widths: Vec<f32>,
     // Last available width — used to detect window resize for auto-scaling
-    // Pending kill awaiting undo
-    #[allow(dead_code)]
-    pub pending_kill: Option<PendingKill>,
     // Set to true when col_widths change so app.rs can persist them
     pub cols_dirty: bool,
     // Quick-filter chips (combine with the text filter)
@@ -268,7 +265,6 @@ impl ProcessTab {
             tree_view: false,
             core_pairs: build_core_pairs(),
             col_widths,
-            pending_kill: None,
             cols_dirty: false,
             chip_high_cpu: false,
             chip_throttled: false,
