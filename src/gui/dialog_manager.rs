@@ -199,7 +199,15 @@ impl DialogManager {
                 };
 
                 if let Some(cfg) = cfg {
-                    let _ = config::save(&cfg);
+                    if let Err(e) = config::save(&cfg) {
+                        log::warn!("Failed to save rule to disk: {e}");
+                        if let Ok(mut s) = state.lock() {
+                            s.append_log(format!(
+                                "[Rule] Failed to save '{}' to disk: {e}",
+                                offer.proc_name
+                            ));
+                        }
+                    }
                 }
                 let _ = cmd_tx.send(DaemonCmd::ReapplyDefaults);
             } else if dismiss {

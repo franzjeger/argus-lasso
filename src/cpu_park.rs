@@ -40,7 +40,7 @@ pub const LEGACY_SUDOERS: &str = "/etc/sudoers.d/argus-lasso";
 
 /// Bumped whenever a helper script changes, so the app can tell an outdated
 /// install from a missing one. Substring-matched in the installed files.
-const HELPER_VERSION: &str = "argus-lasso-helper v3";
+const HELPER_VERSION: &str = "argus-lasso-helper v4";
 
 /// The three privileged operations, and the file each one lives in.
 const OP_PARK: &str = "cpu-park";
@@ -52,7 +52,7 @@ fn helper_path(op: &str) -> String {
 }
 
 const PARK_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v3 — CPU parking. Managed by argus-lasso; do not edit.
+# argus-lasso-helper v4 — CPU parking. Managed by argus-lasso; do not edit.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 case "${1-}" in
@@ -83,7 +83,7 @@ esac
 "#;
 
 const POWER_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v3 — CPU governor and energy preference.
+# argus-lasso-helper v4 — CPU governor and energy preference.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 case "${1-}" in
@@ -108,14 +108,26 @@ esac
 /// it must never reach a process the caller does not own. pkexec exports
 /// PKEXEC_UID; without it we are not being invoked through polkit and refuse
 /// rather than guess who is asking.
+///
+/// The caller also passes the pid's start_ticks (/proc/<pid>/stat field 22,
+/// read at the moment it decided to renice this pid) so the script can
+/// re-check *identity*, not just ownership, immediately before acting: a pid
+/// can be reused — even by a process the same uid owns — in the time between
+/// the caller observing it and this script running. Two processes can never
+/// share a start time, so comparing it catches reuse an ownership check
+/// alone would miss. This narrows the race to the few lines between the
+/// re-check and the renice call; Linux has no pidfd-based setpriority to
+/// close it entirely.
 const RENICE_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v3 — renice, restricted to the caller's own processes.
+# argus-lasso-helper v4 — renice, restricted to the caller's own processes.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 [[ "${1-}" =~ ^-?[0-9]+$ ]] || exit 2
 [[ "${2-}" =~ ^[0-9]+$   ]] || exit 2
+[[ "${3-}" =~ ^[0-9]+$   ]] || exit 2
 nice_val=$1
 pid=$2
+want_start=$3
 if [ -z "${PKEXEC_UID-}" ]; then
     echo "refusing: not invoked through pkexec" >&2
     exit 2
@@ -123,6 +135,17 @@ fi
 owner=$(stat -c %u "/proc/$pid" 2>/dev/null) || { echo "no such process: $pid" >&2; exit 1; }
 if [ "$owner" != "$PKEXEC_UID" ]; then
     echo "refusing: PID $pid belongs to uid $owner, not $PKEXEC_UID" >&2
+    exit 1
+fi
+# /proc/<pid>/stat is "pid (comm) state ppid ... starttime ...": strip up to
+# the last ") " (comm may itself contain spaces or parens) and starttime is
+# the 20th field after that split (state=0, ppid=1, ..., starttime=19).
+stat_line=$(cat "/proc/$pid/stat" 2>/dev/null) || { echo "no such process: $pid" >&2; exit 1; }
+after_comm=${stat_line##*) }
+read -r -a fields <<< "$after_comm"
+actual_start=${fields[19]-}
+if [ "$actual_start" != "$want_start" ]; then
+    echo "refusing: PID $pid is not the process we were asked to renice (start time changed)" >&2
     exit 1
 fi
 renice -n "$nice_val" -p "$pid" >/dev/null
@@ -191,7 +214,6 @@ pub enum TopologyKind {
 
 #[derive(Debug, Clone)]
 pub struct CpuTopology {
-    #[allow(dead_code)]
     pub kind: TopologyKind,
     pub preferred: HashSet<u32>,
     pub non_preferred: HashSet<u32>,
@@ -651,8 +673,20 @@ pub fn unpark_all(log_cb: impl Fn(String)) -> bool {
 
 /// Raise a process's scheduling priority. The helper refuses any PID the
 /// calling user does not own, so this can only ever affect our own processes.
-pub fn set_process_nice_via_helper(pid: u32, nice: i32) -> bool {
-    let (ok, msg) = run_helper(OP_RENICE, &[&nice.to_string(), &pid.to_string()]);
+///
+/// `start_ticks` is the pid's start time (ProcInfo::start_ticks /
+/// /proc/<pid>/stat field 22) as the caller last observed it — passed
+/// through so the helper can refuse if the pid has since been reused by a
+/// different process.
+pub fn set_process_nice_via_helper(pid: u32, start_ticks: u64, nice: i32) -> bool {
+    let (ok, msg) = run_helper(
+        OP_RENICE,
+        &[
+            &nice.to_string(),
+            &pid.to_string(),
+            &start_ticks.to_string(),
+        ],
+    );
     if !ok {
         log::warn!("renice pid={pid} nice={nice} failed: {msg}");
     }
@@ -671,6 +705,21 @@ pub fn is_pkexec_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Allowlist a path for unquoted-adjacent interpolation into a shell command
+/// that `pkexec` runs as root. Every caller still single-quotes the value on
+/// top of this — belt and suspenders, since either one alone has a history
+/// of missed edge cases in shell-command construction.
+fn validate_shell_safe_path(s: &str) -> Result<&str, String> {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+    {
+        Ok(s)
+    } else {
+        Err("Staging path contains unsafe characters.".into())
+    }
+}
+
 /// Stage the helper scripts and the polkit policy in the user's own config
 /// directory, and build the root command that installs them.
 ///
@@ -682,9 +731,15 @@ fn stage_install() -> Result<(String, std::path::PathBuf), String> {
     let _ = fs::remove_dir_all(&stage);
     fs::create_dir_all(&stage).map_err(|e| format!("Failed to create staging dir: {e}"))?;
 
+    // `dir` is interpolated into a string that pkexec runs via `sh -c`, so it
+    // is as good as attacker input: it comes from $HOME (config_dir()), which
+    // isn't necessarily trustworthy just because we're running as our own
+    // uid. An allowlist (rather than blocking a few known-bad characters) and
+    // single-quoting every use below are both required — either alone has a
+    // history of missed edge cases in shell-command construction.
     let dir = match stage.to_str() {
-        Some(s) if !s.contains('\'') && !s.contains(char::is_whitespace) => s.to_string(),
-        _ => return Err("Staging path contains unsafe characters.".into()),
+        Some(s) => validate_shell_safe_path(s)?.to_string(),
+        None => return Err("Staging path is not valid UTF-8.".into()),
     };
 
     for (name, body) in [
@@ -700,14 +755,19 @@ fn stage_install() -> Result<(String, std::path::PathBuf), String> {
     // Removing the predecessor is part of the install, not a separate step:
     // leaving the old NOPASSWD sudoers rule in place would keep the very hole
     // this replaces open.
+    //
+    // Every path is single-quoted, including the compile-time HELPER_DIR/
+    // POLICY_PATH constants: those are trusted, but quoting them too is free
+    // and keeps this command safe even if a packager ever bakes in a path
+    // containing a space.
     let cmd = format!(
         "set -e && \
-         install -d -m 755 -o root -g root {HELPER_DIR} && \
-         install -m 755 -o root -g root {dir}/{OP_PARK} {HELPER_DIR}/{OP_PARK} && \
-         install -m 755 -o root -g root {dir}/{OP_POWER} {HELPER_DIR}/{OP_POWER} && \
-         install -m 755 -o root -g root {dir}/{OP_RENICE} {HELPER_DIR}/{OP_RENICE} && \
-         install -D -m 644 -o root -g root {dir}/policy.xml {POLICY_PATH} && \
-         rm -f {LEGACY_SUDOERS} {LEGACY_HELPER} && \
+         install -d -m 755 -o root -g root '{HELPER_DIR}' && \
+         install -m 755 -o root -g root '{dir}/{OP_PARK}' '{HELPER_DIR}/{OP_PARK}' && \
+         install -m 755 -o root -g root '{dir}/{OP_POWER}' '{HELPER_DIR}/{OP_POWER}' && \
+         install -m 755 -o root -g root '{dir}/{OP_RENICE}' '{HELPER_DIR}/{OP_RENICE}' && \
+         install -D -m 644 -o root -g root '{dir}/policy.xml' '{POLICY_PATH}' && \
+         rm -f '{LEGACY_SUDOERS}' '{LEGACY_HELPER}' && \
          echo INSTALL_OK"
     );
     Ok((cmd, stage))
@@ -933,8 +993,10 @@ mod tests {
     #[test]
     fn renice_refuses_a_process_the_caller_does_not_own() {
         let script = stage_script("renice", RENICE_SCRIPT);
-        // PID 1 is root's. Claim to be some other uid and it must be refused.
-        let code = run(&script, &["-5", "1"], Some("4242"));
+        // PID 1 is root's. Claim to be some other uid and it must be refused
+        // — before the start_ticks re-check is even reached, so any
+        // well-formed placeholder value works here.
+        let code = run(&script, &["-5", "1", "0"], Some("4242"));
         assert_eq!(code, 1, "renice must refuse a PID owned by another uid");
         fs::remove_file(&script).ok();
     }
@@ -944,7 +1006,7 @@ mod tests {
     #[test]
     fn renice_refuses_when_not_invoked_through_pkexec() {
         let script = stage_script("renice-nopk", RENICE_SCRIPT);
-        let code = run(&script, &["-5", "1"], None);
+        let code = run(&script, &["-5", "1", "0"], None);
         assert_eq!(code, 2, "renice must refuse outside pkexec");
         fs::remove_file(&script).ok();
     }
@@ -953,8 +1015,10 @@ mod tests {
     fn renice_rejects_malformed_arguments() {
         let script = stage_script("renice-args", RENICE_SCRIPT);
         for args in [
-            vec!["notanumber", "1"],
-            vec!["-5", "notapid"],
+            vec!["notanumber", "1", "0"],
+            vec!["-5", "notapid", "0"],
+            vec!["-5", "1", "notanumber"],
+            vec!["-5", "1"],
             vec!["-5"],
             vec![],
         ] {
@@ -964,6 +1028,52 @@ mod tests {
                 "expected rejection for {args:?}"
             );
         }
+        fs::remove_file(&script).ok();
+    }
+
+    /// The whole point of adding start_ticks: even with the right owner, a
+    /// pid that has since been reused by a different process instance must
+    /// be refused, not just any pid the caller happens to still own.
+    #[test]
+    fn renice_refuses_when_start_ticks_does_not_match() {
+        use std::os::unix::fs::MetadataExt;
+        let script = stage_script("renice-start-mismatch", RENICE_SCRIPT);
+        let my_pid = std::process::id();
+        let my_uid = fs::metadata("/proc/self").unwrap().uid();
+        // Real start_ticks are never 0 for anything started after boot, so
+        // this can never accidentally match our real one.
+        let code = run(
+            &script,
+            &["0", &my_pid.to_string(), "0"],
+            Some(&my_uid.to_string()),
+        );
+        assert_eq!(
+            code, 1,
+            "renice must refuse when start_ticks does not match the live process"
+        );
+        fs::remove_file(&script).ok();
+    }
+
+    /// Positive-path check for the same mechanism: our own real pid, uid and
+    /// start_ticks must still be accepted. Also cross-checks the script's
+    /// hand-rolled /proc/<pid>/stat field parsing against fast_proc's.
+    #[test]
+    fn renice_succeeds_when_start_ticks_matches() {
+        use std::os::unix::fs::MetadataExt;
+        let script = stage_script("renice-start-match", RENICE_SCRIPT);
+        let my_pid = std::process::id();
+        let my_uid = fs::metadata("/proc/self").unwrap().uid();
+        let real_start = crate::fast_proc::read_stat(my_pid, &mut [0u8; 1024])
+            .expect("read our own /proc/self/stat")
+            .starttime;
+        // nice 0 on ourselves is a harmless no-op, not a real priority
+        // change, and needs no elevated privilege to succeed.
+        let code = run(
+            &script,
+            &["0", &my_pid.to_string(), &real_start.to_string()],
+            Some(&my_uid.to_string()),
+        );
+        assert_eq!(code, 0, "renice must succeed when start_ticks matches");
         fs::remove_file(&script).ok();
     }
 
@@ -1005,5 +1115,36 @@ mod tests {
         for body in [PARK_SCRIPT, POWER_SCRIPT, RENICE_SCRIPT] {
             assert!(body.contains(HELPER_VERSION), "missing version marker");
         }
+    }
+
+    /// stage_install() interpolates this value into a string that pkexec
+    /// runs as root via `sh -c`. It comes from $HOME (config_dir()), which
+    /// is not inherently trustworthy — each of these must be rejected, not
+    /// just the literal single-quote the old blocklist-only check caught.
+    #[test]
+    fn staging_path_validation_rejects_shell_metacharacters() {
+        for bad in [
+            "",
+            "/home/user;rm -rf /",
+            "/home/user$(whoami)",
+            "/home/user`whoami`",
+            "/home/user|cat /etc/shadow",
+            "/home/user&background",
+            "/home/user name/with space",
+            "/home/user'quote",
+            "/home/user\"quote",
+            "/home/user\nnewline",
+        ] {
+            assert!(
+                validate_shell_safe_path(bad).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn staging_path_validation_accepts_normal_paths() {
+        let good = "/home/user/.config/argus-lasso/helper-stage";
+        assert_eq!(validate_shell_safe_path(good), Ok(good));
     }
 }
