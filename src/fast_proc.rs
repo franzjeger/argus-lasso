@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 
 #[derive(Debug, Default)]
 pub struct FastStat {
@@ -18,10 +18,23 @@ fn get_page_size() -> u64 {
     *PAGE_SIZE.get_or_init(|| unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) as u64 })
 }
 
+/// Format "/proc/<pid>/stat" into a stack buffer instead of heap-allocating a
+/// String for it — read_stat runs once per live process on every daemon
+/// tick, and every digit of the largest possible pid plus the fixed
+/// surrounding text fits comfortably under 32 bytes.
+fn proc_stat_path(pid: u32, buf: &mut [u8; 32]) -> Option<&str> {
+    let total = buf.len();
+    let mut cursor: &mut [u8] = buf;
+    write!(cursor, "/proc/{pid}/stat").ok()?;
+    let written = total - cursor.len();
+    std::str::from_utf8(&buf[..written]).ok()
+}
+
 /// Parse /proc/[pid]/stat with zero allocation (except for comm when needed).
 pub fn read_stat(pid: u32, buf: &mut [u8; 1024]) -> Option<FastStat> {
-    let path = format!("/proc/{}/stat", pid);
-    let mut file = File::open(&path).ok()?;
+    let mut path_buf = [0u8; 32];
+    let path = proc_stat_path(pid, &mut path_buf)?;
+    let mut file = File::open(path).ok()?;
     let n = file.read(buf).ok()?;
     if n == 0 {
         return None;
@@ -31,7 +44,10 @@ pub fn read_stat(pid: u32, buf: &mut [u8; 1024]) -> Option<FastStat> {
     let start_paren = data.iter().position(|&b| b == b'(')?;
     let end_paren = data.iter().rposition(|&b| b == b')')?;
 
-    let comm = String::from_utf8_lossy(&data[start_paren + 1..end_paren]).to_string();
+    // `from_utf8_lossy` already returns an owned String when the input isn't
+    // valid UTF-8 (the only case that would actually copy); `.into_owned()`
+    // takes it as-is, unlike `.to_string()`, which would clone it again.
+    let comm = String::from_utf8_lossy(&data[start_paren + 1..end_paren]).into_owned();
 
     // The rest of the fields start after ") "
     if end_paren + 2 >= data.len() {
@@ -120,4 +136,25 @@ pub fn read_cmdline(pid: u32, buf: &mut Vec<u8>) -> Vec<String> {
         .filter(|arg| !arg.is_empty())
         .map(|arg| String::from_utf8_lossy(arg).into_owned())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::proc_stat_path;
+
+    #[test]
+    fn proc_stat_path_formats_without_heap_allocation() {
+        let mut buf = [0u8; 32];
+        assert_eq!(proc_stat_path(1, &mut buf), Some("/proc/1/stat"));
+        assert_eq!(proc_stat_path(123_456, &mut buf), Some("/proc/123456/stat"));
+    }
+
+    #[test]
+    fn proc_stat_path_handles_the_largest_possible_pid() {
+        let mut buf = [0u8; 32];
+        assert_eq!(
+            proc_stat_path(u32::MAX, &mut buf),
+            Some("/proc/4294967295/stat")
+        );
+    }
 }
