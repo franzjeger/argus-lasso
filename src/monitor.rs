@@ -64,6 +64,12 @@ pub struct ProcInfo {
     pub disk_read_bps: u64,  // bytes/s
     pub disk_write_bps: u64, // bytes/s
     pub cmdline: std::sync::Arc<String>,
+    /// Process start time in clock ticks since boot (/proc/<pid>/stat field
+    /// 22). Identifies *this* process, not just this pid number — a pid can
+    /// be reused by an unrelated process, but two processes can't share a
+    /// start time. Callers that track a pid across scans (e.g. Gaming Mode's
+    /// nice-restore list) should key on (pid, start_ticks), not pid alone.
+    pub start_ticks: u64,
 }
 
 impl Default for ProcInfo {
@@ -81,6 +87,7 @@ impl Default for ProcInfo {
             disk_read_bps: 0,
             disk_write_bps: 0,
             cmdline: std::sync::Arc::new(String::new()),
+            start_ticks: 0,
         }
     }
 }
@@ -587,11 +594,13 @@ fn run_loop(
     let mut original_affinities: HashMap<u32, HashSet<u32>> = HashMap::new();
     // pid → expiry Instant (suppress rule re-enforcement after manual change)
     let mut manual_overrides: HashMap<u32, Instant> = HashMap::new();
-    // Gaming Mode nice tracking: pid → original nice before we elevated
+    // Gaming Mode nice tracking: pid → (start_ticks, original nice before we
+    // elevated). start_ticks pins this to the specific process instance, not
+    // just the pid number — see the retain call below and restore_gaming_nices.
     let mut gaming_mode = false;
     let mut launch_profiles = Vec::<argus_ipc::LaunchProfile>::new();
     let mut gaming_elevate_nice = false;
-    let mut gaming_niced: HashMap<u32, i32> = HashMap::new();
+    let mut gaming_niced: HashMap<u32, (u64, i32)> = HashMap::new();
     // Did WE auto-enable Gaming Mode? (never auto-disable a manual activation)
     let mut auto_gaming = false;
     // Consecutive snapshots without a detected game before auto-disabling
@@ -797,8 +806,24 @@ fn run_loop(
             // Prune dead PIDs from per-PID maps: avoids unbounded growth, and —
             // for gaming_niced — stops a reused PID from getting an unrelated
             // process's nice restored onto it when Gaming Mode is disabled.
+            //
+            // gaming_niced additionally keys on start_ticks, not just pid
+            // liveness: current_pids.contains(pid) is true again the instant
+            // a dead pid is reused by an unrelated process, which — within
+            // one scan interval — could otherwise inherit the previous
+            // occupant's nice-restore entry. Two processes can't share a
+            // start time, so comparing it catches reuse that a liveness
+            // check alone would miss.
             original_affinities.retain(|pid, _| current_pids.contains(pid));
-            gaming_niced.retain(|pid, _| current_pids.contains(pid));
+            if !gaming_niced.is_empty() {
+                let live_start_ticks: HashMap<u32, u64> = raw_snapshot
+                    .iter()
+                    .filter(|p| gaming_niced.contains_key(&p.pid))
+                    .map(|p| (p.pid, p.start_ticks))
+                    .collect();
+                gaming_niced
+                    .retain(|pid, entry| live_start_ticks.get(pid).copied() == Some(entry.0));
+            }
             caches.retain_live(&current_pids);
             enforce_nice_failed.retain(|(_, pid)| current_pids.contains(pid));
 
@@ -1352,6 +1377,7 @@ fn collect_snapshot(
             disk_read_bps,
             disk_write_bps,
             cmdline,
+            start_ticks: stat.starttime,
         });
     }
 
@@ -1515,7 +1541,7 @@ fn apply_new_pid(
     original_affinities: &mut HashMap<u32, HashSet<u32>>,
     gaming_mode: bool,
     gaming_elevate_nice: bool,
-    gaming_niced: &mut HashMap<u32, i32>,
+    gaming_niced: &mut HashMap<u32, (u64, i32)>,
     log_cb: &impl Fn(String),
 ) {
     let pid = proc.pid;
@@ -1537,8 +1563,8 @@ fn apply_new_pid(
         // Rule matched — if gaming mode + elevate_nice, apply nice -1 and pin to preferred cores
         if gaming_mode && gaming_elevate_nice && !gaming_niced.contains_key(&pid) {
             let orig_nice = proc.nice;
-            if cpu_park::set_process_nice_via_helper(pid, -1) {
-                gaming_niced.insert(pid, orig_nice);
+            if cpu_park::set_process_nice_via_helper(pid, proc.start_ticks, -1) {
+                gaming_niced.insert(pid, (proc.start_ticks, orig_nice));
                 log_cb(format!("[Gaming Mode] nice -1 → {}({})", proc.name, pid));
             }
             // Pin game process to preferred cores (P-cores / V-Cache CCD)
@@ -1708,10 +1734,10 @@ fn check_hw_alerts(
 
 // ── Restore gaming nices ──────────────────────────────────────────────────────
 
-fn restore_gaming_nices(gaming_niced: &mut HashMap<u32, i32>, log_cb: &impl Fn(String)) {
+fn restore_gaming_nices(gaming_niced: &mut HashMap<u32, (u64, i32)>, log_cb: &impl Fn(String)) {
     let mut count = 0;
-    for (&pid, &orig_nice) in gaming_niced.iter() {
-        if cpu_park::set_process_nice_via_helper(pid, orig_nice) {
+    for (&pid, &(start_ticks, orig_nice)) in gaming_niced.iter() {
+        if cpu_park::set_process_nice_via_helper(pid, start_ticks, orig_nice) {
             count += 1;
         }
     }
