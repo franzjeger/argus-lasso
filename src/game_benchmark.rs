@@ -53,8 +53,7 @@ impl GameBenchmark {
         {
             self.active = capture::read_control().is_active();
             self.results = capture::load_summaries();
-            self.error = std::fs::read_to_string(capture::directory().join("latest-error.txt"))
-                .unwrap_or_default();
+            self.error = read_bounded_text(&capture::directory().join("latest-error.txt"));
             self.checked = Some(Instant::now());
         }
         ui.heading("Game benchmark recording");
@@ -280,4 +279,25 @@ async fn shortcut_loop(
     session.close().await.map_err(|e| e.to_string())?;
     let _ = tx.send("Recording shortcut released".into());
     Ok(())
+}
+
+/// Read at most `MAX_ERROR_FILE_BYTES` of a text file, on failure or an
+/// oversized file returning an empty string rather than the whole content.
+///
+/// This file is written by the in-process recorder running inside the game
+/// (argus-layer), the less-trusted side of this boundary — capping the read
+/// itself (not just the size checked afterward) means a huge or hostile file
+/// costs at most one bounded allocation, not an attempt to load it whole.
+const MAX_ERROR_FILE_BYTES: u64 = 64 * 1024;
+
+fn read_bounded_text(path: &std::path::Path) -> String {
+    use std::io::Read;
+    let Ok(f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut buf = Vec::new();
+    if f.take(MAX_ERROR_FILE_BYTES).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
