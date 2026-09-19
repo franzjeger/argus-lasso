@@ -575,15 +575,15 @@ impl ProBalance {
 
     /// Return detailed info for all currently throttled processes.
     pub fn throttle_infos(&self, snapshot: &[ProcSnapshot]) -> Vec<ThrottleInfo> {
-        let name_map: HashMap<u32, (&str, f32)> = snapshot
-            .iter()
-            .map(|p| (p.pid, (p.name.as_str(), p.cpu_percent)))
-            .collect();
         self.states
             .iter()
             .filter(|(_, e)| e.state == ProcState::Throttled)
             .map(|(&pid, e)| {
-                let (name, cpu_percent) = name_map.get(&pid).copied().unwrap_or(("unknown", 0.0));
+                let (name, cpu_percent) = snapshot
+                    .iter()
+                    .find(|p| p.pid == pid)
+                    .map(|p| (p.name.as_str(), p.cpu_percent))
+                    .unwrap_or(("unknown", 0.0));
                 ThrottleInfo {
                     pid,
                     name: name.to_string(),

@@ -448,7 +448,7 @@ fn sensor_row(
         draw_sparkline(
             ui,
             spark_rect,
-            &sensor.history,
+            &sensor.ordered_history(),
             now_color.gamma_multiply(0.6),
         );
     }
@@ -518,7 +518,7 @@ fn temp_pct(c: f32) -> f32 {
 fn draw_sparkline(
     ui: &mut Ui,
     rect: egui::Rect,
-    history: &std::collections::VecDeque<f32>,
+    history: &[f32],
     color: Color32,
 ) {
     if history.len() < 2 {
@@ -526,7 +526,7 @@ fn draw_sparkline(
     }
 
     let painter = ui.painter_at(rect);
-    let vals: Vec<f32> = history.iter().copied().collect();
+    let vals = history;
 
     let lo = vals.iter().cloned().fold(f32::INFINITY, f32::min);
     let hi = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);

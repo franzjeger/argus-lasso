@@ -53,18 +53,16 @@ pub enum DaemonCmd {
 pub struct ProcInfo {
     pub pid: u32,
     pub ppid: u32,
-    pub name: String,
-    /// Share of total available CPU time (0–100%, including multicore processes).
+    pub name: std::sync::Arc<str>,
+    /// Share of total available CPU time (0-100%, including multicore processes).
     pub cpu_percent: f32,
-    /// GPU utilization % (NVML per-process SM util; 0.0 without NVIDIA/NVML)
     pub gpu_percent: f32,
     pub mem_rss: u64, // bytes
     pub nice: i32,
-    pub affinity: String,
-    pub ionice: String,
+    pub affinity: std::sync::Arc<str>,
+    pub ionice: std::sync::Arc<str>,
     pub disk_read_bps: u64,  // bytes/s
     pub disk_write_bps: u64, // bytes/s
-    /// Reference-counted so GUI snapshot clones are O(1) for this field.
     pub cmdline: std::sync::Arc<String>,
 }
 
@@ -73,13 +71,13 @@ impl Default for ProcInfo {
         Self {
             pid: 0,
             ppid: 0,
-            name: String::new(),
+            name: "".into(),
             cpu_percent: 0.0,
             gpu_percent: 0.0,
             mem_rss: 0,
             nice: 0,
-            affinity: String::new(),
-            ionice: String::new(),
+            affinity: "".into(),
+            ionice: "".into(),
             disk_read_bps: 0,
             disk_write_bps: 0,
             cmdline: std::sync::Arc::new(String::new()),
@@ -754,7 +752,8 @@ fn run_loop(
             } else {
                 0.0
             };
-            let (new_snapshot, new_cpu_times, sys_total) = collect_snapshot(
+            let (new_cpu_times, sys_total) = collect_snapshot(
+                &mut raw_snapshot,
                 &mut prev_cpu_times,
                 prev_sys_total,
                 &mut caches,
@@ -763,7 +762,6 @@ fn run_loop(
             );
             prev_cpu_times = new_cpu_times;
             prev_sys_total = sys_total;
-            raw_snapshot = new_snapshot;
 
             let current_pids: HashSet<u32> = raw_snapshot.iter().map(|p| p.pid).collect();
 
@@ -882,7 +880,7 @@ fn run_loop(
                 .iter()
                 .map(|p| ProcSnapshot {
                     pid: p.pid,
-                    name: p.name.clone(),
+                    name: p.name.to_string(),
                     cpu_percent: p.cpu_percent,
                     nice: p.nice,
                 })
@@ -929,7 +927,25 @@ fn run_loop(
             last_pb = now;
         }
 
-        if now.duration_since(last_sensors) >= Duration::from_secs(1) {
+        let refresh = Duration::from_millis(config.monitor.display_refresh_interval_ms);
+        if now.duration_since(last_snapshot) >= refresh {
+            let throttled = probalance.throttled_pids();
+            let pb_snap_for_infos: Vec<crate::probalance::ProcSnapshot> = raw_snapshot
+                .iter()
+                .map(|p| crate::probalance::ProcSnapshot {
+                    pid: p.pid,
+                    name: p.name.to_string(),
+                    cpu_percent: p.cpu_percent,
+                    nice: p.nice,
+                })
+                .collect();
+            let throttle_infos = probalance.throttle_infos(&pb_snap_for_infos);
+            let cpu_percents = collect_cpu_percents();
+            let avg = if cpu_percents.is_empty() {
+                0.0
+            } else {
+                cpu_percents.iter().sum::<f32>() / cpu_percents.len() as f32
+            };
             // Update hardware sensor readings
             hw_collector.update();
 
@@ -1096,10 +1112,11 @@ pub fn oneshot_snapshot() -> Vec<ProcInfo> {
     let mut prev_times: HashMap<u32, u64> = HashMap::new();
     let mut caches = SnapshotCaches::default();
     // The CLI prints affinity, so both passes ask for detail.
-    let (_, times, sys_total) = collect_snapshot(&mut prev_times, 0, &mut caches, true, 0.0);
+    let mut snap = Vec::new();
+    let (times, sys_total) = collect_snapshot(&mut snap, &mut prev_times, 0, &mut caches, true, 0.0);
     prev_times = times;
     std::thread::sleep(Duration::from_millis(500));
-    let (snap, _, _) = collect_snapshot(&mut prev_times, sys_total, &mut caches, true, 0.5);
+    let (_, _) = collect_snapshot(&mut snap, &mut prev_times, sys_total, &mut caches, true, 0.5);
     snap
 }
 
@@ -1197,7 +1214,7 @@ fn park_non_preferred(log_cb: &impl Fn(String)) {
 /// the previous occupant's name.
 struct ProcMeta {
     start_time: u64,
-    name: String,
+    name: std::sync::Arc<str>,
     cmdline: std::sync::Arc<String>,
 }
 
@@ -1207,7 +1224,7 @@ pub struct SnapshotCaches {
     meta: HashMap<u32, ProcMeta>,
     /// pid → (affinity, ionice) — display-only, so refreshed on the display
     /// cadence rather than the much shorter enforce cadence.
-    display: HashMap<u32, (String, String)>,
+    display: HashMap<u32, (std::sync::Arc<str>, std::sync::Arc<str>)>,
     /// pid → (read_bytes, write_bytes) at the last I/O sample.
     io: HashMap<u32, (u64, u64)>,
 }
@@ -1232,14 +1249,15 @@ impl SnapshotCaches {
 /// `io_elapsed` is the wall time since the last I/O sample; the byte deltas
 /// are divided by it so the rate is per second regardless of cadence.
 fn collect_snapshot(
+    snapshot: &mut Vec<ProcInfo>,
     prev_times: &mut HashMap<u32, u64>,
     prev_sys_total: u64,
     caches: &mut SnapshotCaches,
     detail: bool,
     io_elapsed: f32,
-) -> (Vec<ProcInfo>, HashMap<u32, u64>, u64) {
+) -> (HashMap<u32, u64>, u64) {
     let mut new_times: HashMap<u32, u64> = HashMap::new();
-    let mut snapshot: Vec<ProcInfo> = Vec::new();
+    snapshot.clear();
 
     let sys_total = read_sys_cpu_total();
     let sys_delta = sys_total.saturating_sub(prev_sys_total) as f32;
@@ -1265,7 +1283,7 @@ fn collect_snapshot(
                 let cmdline = crate::fast_proc::read_cmdline(pid, &mut cmd_buf);
                 let entry = ProcMeta {
                     start_time: stat.starttime,
-                    name: utils::resolve_name(&stat.comm, &cmdline),
+                    name: utils::resolve_name(&stat.comm, &cmdline).into(),
                     cmdline: std::sync::Arc::new(cmdline.join(" ")),
                 };
                 caches.meta.entry(pid).insert_entry(entry).into_mut()
@@ -1288,8 +1306,8 @@ fn collect_snapshot(
         let nice = stat.nice;
 
         let (affinity, ionice, disk_read_bps, disk_write_bps) = if detail {
-            let affinity = utils::get_affinity_str(pid);
-            let ionice = read_ionice(pid);
+            let affinity: std::sync::Arc<str> = utils::get_affinity_str(pid).into();
+            let ionice: std::sync::Arc<str> = read_ionice(pid).into();
             let (r, w) = read_proc_io(pid, &mut caches.io, io_elapsed);
             caches
                 .display
@@ -1298,7 +1316,7 @@ fn collect_snapshot(
         } else {
             match caches.display.get(&pid) {
                 Some((a, i)) => (a.clone(), i.clone(), 0, 0),
-                None => (String::new(), String::new(), 0, 0),
+                None => ("".into(), "".into(), 0, 0),
             }
         };
 
@@ -1318,13 +1336,23 @@ fn collect_snapshot(
         });
     }
 
-    (snapshot, new_times, sys_total)
+    (new_times, sys_total)
 }
 fn read_proc_io(pid: u32, io_cache: &mut HashMap<u32, (u64, u64)>, elapsed: f32) -> (u64, u64) {
-    let text = match std::fs::read_to_string(format!("/proc/{pid}/io")) {
-        Ok(t) => t,
-        Err(_) => return (0, 0),
+    let mut buf = [0u8; 512];
+    let text = if let Ok(mut f) = std::fs::File::open(format!("/proc/{pid}/io")) {
+        use std::io::Read;
+        if let Ok(n) = f.read(&mut buf) {
+            std::str::from_utf8(&buf[..n]).unwrap_or("")
+        } else {
+            ""
+        }
+    } else {
+        ""
     };
+    if text.is_empty() {
+        return (0, 0);
+    }
     let mut read_bytes = 0u64;
     let mut write_bytes = 0u64;
     for line in text.lines() {

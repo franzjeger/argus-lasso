@@ -21,7 +21,9 @@ pub struct Sensor {
     pub max: f32,
     avg_sum: f64,
     avg_count: u64,
-    pub history: VecDeque<f32>,
+    pub history: [f32; HISTORY_LEN],
+    pub history_start: usize,
+    pub history_len: usize,
 }
 
 impl Default for Sensor {
@@ -34,7 +36,9 @@ impl Default for Sensor {
             max: f32::MIN,
             avg_sum: 0.0,
             avg_count: 0,
-            history: VecDeque::with_capacity(HISTORY_LEN + 1),
+            history: [0.0; HISTORY_LEN],
+            history_start: 0,
+            history_len: 0,
         }
     }
 }
@@ -66,10 +70,22 @@ impl Sensor {
         }
         self.avg_sum += value as f64;
         self.avg_count += 1;
-        self.history.push_back(value);
-        while self.history.len() > HISTORY_LEN {
-            self.history.pop_front();
+        if self.history_len < HISTORY_LEN {
+            let idx = (self.history_start + self.history_len) % HISTORY_LEN;
+            self.history[idx] = value;
+            self.history_len += 1;
+        } else {
+            self.history[self.history_start] = value;
+            self.history_start = (self.history_start + 1) % HISTORY_LEN;
         }
+    }
+
+    pub fn ordered_history(&self) -> Vec<f32> {
+        let mut res = Vec::with_capacity(self.history_len);
+        for i in 0..self.history_len {
+            res.push(self.history[(self.history_start + i) % HISTORY_LEN]);
+        }
+        res
     }
 
     pub fn avg(&self) -> f32 {
