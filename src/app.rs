@@ -21,6 +21,37 @@ use crate::monitor::{AppState, DaemonCmd};
 use crate::rules::RuleEngine;
 use crate::utils;
 
+/// Throttle live saves while retaining the final change until it is flushed.
+struct PendingConfigSave {
+    last_save: std::time::Instant,
+    dirty: bool,
+}
+
+impl PendingConfigSave {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            last_save: now,
+            dirty: false,
+        }
+    }
+
+    fn remaining(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.dirty
+            .then(|| Self::INTERVAL.saturating_sub(now.duration_since(self.last_save)))
+    }
+
+    fn take_due(&mut self, now: std::time::Instant) -> bool {
+        if self.remaining(now) != Some(std::time::Duration::ZERO) {
+            return false;
+        }
+        self.dirty = false;
+        self.last_save = now;
+        true
+    }
+}
+
 // ── Active tab ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -140,12 +171,7 @@ pub struct ArgusLassoApp {
     events_seen: usize,
     // CPU model string for status bar
     cpu_model: String,
-    // Debounce config saves during column-resize drags: cols_dirty is true on
-    // every frame while a divider is dragged, so saving immediately would
-    // fsync the config ~60×/sec. Persist at most once per 300ms instead.
-    // (The live value is already in shared state each frame; only the disk
-    // write is throttled.)
-    last_disk_save: std::time::Instant,
+    pending_config_save: PendingConfigSave,
     /// Set only by --ui-tour: drives the app through every screen, capturing
     /// each, then exits. None in every normal run.
     tour: Option<crate::ui_tour::Tour>,
@@ -263,24 +289,8 @@ impl ArgusLassoApp {
             }),
             events_seen: 0,
             cpu_model,
-            last_disk_save: std::time::Instant::now(),
+            pending_config_save: PendingConfigSave::new(std::time::Instant::now()),
         }
-    }
-
-    /// Debounce gate shared by every "live" config save (column resizing,
-    /// opacity/theme dragging): the dirty flag/changed check is true on every
-    /// frame the value is still moving (including the release frame that
-    /// applies the final delta), so saving immediately would fsync the
-    /// config ~60×/sec. Allow at most one save per 300ms across all of them;
-    /// the live value is already in shared state each frame regardless, so
-    /// throttling only the disk write loses nothing.
-    fn disk_save_due(&mut self) -> bool {
-        let now = std::time::Instant::now();
-        if now.duration_since(self.last_disk_save) < std::time::Duration::from_millis(300) {
-            return false;
-        }
-        self.last_disk_save = now;
-        true
     }
 
     fn send(&self, cmd: DaemonCmd) {
@@ -421,6 +431,9 @@ impl eframe::App for ArgusLassoApp {
         // Closing the window exits the whole process (daemon included) — ask
         // the daemon to restore nices/throttles/parked CPUs and wait briefly.
         crate::monitor::shutdown_and_wait(&self.state, &self.cmd_tx);
+        if self.pending_config_save.dirty {
+            self.save_config();
+        }
     }
 
     /// 0.34 makes `ui` the required entry point and deprecates `update`.
@@ -1063,14 +1076,12 @@ impl eframe::App for ArgusLassoApp {
                         self.active_tab = Tab::Rules;
                     }
                     // Persist col_widths when user drags a column divider
-                    // (debounced — see disk_save_due).
+                    // (the pending save is flushed independently of the active tab).
                     if self.process_tab.cols_dirty {
                         if let Ok(mut s) = self.state.lock() {
                             s.config.ui.col_widths = self.process_tab.col_widths.clone();
                         }
-                        if self.disk_save_due() {
-                            self.save_config();
-                        }
+                        self.pending_config_save.dirty = true;
                     }
                     // Persist column visibility from the header context menu
                     if self.process_tab.hidden_dirty {
@@ -1162,9 +1173,7 @@ impl eframe::App for ArgusLassoApp {
                         if let Ok(mut s) = self.state.lock() {
                             s.config.ui.hw_mon_col_widths = widths;
                         }
-                        if self.disk_save_due() {
-                            self.save_config();
-                        }
+                        self.pending_config_save.dirty = true;
                     }
                 }
 
@@ -1253,9 +1262,7 @@ impl eframe::App for ArgusLassoApp {
                         // egui reports a changed value on every frame of a
                         // slider drag, so saving unconditionally here would
                         // fsync the config on every one of those frames.
-                        if self.disk_save_due() {
-                            self.save_config();
-                        }
+                        self.pending_config_save.dirty = true;
                     }
                 }
 
@@ -1289,6 +1296,15 @@ impl eframe::App for ArgusLassoApp {
                 }
             }
         });
+
+        // Flush even after a slider stops moving or the user switches tabs.
+        let now = std::time::Instant::now();
+        if self.pending_config_save.take_due(now) {
+            self.save_config();
+        }
+        if let Some(delay) = self.pending_config_save.remaining(now) {
+            ctx.request_repaint_after(delay);
+        }
 
         // ── --ui-tour capture ───────────────────────────────────────────────
         // Last thing in the frame: the screen is fully laid out by now, so the
@@ -1326,6 +1342,9 @@ impl eframe::App for ArgusLassoApp {
         if self.updates.restart_requested {
             self.updates.restart_requested = false;
             crate::monitor::shutdown_and_wait(&self.state, &self.cmd_tx);
+            if self.pending_config_save.dirty {
+                self.save_config();
+            }
             // The daemon has stopped for good by now, so a failed exec leaves
             // the window up but no longer monitoring — say so plainly.
             self.updates.message = format!(
@@ -1346,5 +1365,40 @@ impl eframe::App for ArgusLassoApp {
             config.monitor.display_refresh_interval_ms.max(100)
         };
         ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingConfigSave;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn live_save_flushes_final_change_without_another_edit() {
+        let start = Instant::now();
+        let mut save = PendingConfigSave::new(start);
+        save.dirty = true;
+        assert!(save.take_due(start + Duration::from_millis(300)));
+        // The last slider event falls inside the throttle window.
+        save.dirty = true;
+        assert!(!save.take_due(start + Duration::from_millis(350)));
+        assert_eq!(
+            save.remaining(start + Duration::from_millis(350)),
+            Some(Duration::from_millis(250))
+        );
+        // A later frame, without an edit, must still save that last value.
+        assert!(save.take_due(start + Duration::from_millis(600)));
+        assert!(!save.take_due(start + Duration::from_millis(900)));
+        assert_eq!(save.remaining(start + Duration::from_millis(900)), None);
+    }
+
+    #[test]
+    fn edit_immediately_after_startup_remains_pending() {
+        let start = Instant::now();
+        let mut save = PendingConfigSave::new(start);
+        save.dirty = true;
+        assert!(!save.take_due(start));
+        assert!(save.dirty); // Also flushed by the close/restart handlers.
+        assert!(save.take_due(start + PendingConfigSave::INTERVAL));
     }
 }

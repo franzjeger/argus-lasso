@@ -100,6 +100,10 @@ pub fn get_tids(pid: u32) -> Vec<u32> {
 /// Apply CPU affinity to a process AND all its threads via sched_setaffinity(2).
 /// Returns true if at least one thread was set successfully.
 pub fn set_affinity(pid: u32, cpulist: &str) -> bool {
+    apply_affinity(pid, cpulist, false)
+}
+
+fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> bool {
     let cpuset = match cpulist_to_set(cpulist) {
         Ok(s) if !s.is_empty() => s,
         Ok(_) => {
@@ -113,7 +117,7 @@ pub fn set_affinity(pid: u32, cpulist: &str) -> bool {
     };
 
     // Build nix CpuSet
-    use nix::sched::{sched_setaffinity, CpuSet};
+    use nix::sched::{sched_getaffinity, sched_setaffinity, CpuSet};
     use nix::unistd::Pid;
 
     let mut cpu_set = CpuSet::new();
@@ -126,6 +130,12 @@ pub fn set_affinity(pid: u32, cpulist: &str) -> bool {
     let tids = get_tids(pid);
     let mut any_ok = false;
     for tid in tids {
+        // Affinity belongs to each thread, not to the process as a whole.
+        if only_changed
+            && sched_getaffinity(Pid::from_raw(tid as i32)).is_ok_and(|current| current == cpu_set)
+        {
+            continue;
+        }
         match sched_setaffinity(Pid::from_raw(tid as i32), &cpu_set) {
             Ok(_) => {
                 any_ok = true;
@@ -141,19 +151,10 @@ pub fn set_affinity(pid: u32, cpulist: &str) -> bool {
     any_ok
 }
 
-/// set_affinity(), but a no-op (returning false, without touching the
-/// process) when the process is already on `cpulist` — comparing as sets so
-/// equivalent-but-differently-formatted cpulists don't cause needless
-/// syscalls or "changed" reports. Was previously reimplemented ad hoc at
-/// three call sites with two different behaviours (rules.rs dirty-checked,
-/// monitor.rs's two default-affinity sites didn't); a periodic
-/// ReapplyDefaults loops this over every known process, so skipping the
-/// syscall (and the caller's log line) when nothing would actually change
-/// matters there in particular.
+/// Apply affinity to every thread whose CPU mask differs from `cpulist`.
+/// Returns true if at least one differing thread was updated successfully.
 pub fn set_affinity_if_changed(pid: u32, cpulist: &str) -> bool {
-    let target = cpulist_to_set(cpulist).unwrap_or_default();
-    let current = cpulist_to_set(&get_affinity_str(pid)).unwrap_or_default();
-    current != target && set_affinity(pid, cpulist)
+    apply_affinity(pid, cpulist, true)
 }
 
 /// Read current affinity of the main thread as a cpulist string.
@@ -590,17 +591,59 @@ pub(crate) static PROCESS_NICE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mute
 mod tests {
     use super::*;
 
-    /// The whole point of set_affinity_if_changed: asking for the affinity a
-    /// process already has must be a no-op, without ever calling
-    /// sched_setaffinity — real breadth-of-effect testing of the "actually
-    /// changes something" branch is left to set_affinity's own behaviour
-    /// (unchanged by this helper) since it would affect every other test
-    /// sharing this process.
     #[test]
-    fn set_affinity_if_changed_is_a_noop_when_already_on_target() {
+    fn affinity_updates_worker_even_when_main_thread_matches() {
+        const CHILD_ENV: &str = "ARGUS_AFFINITY_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Isolate process-wide changes from the other test harness threads.
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "utils::tests::affinity_updates_worker_even_when_main_thread_matches",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        use nix::sched::{sched_getaffinity, sched_setaffinity, CpuSet};
+        use nix::unistd::Pid;
         let pid = std::process::id();
-        let current = get_affinity_str(pid);
-        assert!(!set_affinity_if_changed(pid, &current));
+        let available = cpulist_to_set(&get_affinity_str(pid)).unwrap();
+        if available.len() < 2 {
+            eprintln!("affinity regression test requires two available CPUs");
+            return;
+        }
+        let mut cpus = available.into_iter();
+        let target_cpu = cpus.next().unwrap();
+        let other_cpu = cpus.next().unwrap();
+        let mut target = CpuSet::new();
+        target.set(target_cpu as usize).unwrap();
+        sched_setaffinity(Pid::from_raw(pid as i32), &target).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut other = CpuSet::new();
+            other.set(other_cpu as usize).unwrap();
+            sched_setaffinity(Pid::from_raw(0), &other).unwrap();
+            ready_tx.send(()).unwrap();
+            done_rx.recv().unwrap();
+            assert_eq!(sched_getaffinity(Pid::from_raw(0)).unwrap(), target);
+        });
+        ready_rx.recv().unwrap();
+        assert_eq!(get_affinity_str(pid), target_cpu.to_string());
+        assert!(set_affinity_if_changed(pid, &target_cpu.to_string()));
+        assert!(!set_affinity_if_changed(pid, &target_cpu.to_string()));
+        done_tx.send(()).unwrap();
+        worker.join().unwrap();
     }
 
     #[test]
