@@ -577,6 +577,15 @@ fn csv_field(s: &str) -> String {
     }
 }
 
+/// Guards tests (here and in cpu_park.rs/rules.rs) that change this test
+/// binary's own process-wide nice value via a real setpriority(2) syscall.
+/// PRIO_PROCESS affects every thread in the process, and the default test
+/// harness runs all tests as threads in one process — two such tests
+/// running concurrently race on the same live value otherwise. Take this
+/// lock for the duration of any test that actually renices its own pid.
+#[cfg(test)]
+pub(crate) static PROCESS_NICE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1059,6 +1059,12 @@ mod tests {
     /// hand-rolled /proc/<pid>/stat field parsing against fast_proc's.
     #[test]
     fn renice_succeeds_when_start_ticks_matches() {
+        // This test actually renices the test binary's own process (unlike
+        // its sibling above, which is refused before reaching renice) — see
+        // PROCESS_NICE_TEST_LOCK's doc comment for why that needs
+        // serializing against other tests doing the same (rules.rs's
+        // apply_rules_lets_a_later_rule_override_..).
+        let _guard = crate::utils::PROCESS_NICE_TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::MetadataExt;
         let script = stage_script("renice-start-match", RENICE_SCRIPT);
         let my_pid = std::process::id();

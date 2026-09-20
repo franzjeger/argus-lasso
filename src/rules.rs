@@ -518,6 +518,10 @@ mod tests {
     /// restores the original nice value afterward.
     #[test]
     fn apply_rules_lets_a_later_rule_override_an_earlier_ones_nice_in_the_same_pass() {
+        // This test renices the test binary's own process — see the lock's
+        // own doc comment for why that needs serializing against sibling
+        // tests that do the same (cpu_park.rs's renice_succeeds_when_..).
+        let _guard = utils::PROCESS_NICE_TEST_LOCK.lock().unwrap();
         let pid = std::process::id();
         let starting = utils::get_nice(pid).unwrap_or(0);
         let bumped = if starting == 1 { 2 } else { 1 };

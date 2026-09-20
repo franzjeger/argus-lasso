@@ -806,7 +806,10 @@ mod tests {
             Ok(())
         });
         assert!(result.is_ok());
-        assert!(!fallback_called.get(), "fallback must not run when nothing failed");
+        assert!(
+            !fallback_called.get(),
+            "fallback must not run when nothing failed"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

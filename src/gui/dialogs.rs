@@ -838,7 +838,8 @@ impl RuleEditDialog {
                                     // diverge like that.
                                     let affinity_would_be_empty =
                                         *affinity_enabled && picker.cpulist().is_empty();
-                                    let can_save = !rule.pattern.is_empty() && !affinity_would_be_empty;
+                                    let can_save =
+                                        !rule.pattern.is_empty() && !affinity_would_be_empty;
                                     if ui.add_enabled(can_save, save).clicked() {
                                         close_as = Some(true);
                                     }

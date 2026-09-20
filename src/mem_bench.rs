@@ -542,7 +542,10 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("argus-mem-bench-test-{name}-{}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "argus-mem-bench-test-{name}-{}",
+            std::process::id()
+        ))
     }
 
     /// The bug this test exists for: a real L3 at or under the 32 MiB

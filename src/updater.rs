@@ -377,8 +377,9 @@ fn verify_staged_binary_is_an_upgrade(staged: &Path) -> Result<(), String> {
         .output()
         .map_err(|e| format!("could not run the downloaded build to check its version: {e}"))?;
     if !output.status.success() {
-        return Err("the downloaded build did not respond to --version; refusing to install"
-            .to_string());
+        return Err(
+            "the downloaded build did not respond to --version; refusing to install".to_string(),
+        );
     }
     check_reported_version_is_an_upgrade(&String::from_utf8_lossy(&output.stdout))
 }
@@ -791,10 +792,7 @@ mod tests {
     #[test]
     fn refuses_a_reported_version_older_than_this_one() {
         let err = check_reported_version_is_an_upgrade("argus-lasso 0.0.1").unwrap_err();
-        assert!(
-            err.contains("not newer"),
-            "unexpected error message: {err}"
-        );
+        assert!(err.contains("not newer"), "unexpected error message: {err}");
     }
 
     #[test]
@@ -821,10 +819,8 @@ mod tests {
     /// target path must not have its target overwritten.
     #[test]
     fn create_new_exclusive_refuses_to_follow_a_pre_planted_symlink() {
-        let dir = std::env::temp_dir().join(format!(
-            "argus-updater-symlink-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("argus-updater-symlink-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let victim = dir.join("victim.txt");
         std::fs::write(&victim, b"original contents").unwrap();

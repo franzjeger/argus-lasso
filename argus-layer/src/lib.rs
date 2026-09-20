@@ -557,7 +557,11 @@ pub unsafe extern "system" fn argus_vkCreateDevice(
     guard(
         "vkCreateDevice",
         std::panic::AssertUnwindSafe(|| {
-            let instance = match PHYS_TO_INST.read_or_recover().get(&physical_device).copied() {
+            let instance = match PHYS_TO_INST
+                .read_or_recover()
+                .get(&physical_device)
+                .copied()
+            {
                 Some(i) => i,
                 None => return vk::Result::ERROR_INITIALIZATION_FAILED,
             };
@@ -581,7 +585,8 @@ pub unsafe extern "system" fn argus_vkCreateDevice(
                                 *const ash::vk::DeviceCreateInfo<'a>,
                                 *const ash::vk::AllocationCallbacks<'b>,
                                 *mut ash::vk::Device,
-                            ) -> ash::vk::Result,
+                            )
+                                -> ash::vk::Result,
                         >(p),
                         None => return vk::Result::ERROR_INITIALIZATION_FAILED,
                     };
@@ -798,7 +803,11 @@ pub unsafe extern "system" fn argus_vkCreateSwapchainKHR(
                 }
             };
 
-            let instance = match PHYS_TO_INST.read_or_recover().get(&physical_device).copied() {
+            let instance = match PHYS_TO_INST
+                .read_or_recover()
+                .get(&physical_device)
+                .copied()
+            {
                 Some(i) => i,
                 None => return vk::Result::ERROR_INITIALIZATION_FAILED,
             };
@@ -850,7 +859,9 @@ pub unsafe extern "system" fn argus_vkCreateSwapchainKHR(
                 || ci.image_array_layers != 1
                 || ci.flags.contains(vk::SwapchainCreateFlagsKHR::PROTECTED)
             {
-                eprintln!("[Argus-Layer] HUD skipped: unsupported swapchain usage/layers/protection");
+                eprintln!(
+                    "[Argus-Layer] HUD skipped: unsupported swapchain usage/layers/protection"
+                );
                 return vk::Result::SUCCESS;
             }
             // Get swapchain images
@@ -1110,7 +1121,8 @@ pub unsafe extern "system" fn argus_vkGetDeviceQueue2(
                             for<'a> unsafe extern "system" fn(
                                 ash::vk::Queue,
                                 *const ash::vk::PresentInfoKHR<'a>,
-                            ) -> ash::vk::Result,
+                            )
+                                -> ash::vk::Result,
                         >(ptr),
                     );
                 }
@@ -1185,51 +1197,55 @@ pub unsafe extern "system" fn vkGetInstanceProcAddr(
                 b"vkGetInstanceProcAddr" => Some(std::mem::transmute::<
                     *const (),
                     unsafe extern "system" fn(),
-                >(vkGetInstanceProcAddr as *const ())),
-                b"vkGetDeviceProcAddr" => Some(
-                    std::mem::transmute::<*const (), unsafe extern "system" fn()>(
-                        vkGetDeviceProcAddr as *const (),
-                    ),
-                ),
-                b"vkGetDeviceQueue2" => Some(
-                    std::mem::transmute::<*const (), unsafe extern "system" fn()>(
-                        argus_vkGetDeviceQueue2 as *const (),
-                    ),
-                ),
+                >(
+                    vkGetInstanceProcAddr as *const ()
+                )),
+                b"vkGetDeviceProcAddr" => Some(std::mem::transmute::<
+                    *const (),
+                    unsafe extern "system" fn(),
+                >(vkGetDeviceProcAddr as *const ())),
+                b"vkGetDeviceQueue2" => Some(std::mem::transmute::<
+                    *const (),
+                    unsafe extern "system" fn(),
+                >(
+                    argus_vkGetDeviceQueue2 as *const ()
+                )),
                 b"vkDestroySwapchainKHR" => Some(std::mem::transmute::<
                     *const (),
                     unsafe extern "system" fn(),
-                >(argus_vkDestroySwapchainKHR as *const ())),
-                b"vkCreateInstance" => Some(
-                    std::mem::transmute::<*const (), unsafe extern "system" fn()>(
-                        argus_vkCreateInstance as *const (),
-                    ),
-                ),
+                >(
+                    argus_vkDestroySwapchainKHR as *const ()
+                )),
+                b"vkCreateInstance" => Some(std::mem::transmute::<
+                    *const (),
+                    unsafe extern "system" fn(),
+                >(argus_vkCreateInstance as *const ())),
                 b"vkEnumeratePhysicalDevices" => Some(std::mem::transmute::<
                     *const (),
                     unsafe extern "system" fn(),
                 >(
-                    argus_vkEnumeratePhysicalDevices as *const ()
+                    argus_vkEnumeratePhysicalDevices as *const (),
                 )),
-                b"vkGetDeviceQueue" => Some(
-                    std::mem::transmute::<*const (), unsafe extern "system" fn()>(
-                        argus_vkGetDeviceQueue as *const (),
-                    ),
-                ),
+                b"vkGetDeviceQueue" => Some(std::mem::transmute::<
+                    *const (),
+                    unsafe extern "system" fn(),
+                >(argus_vkGetDeviceQueue as *const ())),
                 b"vkCreateSwapchainKHR" => Some(std::mem::transmute::<
                     *const (),
                     unsafe extern "system" fn(),
-                >(argus_vkCreateSwapchainKHR as *const ())),
-                b"vkQueuePresentKHR" => Some(
-                    std::mem::transmute::<*const (), unsafe extern "system" fn()>(
-                        argus_vkQueuePresentKHR as *const (),
-                    ),
-                ),
-                b"vkCreateDevice" => Some(
-                    std::mem::transmute::<*const (), unsafe extern "system" fn()>(
-                        argus_vkCreateDevice as *const (),
-                    ),
-                ),
+                >(
+                    argus_vkCreateSwapchainKHR as *const ()
+                )),
+                b"vkQueuePresentKHR" => Some(std::mem::transmute::<
+                    *const (),
+                    unsafe extern "system" fn(),
+                >(
+                    argus_vkQueuePresentKHR as *const ()
+                )),
+                b"vkCreateDevice" => Some(std::mem::transmute::<
+                    *const (),
+                    unsafe extern "system" fn(),
+                >(argus_vkCreateDevice as *const ())),
                 _ => {
                     if let Some(next) = get_next_gipa() {
                         next(instance, p_name)
@@ -1264,34 +1280,38 @@ pub unsafe extern "system" fn vkGetDeviceProcAddr(
             let name = CStr::from_ptr(p_name);
 
             match name.to_bytes() {
-                b"vkGetDeviceProcAddr" => Some(
-                    std::mem::transmute::<*const (), unsafe extern "system" fn()>(
-                        vkGetDeviceProcAddr as *const (),
-                    ),
-                ),
-                b"vkGetDeviceQueue2" => Some(
-                    std::mem::transmute::<*const (), unsafe extern "system" fn()>(
-                        argus_vkGetDeviceQueue2 as *const (),
-                    ),
-                ),
+                b"vkGetDeviceProcAddr" => Some(std::mem::transmute::<
+                    *const (),
+                    unsafe extern "system" fn(),
+                >(vkGetDeviceProcAddr as *const ())),
+                b"vkGetDeviceQueue2" => Some(std::mem::transmute::<
+                    *const (),
+                    unsafe extern "system" fn(),
+                >(
+                    argus_vkGetDeviceQueue2 as *const ()
+                )),
                 b"vkDestroySwapchainKHR" => Some(std::mem::transmute::<
                     *const (),
                     unsafe extern "system" fn(),
-                >(argus_vkDestroySwapchainKHR as *const ())),
-                b"vkGetDeviceQueue" => Some(
-                    std::mem::transmute::<*const (), unsafe extern "system" fn()>(
-                        argus_vkGetDeviceQueue as *const (),
-                    ),
-                ),
+                >(
+                    argus_vkDestroySwapchainKHR as *const ()
+                )),
+                b"vkGetDeviceQueue" => Some(std::mem::transmute::<
+                    *const (),
+                    unsafe extern "system" fn(),
+                >(argus_vkGetDeviceQueue as *const ())),
                 b"vkCreateSwapchainKHR" => Some(std::mem::transmute::<
                     *const (),
                     unsafe extern "system" fn(),
-                >(argus_vkCreateSwapchainKHR as *const ())),
-                b"vkQueuePresentKHR" => Some(
-                    std::mem::transmute::<*const (), unsafe extern "system" fn()>(
-                        argus_vkQueuePresentKHR as *const (),
-                    ),
-                ),
+                >(
+                    argus_vkCreateSwapchainKHR as *const ()
+                )),
+                b"vkQueuePresentKHR" => Some(std::mem::transmute::<
+                    *const (),
+                    unsafe extern "system" fn(),
+                >(
+                    argus_vkQueuePresentKHR as *const ()
+                )),
                 _ => {
                     let next_gdpa = DEVICE_GDPA.read_or_recover().get(&device).copied();
                     if let Some(next) = next_gdpa {
