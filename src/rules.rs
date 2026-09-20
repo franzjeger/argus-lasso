@@ -508,30 +508,37 @@ mod tests {
     /// to dirty-check every rule against the snapshot taken *before* the
     /// loop, instead of re-checking against what an earlier rule in the same
     /// pass just set (the way the affinity check re-reads from the OS every
-    /// iteration). Two enabled rules on the same process, second one setting
-    /// nice back to the pre-pass value, reproduces it: under the bug, the
-    /// second rule wrongly compared against the stale snapshot and never
-    /// fired at all, silently leaving the process on the first rule's value.
+    /// iteration).
     ///
-    /// Targets this test process's own pid with small, always-permitted
-    /// non-negative nice values — no elevated privilege needed — and
-    /// restores the original nice value afterward.
+    /// Both rules here target the *same* raised nice value. Under the fix,
+    /// rule 2 sees rule 1's just-applied live value, recognizes its own
+    /// target is already met, and skips — one action. Under the bug, rule 2
+    /// compares against the frozen pre-pass snapshot (which does differ from
+    /// its target) and wrongly fires a second, redundant syscall — two
+    /// actions. This deliberately never asks the process to *lower* its own
+    /// nice value (not even back to where it started): setpriority(2) lets
+    /// an unprivileged process always raise its own nice value, but lowering
+    /// it — even back to a value it held a moment ago — is governed by
+    /// RLIMIT_NICE, which a locked-down CI runner enforces far more strictly
+    /// than a typical desktop session. An earlier version of this test raised
+    /// nice and then tried to restore the original value, which passed
+    /// locally but failed deterministically in CI for exactly that reason.
     #[test]
-    fn apply_rules_lets_a_later_rule_override_an_earlier_ones_nice_in_the_same_pass() {
+    fn apply_rules_lets_a_later_rule_see_an_earlier_ones_just_applied_nice() {
         // This test renices the test binary's own process — see the lock's
         // own doc comment for why that needs serializing against sibling
         // tests that do the same (cpu_park.rs's renice_succeeds_when_..).
         let _guard = utils::PROCESS_NICE_TEST_LOCK.lock().unwrap();
         let pid = std::process::id();
         let starting = utils::get_nice(pid).unwrap_or(0);
-        let bumped = if starting == 1 { 2 } else { 1 };
+        let target = starting + 1;
 
         let mut rule1 = rule_with("apply-rules-staleness-test", "contains");
         rule1.rule_id = "r1".into();
-        rule1.nice = Some(bumped);
+        rule1.nice = Some(target);
         let mut rule2 = rule_with("apply-rules-staleness-test", "contains");
         rule2.rule_id = "r2".into();
-        rule2.nice = Some(starting);
+        rule2.nice = Some(target);
 
         let mut nice_failed = std::collections::HashSet::new();
         let actions = apply_rules(
@@ -545,19 +552,17 @@ mod tests {
         );
 
         let ended_at = utils::get_nice(pid);
-        // Always put it back, pass or fail.
+        // Best-effort cleanup only: lowering back to `starting` is exactly
+        // the operation this test avoids relying on, so don't assert on it.
         let _ = utils::set_nice(pid, starting);
 
         assert_eq!(
             actions.len(),
-            2,
-            "both rules should have applied a nice change: {actions:?}"
+            1,
+            "the second rule must recognize its target is already met via \
+             the first rule's live change, not re-fire against a stale \
+             snapshot: {actions:?}"
         );
-        assert_eq!(
-            ended_at,
-            Some(starting),
-            "the second rule must win and restore the pre-pass value, not get \
-             silently skipped for comparing against a stale snapshot"
-        );
+        assert_eq!(ended_at, Some(target));
     }
 }

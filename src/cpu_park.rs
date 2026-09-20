@@ -1072,11 +1072,21 @@ mod tests {
         let real_start = crate::fast_proc::read_stat(my_pid, &mut [0u8; 1024])
             .expect("read our own /proc/self/stat")
             .starttime;
-        // nice 0 on ourselves is a harmless no-op, not a real priority
-        // change, and needs no elevated privilege to succeed.
+        // Renice to whatever our nice value already is: a genuine no-op
+        // regardless of what any other test has done to it, so this never
+        // needs to raise (requires CAP_SYS_NICE) or lower (governed by
+        // RLIMIT_NICE, and not guaranteed even back to a value this same
+        // process held a moment ago) our own priority — see
+        // PROCESS_NICE_TEST_LOCK's doc comment and rules.rs's staleness
+        // regression test for why a hardcoded target bit us here before.
+        let current_nice = crate::utils::get_nice(my_pid).unwrap_or(0);
         let code = run(
             &script,
-            &["0", &my_pid.to_string(), &real_start.to_string()],
+            &[
+                &current_nice.to_string(),
+                &my_pid.to_string(),
+                &real_start.to_string(),
+            ],
             Some(&my_uid.to_string()),
         );
         assert_eq!(code, 0, "renice must succeed when start_ticks matches");
