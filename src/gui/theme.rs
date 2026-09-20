@@ -1127,22 +1127,10 @@ pub fn apply(ctx: &Context, native_ppp: f32) {
 
     style.visuals = vis;
 
-    // ── Typography ───────────────────────────────────────────────────────
-    style.text_styles = {
-        use egui::TextStyle::*;
-        [
-            (Small, FontId::proportional(12.0)),
-            (Body, FontId::proportional(14.0)),
-            (Button, FontId::proportional(14.0)),
-            (Heading, FontId::proportional(16.0)),
-            (Monospace, FontId::monospace(13.0)),
-        ]
-        .into()
-    };
-
-    // ── Spacing — comfortable row height ─────────────────────────────────
-    style.spacing.interact_size.y = 24.0;
-    style.spacing.item_spacing = egui::vec2(8.0, 4.0);
+    // Text styles and interact_size/item_spacing are NOT set here: they're
+    // tokens:: values apply_theme() applies uniformly to every theme right
+    // after calling this function, so setting a different value here would
+    // be dead on arrival.
     style.spacing.scroll = scroll_style();
 
     // ── Striped table — more visible alt row ─────────────────────────────
@@ -1224,20 +1212,10 @@ pub fn apply_light(ctx: &Context, native_ppp: f32) {
 
     style.visuals = vis;
 
-    style.text_styles = {
-        use egui::TextStyle::*;
-        [
-            (Small, FontId::proportional(12.0)),
-            (Body, FontId::proportional(14.0)),
-            (Button, FontId::proportional(14.0)),
-            (Heading, FontId::proportional(16.0)),
-            (Monospace, FontId::monospace(13.0)),
-        ]
-        .into()
-    };
-
-    style.spacing.interact_size.y = 24.0;
-    style.spacing.item_spacing = egui::vec2(8.0, 4.0);
+    // Text styles and interact_size/item_spacing are NOT set here: they're
+    // tokens:: values apply_theme() applies uniformly to every theme right
+    // after calling this function, so setting a different value here would
+    // be dead on arrival.
     style.spacing.scroll = scroll_style();
     // Striped table alternate row — explicitly set after visuals assignment
     style.visuals.faint_bg_color = alt_base;
@@ -1339,20 +1317,10 @@ pub fn apply_adwaita(ctx: &Context, native_ppp: f32, dark: bool) {
 
     style.visuals = vis;
 
-    style.text_styles = {
-        use egui::TextStyle::*;
-        [
-            (Small, FontId::proportional(12.0)),
-            (Body, FontId::proportional(14.0)),
-            (Button, FontId::proportional(14.0)),
-            (Heading, FontId::proportional(16.0)),
-            (Monospace, FontId::monospace(13.0)),
-        ]
-        .into()
-    };
-
-    style.spacing.interact_size.y = 24.0;
-    style.spacing.item_spacing = egui::vec2(8.0, 4.0);
+    // Text styles and interact_size/item_spacing are NOT set here: they're
+    // tokens:: values apply_theme() applies uniformly to every theme right
+    // after calling this function, so setting a different value here would
+    // be dead on arrival.
     style.spacing.scroll = scroll_style();
     style.visuals.faint_bg_color = alt_base;
 

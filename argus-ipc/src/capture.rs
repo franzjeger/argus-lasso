@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::{
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Read},
     path::PathBuf,
 };
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -83,7 +83,7 @@ pub fn toggle(duration_seconds: u32) -> io::Result<Control> {
     fs::rename(temp, dir.join("control.json"))?;
     Ok(c)
 }
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Summary {
     pub schema: u32,
     pub metric: String,
@@ -119,6 +119,25 @@ pub fn statistics(intervals_ns: &mut [u64]) -> (Option<f64>, Option<f64>, Option
         Some(intervals_ns[(99 * n).div_ceil(100) - 1] as f64 / 1e6),
     )
 }
+/// Summary files are written by the in-process recorder running inside the
+/// game (argus-layer), the less-trusted side of this boundary — a compromised
+/// or simply buggy game binary can drop an arbitrarily large file at this
+/// same-uid-writable path. A real Summary is a handful of scalars and short
+/// strings, nowhere near this size; capping the *read* (not just checking the
+/// size after) means a huge file costs at most one bounded allocation to
+/// reject, not an attempt to load the whole thing into memory.
+const MAX_SUMMARY_BYTES: u64 = 64 * 1024;
+
+fn read_summary_capped(path: &std::path::Path) -> Option<Summary> {
+    let mut buf = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_SUMMARY_BYTES)
+        .read_to_end(&mut buf)
+        .ok()?;
+    serde_json::from_slice(&buf).ok()
+}
+
 pub fn load_summaries() -> Vec<(PathBuf, Summary)> {
     let mut paths: Vec<_> = fs::read_dir(directory())
         .into_iter()
@@ -135,17 +154,66 @@ pub fn load_summaries() -> Vec<(PathBuf, Summary)> {
     paths.truncate(30);
     paths
         .into_iter()
-        .filter_map(|p| {
-            File::open(&p)
-                .ok()
-                .and_then(|f| serde_json::from_reader(f).ok())
-                .map(|s| (p, s))
-        })
+        .filter_map(|p| read_summary_capped(&p).map(|s| (p, s)))
         .collect()
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("{name}-{}", std::process::id()))
+    }
+
+    /// A real Summary is a handful of scalars and short strings; this proves
+    /// the cap doesn't get in the way of an ordinary, legitimately-sized one.
+    #[test]
+    fn read_summary_capped_accepts_a_normal_summary() {
+        let path = temp_path("argus-ipc-summary-ok");
+        let summary = Summary {
+            schema: 1,
+            metric: "fps".into(),
+            build: "1.0.0".into(),
+            session: "12345".into(),
+            pid: 42,
+            executable: "/usr/bin/game".into(),
+            swapchain: 7,
+            frames: 1000,
+            duration_seconds: 60.0,
+            average_fps: Some(120.0),
+            low_1_fps: Some(90.0),
+            p99_frametime_ms: Some(11.0),
+            dropped_samples: 0,
+            failed_presents: 0,
+            complete: true,
+        };
+        std::fs::write(&path, serde_json::to_vec(&summary).unwrap()).unwrap();
+        assert_eq!(read_summary_capped(&path), Some(summary));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The whole point of the cap: a file from the less-trusted side of this
+    /// boundary (the in-process recorder running inside the game) far larger
+    /// than any real Summary must be rejected without ever being fully
+    /// buffered or parsed as one giant JSON value.
+    #[test]
+    fn read_summary_capped_rejects_an_oversized_file() {
+        let path = temp_path("argus-ipc-summary-huge");
+        // Well past MAX_SUMMARY_BYTES, and not valid JSON once truncated to
+        // it either way.
+        let huge = format!("{{\"metric\":\"{}", "x".repeat(200_000));
+        std::fs::write(&path, &huge).unwrap();
+        assert_eq!(read_summary_capped(&path), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_summary_capped_returns_none_for_a_missing_file() {
+        let path = temp_path("argus-ipc-summary-missing");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(read_summary_capped(&path), None);
+    }
+
     #[test]
     fn explicit_low_definition_and_empty_capture() {
         assert_eq!(statistics(&mut []), (None, None, None));

@@ -155,15 +155,24 @@ impl ActionHandler {
                     }
                     survivors.push(t);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                for &t in &survivors {
-                    if let Err(nix::Error::ESRCH) =
-                        signal::kill(Pid::from_raw(t as i32), Signal::SIGKILL)
-                    {
-                        continue;
+                // Force-kill anything still alive after a grace period, off
+                // the GUI thread: this ran inline before, blocking every
+                // repaint for 300ms on every "End process and children"
+                // click. The summary below only reflects the SIGTERM pass
+                // either way (the original code didn't track SIGKILL
+                // outcomes separately), so there's nothing this background
+                // sweep needs to report back.
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    for &t in &survivors {
+                        if let Err(nix::Error::ESRCH) =
+                            signal::kill(Pid::from_raw(t as i32), Signal::SIGKILL)
+                        {
+                            continue;
+                        }
+                        let _ = signal::kill(Pid::from_raw(t as i32), Signal::SIGCONT);
                     }
-                    let _ = signal::kill(Pid::from_raw(t as i32), Signal::SIGCONT);
-                }
+                });
                 let msg = format!(
                     "Killed {} of {} processes in tree of {} ({})",
                     killed, count, name, pid

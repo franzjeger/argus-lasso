@@ -636,8 +636,16 @@ fn run_loop(
             ipc.broadcast(&argus_ipc::IpcMessage::Config(
                 config.gaming_mode.overlay.clone(),
             ));
+            // Merge just the field this toggle actually changed into shared
+            // state, not the whole Config: `config` here is this loop's own
+            // mirror, refreshed only by DaemonCmd::UpdateConfig, so it can't
+            // see GUI-only fields (column widths, rules, opacity/theme) the
+            // GUI thread writes directly into s.config between UpdateConfig
+            // calls. Overwriting the whole struct raced those writes and
+            // could silently discard them — including, in the rules case, a
+            // user's just-edited rule definitions on the next config save.
             if let Ok(mut s) = state.lock() {
-                s.config = config.clone();
+                s.config.gaming_mode.overlay = config.gaming_mode.overlay.clone();
             }
             log_cb(format!(
                 "Overlay visibility toggled to {}",
@@ -1571,7 +1579,7 @@ fn apply_new_pid(
             let topo = cpu_park::detect_topology();
             if topo.has_asymmetry() {
                 let preferred_list = utils::cpuset_to_cpulist(&topo.preferred);
-                if utils::set_affinity(pid, &preferred_list) {
+                if utils::set_affinity_if_changed(pid, &preferred_list) {
                     log_cb(format!(
                         "[Gaming Mode] affinity → {} ({}) for {}({})",
                         topo.preferred_label, preferred_list, proc.name, pid
@@ -1582,7 +1590,7 @@ fn apply_new_pid(
     } else {
         // No rule matched — apply default affinity if configured
         if let Some(ref default_aff) = config.cpu.default_affinity {
-            if !default_aff.is_empty() && utils::set_affinity(pid, default_aff) {
+            if !default_aff.is_empty() && utils::set_affinity_if_changed(pid, default_aff) {
                 log_cb(format!(
                     "[Default] affinity={default_aff} → {}({pid})",
                     proc.name
@@ -1675,7 +1683,7 @@ fn reapply_defaults(
         } else {
             false
         };
-        if !matched && utils::set_affinity(pid, &default_aff) {
+        if !matched && utils::set_affinity_if_changed(pid, &default_aff) {
             log_cb(format!("[Default] affinity={default_aff} → {name}({pid})"));
         }
     }

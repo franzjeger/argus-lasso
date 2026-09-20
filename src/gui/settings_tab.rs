@@ -225,351 +225,351 @@ impl SettingsTab {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if self.section == SettingsSection::Processes {
-                // ── Default CPU affinity ──────────────────────────────────────────
-                theme::card(ui, "Default CPU affinity", |ui| {
-                    let help = if self.topo.has_asymmetry() {
-                        format!(
-                            "Applied to every process that doesn't match a specific rule. \
-                     Detected: {}. Typical: Default → {}, Game rule → {}.",
-                            self.topo.kind_label(),
-                            self.topo.non_preferred_label,
-                            self.topo.preferred_label,
-                        )
-                    } else {
-                        "Applied to every process that doesn't match a specific rule.".to_string()
-                    };
-                    help_text(ui, &help);
-                    ui.add_space(tokens::SPACE_S);
-
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.default_affinity_enabled, "Enabled");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.default_affinity_text)
-                                .hint_text("e.g. 8-15,24-31")
-                                .desired_width(130.0)
-                                .interactive(self.default_affinity_enabled),
-                        );
-                        if ui
-                            .add_enabled(
-                                self.default_affinity_enabled,
-                                egui::Button::new("Pick CPUs…"),
+                    // ── Default CPU affinity ──────────────────────────────────────────
+                    theme::card(ui, "Default CPU affinity", |ui| {
+                        let help = if self.topo.has_asymmetry() {
+                            format!(
+                                "Applied to every process that doesn't match a specific rule. \
+                         Detected: {}. Typical: Default → {}, Game rule → {}.",
+                                self.topo.kind_label(),
+                                self.topo.non_preferred_label,
+                                self.topo.preferred_label,
                             )
-                            .clicked()
-                        {
-                            self.cpu_dialog =
-                                Some(AffinityDialog::new(&self.default_affinity_text, "Default"));
-                        }
-                    });
-
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("Quick presets:")
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                        let current = self.default_affinity_text.trim().to_string();
-                        let on = self.default_affinity_enabled;
-                        if self.topo.has_asymmetry() {
-                            let pref = cpuset_to_cpulist(&self.topo.preferred);
-                            let npref = cpuset_to_cpulist(&self.topo.non_preferred);
-                            if theme::chip(
-                                ui,
-                                &self.topo.preferred_button_label(),
-                                on && current == pref,
-                            ) {
-                                self.default_affinity_text = pref;
-                                self.default_affinity_enabled = true;
-                            }
-                            if theme::chip(
-                                ui,
-                                &self.topo.non_preferred_button_label(),
-                                on && current == npref,
-                            ) {
-                                self.default_affinity_text = npref;
-                                self.default_affinity_enabled = true;
-                            }
-                        }
-                        if theme::chip(ui, "All CPU threads", on && current.is_empty()) {
-                            self.default_affinity_text = String::new();
-                            self.default_affinity_enabled = true;
-                        }
-                    });
-                });
-
-                // Handle Pick CPUs dialog
-                if let Some(ref mut dlg) = self.cpu_dialog {
-                    if let Some(result) = dlg.show(ctx, opacity) {
-                        if !result.is_empty() {
-                            self.default_affinity_text = result;
-                        }
-                        self.cpu_dialog = None;
-                    }
-                }
-
-                ui.add_space(tokens::SPACE_M);
-
-                // ── Monitoring ────────────────────────────────────────────────────
-                theme::card(ui, "Monitoring", |ui| {
-                    help_text(
-                        ui,
-                        "How often rules are enforced on running processes, and how often \
-                 the process table refreshes on screen.",
-                    );
-                    ui.add_space(tokens::SPACE_S);
-
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Apply rules every", |ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut self.config.monitor.rule_enforce_interval_ms)
-                                .range(100..=10000)
-                                .suffix(" ms"),
-                        );
-                    });
-
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Refresh process list", |ui| {
-                        const PICKS: [u64; 4] = [500, 1000, 2000, 5000];
-                        let sel = PICKS
-                            .iter()
-                            .position(|ms| *ms == self.config.monitor.display_refresh_interval_ms)
-                            .unwrap_or(usize::MAX);
-                        if let Some(i) = theme::segmented(ui, &["0.5 s", "1 s", "2 s", "5 s"], sel) {
-                            self.config.monitor.display_refresh_interval_ms = PICKS[i];
-                        }
-                    });
-                });
-
-                ui.add_space(tokens::SPACE_M);
-
-                }
-                if self.section == SettingsSection::Appearance {
-                // ── Appearance and power ──────────────────────────────────────────
-                theme::card(ui, "Appearance", |ui| {
-                    help_text(
-                        ui,
-                        "Theme and window opacity are saved immediately. Game overlay appearance is in Gaming → Overlay.",
-                    );
-                    ui.add_space(tokens::SPACE_S);
-
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Theme", |ui| {
-                        let prev_theme = self.theme.clone();
-                        egui::ComboBox::from_id_salt("theme_picker")
-                            .selected_text(self.theme.label())
-                            .show_ui(ui, |ui| {
-                                for t in [
-                                    AppTheme::BreezeDark,
-                                    AppTheme::BreezeLight,
-                                    AppTheme::AdwaitaDark,
-                                    AppTheme::AdwaitaLight,
-                                ] {
-                                    ui.selectable_value(&mut self.theme, t.clone(), t.label());
-                                }
-                            });
-                        if self.theme != prev_theme {
-                            theme::apply_theme(ctx, self.native_ppp, &self.theme);
-                        }
-                    });
-
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Window opacity", |ui| {
-                        // The track is painted with `inactive.bg_fill`, which
-                        // equals the window background — invisible without a
-                        // value fill. Enable the trailing fill (accent colour)
-                        // so the slider reads as a slider, not a floating box.
-                        ui.spacing_mut().slider_width = 200.0;
-                        ui.add(
-                            egui::Slider::new(&mut self.opacity, 0.1f32..=1.0)
-                                .trailing_fill(true)
-                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                                .custom_parser(|s| {
-                                    s.trim_end_matches('%')
-                                        .trim()
-                                        .parse::<f64>()
-                                        .ok()
-                                        .map(|p| p / 100.0)
-                                })
-                                .show_value(true),
-                        );
-                    });
-
-                });
-                }
-                if self.section == SettingsSection::Power {
-                theme::card(ui, "CPU power management", |ui| {
-                    help_text(ui, "Controls CPU frequency policy and the balance between performance and energy use. Changes take effect with Apply changes.");
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Frequency policy (governor)", |ui| {
-                        if self.available_governors.is_empty() {
-                            ui.label(
-                                egui::RichText::new("Unavailable on this system")
-                                    .italics()
-                                    .color(ui.visuals().weak_text_color()),
-                            );
                         } else {
-                            egui::ComboBox::from_id_salt("gov_picker")
-                                .selected_text(&self.cpu_governor)
-                                .show_ui(ui, |ui| {
-                                    for g in &self.available_governors.clone() {
-                                        ui.selectable_value(
-                                            &mut self.cpu_governor,
-                                            g.clone(),
-                                            g.as_str(),
-                                        );
-                                    }
-                                });
-                        }
-                    });
+                            "Applied to every process that doesn't match a specific rule.".to_string()
+                        };
+                        help_text(ui, &help);
+                        ui.add_space(tokens::SPACE_S);
 
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Energy preference (EPP)", |ui| {
-                        if self.available_epps.is_empty() {
-                            ui.label(
-                                egui::RichText::new("Unavailable on this system")
-                                    .italics()
-                                    .color(ui.visuals().weak_text_color()),
-                            );
-                        } else {
-                            egui::ComboBox::from_id_salt("epp_picker")
-                                .selected_text(&self.cpu_epp)
-                                .show_ui(ui, |ui| {
-                                    for e in &self.available_epps.clone() {
-                                        ui.selectable_value(
-                                            &mut self.cpu_epp,
-                                            e.clone(),
-                                            e.as_str(),
-                                        );
-                                    }
-                                });
-                        }
-                    });
-
-                    if !self.power_status.is_empty() {
-                        help_text(ui, &self.power_status.clone());
-                    }
-                });
-
-                ui.add_space(tokens::SPACE_M);
-
-                }
-                if self.section == SettingsSection::Notifications {
-                // ── Notifications and startup ─────────────────────────────────────
-                theme::card(ui, "Desktop notifications", |ui| {
-                    help_text(
-                        ui,
-                        "Desktop notifications cover ProBalance throttling, hardware alerts \
-                 and process termination.",
-                    );
-                    ui.add_space(tokens::SPACE_S);
-
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Desktop notifications", |ui| {
-                        ui.checkbox(&mut self.config.ui.notifications_enabled, "Enabled");
-                    });
-
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Temperature alerts", |ui| {
-                        ui.checkbox(&mut self.config.hw_alerts.enabled, "Enabled");
-                        let on = self.config.hw_alerts.enabled;
-                        let weak = ui.visuals().weak_text_color();
-                        ui.add_enabled_ui(on, |ui| {
-                            ui.label("at");
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.default_affinity_enabled, "Enabled");
                             ui.add(
-                                egui::DragValue::new(
-                                    &mut self.config.hw_alerts.temp_threshold_celsius,
+                                egui::TextEdit::singleline(&mut self.default_affinity_text)
+                                    .hint_text("e.g. 8-15,24-31")
+                                    .desired_width(130.0)
+                                    .interactive(self.default_affinity_enabled),
+                            );
+                            if ui
+                                .add_enabled(
+                                    self.default_affinity_enabled,
+                                    egui::Button::new("Pick CPUs…"),
                                 )
-                                .range(50.0..=110.0)
-                                .speed(1.0)
-                                .fixed_decimals(0)
-                                .suffix(" °C"),
+                                .clicked()
+                            {
+                                self.cpu_dialog =
+                                    Some(AffinityDialog::new(&self.default_affinity_text, "Default"));
+                            }
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Quick presets:")
+                                    .color(ui.visuals().weak_text_color()),
                             );
-                            ui.colored_label(weak, "·  at least");
-                            ui.add(
-                                egui::DragValue::new(&mut self.config.hw_alerts.cooldown_secs)
-                                    .range(10..=300)
-                                    .speed(5.0)
-                                    .suffix(" s"),
-                            );
-                            ui.colored_label(weak, "between alerts");
+                            let current = self.default_affinity_text.trim().to_string();
+                            let on = self.default_affinity_enabled;
+                            if self.topo.has_asymmetry() {
+                                let pref = cpuset_to_cpulist(&self.topo.preferred);
+                                let npref = cpuset_to_cpulist(&self.topo.non_preferred);
+                                if theme::chip(
+                                    ui,
+                                    &self.topo.preferred_button_label(),
+                                    on && current == pref,
+                                ) {
+                                    self.default_affinity_text = pref;
+                                    self.default_affinity_enabled = true;
+                                }
+                                if theme::chip(
+                                    ui,
+                                    &self.topo.non_preferred_button_label(),
+                                    on && current == npref,
+                                ) {
+                                    self.default_affinity_text = npref;
+                                    self.default_affinity_enabled = true;
+                                }
+                            }
+                            if theme::chip(ui, "All CPU threads", on && current.is_empty()) {
+                                self.default_affinity_text = String::new();
+                                self.default_affinity_enabled = true;
+                            }
                         });
                     });
 
-                });
+                    // Handle Pick CPUs dialog
+                    if let Some(ref mut dlg) = self.cpu_dialog {
+                        if let Some(result) = dlg.show(ctx, opacity) {
+                            if !result.is_empty() {
+                                self.default_affinity_text = result;
+                            }
+                            self.cpu_dialog = None;
+                        }
+                    }
+
+                    ui.add_space(tokens::SPACE_M);
+
+                    // ── Monitoring ────────────────────────────────────────────────────
+                    theme::card(ui, "Monitoring", |ui| {
+                        help_text(
+                            ui,
+                            "How often rules are enforced on running processes, and how often \
+                     the process table refreshes on screen.",
+                        );
+                        ui.add_space(tokens::SPACE_S);
+
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Apply rules every", |ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.config.monitor.rule_enforce_interval_ms)
+                                    .range(100..=10000)
+                                    .suffix(" ms"),
+                            );
+                        });
+
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Refresh process list", |ui| {
+                            const PICKS: [u64; 4] = [500, 1000, 2000, 5000];
+                            let sel = PICKS
+                                .iter()
+                                .position(|ms| *ms == self.config.monitor.display_refresh_interval_ms)
+                                .unwrap_or(usize::MAX);
+                            if let Some(i) = theme::segmented(ui, &["0.5 s", "1 s", "2 s", "5 s"], sel) {
+                                self.config.monitor.display_refresh_interval_ms = PICKS[i];
+                            }
+                        });
+                    });
+
+                    ui.add_space(tokens::SPACE_M);
+
+                }
+                if self.section == SettingsSection::Appearance {
+                    // ── Appearance and power ──────────────────────────────────────────
+                    theme::card(ui, "Appearance", |ui| {
+                        help_text(
+                            ui,
+                            "Theme and window opacity are saved immediately. Game overlay appearance is in Gaming → Overlay.",
+                        );
+                        ui.add_space(tokens::SPACE_S);
+
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Theme", |ui| {
+                            let prev_theme = self.theme.clone();
+                            egui::ComboBox::from_id_salt("theme_picker")
+                                .selected_text(self.theme.label())
+                                .show_ui(ui, |ui| {
+                                    for t in [
+                                        AppTheme::BreezeDark,
+                                        AppTheme::BreezeLight,
+                                        AppTheme::AdwaitaDark,
+                                        AppTheme::AdwaitaLight,
+                                    ] {
+                                        ui.selectable_value(&mut self.theme, t.clone(), t.label());
+                                    }
+                                });
+                            if self.theme != prev_theme {
+                                theme::apply_theme(ctx, self.native_ppp, &self.theme);
+                            }
+                        });
+
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Window opacity", |ui| {
+                            // The track is painted with `inactive.bg_fill`, which
+                            // equals the window background — invisible without a
+                            // value fill. Enable the trailing fill (accent colour)
+                            // so the slider reads as a slider, not a floating box.
+                            ui.spacing_mut().slider_width = 200.0;
+                            ui.add(
+                                egui::Slider::new(&mut self.opacity, 0.1f32..=1.0)
+                                    .trailing_fill(true)
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                    .custom_parser(|s| {
+                                        s.trim_end_matches('%')
+                                            .trim()
+                                            .parse::<f64>()
+                                            .ok()
+                                            .map(|p| p / 100.0)
+                                    })
+                                    .show_value(true),
+                            );
+                        });
+
+                    });
+                }
+                if self.section == SettingsSection::Power {
+                    theme::card(ui, "CPU power management", |ui| {
+                        help_text(ui, "Controls CPU frequency policy and the balance between performance and energy use. Changes take effect with Apply changes.");
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Frequency policy (governor)", |ui| {
+                            if self.available_governors.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("Unavailable on this system")
+                                        .italics()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            } else {
+                                egui::ComboBox::from_id_salt("gov_picker")
+                                    .selected_text(&self.cpu_governor)
+                                    .show_ui(ui, |ui| {
+                                        for g in &self.available_governors.clone() {
+                                            ui.selectable_value(
+                                                &mut self.cpu_governor,
+                                                g.clone(),
+                                                g.as_str(),
+                                            );
+                                        }
+                                    });
+                            }
+                        });
+
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Energy preference (EPP)", |ui| {
+                            if self.available_epps.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("Unavailable on this system")
+                                        .italics()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            } else {
+                                egui::ComboBox::from_id_salt("epp_picker")
+                                    .selected_text(&self.cpu_epp)
+                                    .show_ui(ui, |ui| {
+                                        for e in &self.available_epps.clone() {
+                                            ui.selectable_value(
+                                                &mut self.cpu_epp,
+                                                e.clone(),
+                                                e.as_str(),
+                                            );
+                                        }
+                                    });
+                            }
+                        });
+
+                        if !self.power_status.is_empty() {
+                            help_text(ui, &self.power_status.clone());
+                        }
+                    });
+
+                    ui.add_space(tokens::SPACE_M);
+
+                }
+                if self.section == SettingsSection::Notifications {
+                    // ── Notifications and startup ─────────────────────────────────────
+                    theme::card(ui, "Desktop notifications", |ui| {
+                        help_text(
+                            ui,
+                            "Desktop notifications cover ProBalance throttling, hardware alerts \
+                     and process termination.",
+                        );
+                        ui.add_space(tokens::SPACE_S);
+
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Desktop notifications", |ui| {
+                            ui.checkbox(&mut self.config.ui.notifications_enabled, "Enabled");
+                        });
+
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Temperature alerts", |ui| {
+                            ui.checkbox(&mut self.config.hw_alerts.enabled, "Enabled");
+                            let on = self.config.hw_alerts.enabled;
+                            let weak = ui.visuals().weak_text_color();
+                            ui.add_enabled_ui(on, |ui| {
+                                ui.label("at");
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut self.config.hw_alerts.temp_threshold_celsius,
+                                    )
+                                    .range(50.0..=110.0)
+                                    .speed(1.0)
+                                    .fixed_decimals(0)
+                                    .suffix(" °C"),
+                                );
+                                ui.colored_label(weak, "·  at least");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.config.hw_alerts.cooldown_secs)
+                                        .range(10..=300)
+                                        .speed(5.0)
+                                        .suffix(" s"),
+                                );
+                                ui.colored_label(weak, "between alerts");
+                            });
+                        });
+
+                    });
                 }
                 if self.section == SettingsSection::Startup {
-                theme::card(ui, "Startup", |ui| {
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Start with session", |ui| {
-                        ui.checkbox(
-                            &mut self.autostart_enabled,
-                            "Launch Argus-Lasso automatically with your desktop session",
-                        );
-                    });
-                });
-
-                ui.add_space(tokens::SPACE_M);
-
-                // ── Updates ───────────────────────────────────────────────────────
-                theme::card(ui, "Updates", |ui| {
-                    help_text(
-                        ui,
-                        "Argus-Lasso can replace its own binary from the project's GitHub \
-                 releases. A system-wide install is left to your package manager.",
-                    );
-                    ui.add_space(tokens::SPACE_S);
-
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Installed version", |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("v{}", crate::updater::current_version()))
-                                .font(theme::num_font(tokens::FONT_BODY)),
-                        );
-                        // The outcome qualifies the version, so it sits beside
-                        // it as weak subtext. As a loose line under the whole
-                        // group it read as an unrelated status message.
-                        if !updates.message.is_empty() {
-                            ui.add_space(tokens::SPACE_XS);
-                            ui.label(
-                                egui::RichText::new(&updates.message)
-                                    .size(tokens::FONT_HELP)
-                                    .color(ui.visuals().weak_text_color()),
+                    theme::card(ui, "Startup", |ui| {
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Start with session", |ui| {
+                            ui.checkbox(
+                                &mut self.autostart_enabled,
+                                "Launch Argus-Lasso automatically with your desktop session",
                             );
-                        }
-                        ui.add_space(tokens::SPACE_S);
-                        let label = if updates.busy {
-                            "Working…"
-                        } else {
-                            "Check now"
-                        };
-                        if ui
-                            .add_enabled(!updates.busy, egui::Button::new(label))
-                            .clicked()
-                        {
-                            updates.start_check();
-                        }
-                        let pending = updates
-                            .available
-                            .as_ref()
-                            .map(|u| (u.tag.clone(), u.page_url.clone()));
-                        if let Some((tag, page_url)) = pending {
-                            let s = theme::sem(ui);
-                            if updates.installed {
-                                let btn = egui::Button::new(
-                                    egui::RichText::new("Restart now").color(s.on_accent),
-                                )
-                                .fill(s.accent);
-                                if ui.add(btn).clicked() {
-                                    updates.restart_requested = true;
-                                }
-                            } else {
-                                let btn = egui::Button::new(
-                                    egui::RichText::new(format!("Update to {tag}"))
-                                        .color(s.on_accent),
-                                )
-                                .fill(s.accent);
-                                if ui.add_enabled(!updates.busy, btn).clicked() {
-                                    updates.start_install();
-                                }
-                            }
-                            if !page_url.is_empty() {
-                                ui.hyperlink_to("Release notes", &page_url);
-                            }
-                        }
+                        });
                     });
 
-                    crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Check on startup", |ui| {
-                        ui.checkbox(&mut self.config.ui.check_updates_on_start, "Enabled");
+                    ui.add_space(tokens::SPACE_M);
+
+                    // ── Updates ───────────────────────────────────────────────────────
+                    theme::card(ui, "Updates", |ui| {
+                        help_text(
+                            ui,
+                            "Argus-Lasso can replace its own binary from the project's GitHub \
+                     releases. A system-wide install is left to your package manager.",
+                        );
+                        ui.add_space(tokens::SPACE_S);
+
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Installed version", |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("v{}", crate::updater::current_version()))
+                                    .font(theme::num_font(tokens::FONT_BODY)),
+                            );
+                            // The outcome qualifies the version, so it sits beside
+                            // it as weak subtext. As a loose line under the whole
+                            // group it read as an unrelated status message.
+                            if !updates.message.is_empty() {
+                                ui.add_space(tokens::SPACE_XS);
+                                ui.label(
+                                    egui::RichText::new(&updates.message)
+                                        .size(tokens::FONT_HELP)
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            }
+                            ui.add_space(tokens::SPACE_S);
+                            let label = if updates.busy {
+                                "Working…"
+                            } else {
+                                "Check now"
+                            };
+                            if ui
+                                .add_enabled(!updates.busy, egui::Button::new(label))
+                                .clicked()
+                            {
+                                updates.start_check();
+                            }
+                            let pending = updates
+                                .available
+                                .as_ref()
+                                .map(|u| (u.tag.clone(), u.page_url.clone()));
+                            if let Some((tag, page_url)) = pending {
+                                let s = theme::sem(ui);
+                                if updates.installed {
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new("Restart now").color(s.on_accent),
+                                    )
+                                    .fill(s.accent);
+                                    if ui.add(btn).clicked() {
+                                        updates.restart_requested = true;
+                                    }
+                                } else {
+                                    let btn = egui::Button::new(
+                                        egui::RichText::new(format!("Update to {tag}"))
+                                            .color(s.on_accent),
+                                    )
+                                    .fill(s.accent);
+                                    if ui.add_enabled(!updates.busy, btn).clicked() {
+                                        updates.start_install();
+                                    }
+                                }
+                                if !page_url.is_empty() {
+                                    ui.hyperlink_to("Release notes", &page_url);
+                                }
+                            }
+                        });
+
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Check on startup", |ui| {
+                            ui.checkbox(&mut self.config.ui.check_updates_on_start, "Enabled");
+                        });
                     });
-                });
 
                 }
                 if !self.status.is_empty() {
@@ -611,23 +611,54 @@ fn read_available_governors() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn set_governor(governor: &str) -> Result<(), String> {
-    // Try direct sysfs write first, fall back to privileged helper.
-    let cpu_count = crate::utils::get_cpu_count();
+/// Write `value` to `path_suffix` under every CPU's cpufreq directory (e.g.
+/// "cpufreq/scaling_governor"), falling back to the privileged polkit helper
+/// — which owns the privileged path and covers every core itself — if ANY
+/// core's direct write failed, not only if every one of them did. A
+/// non-uniform sysfs permission setup (or one core in an unexpected state)
+/// previously reported success while silently leaving some cores on their
+/// old value, because the fallback only fired when EVERY core failed.
+fn write_sysfs_all_cpus(
+    path_suffix: &str,
+    value: &str,
+    fallback: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    write_sysfs_all_cpus_at(
+        std::path::Path::new("/sys/devices/system/cpu"),
+        crate::utils::get_cpu_count(),
+        path_suffix,
+        value,
+        fallback,
+    )
+}
+
+fn write_sysfs_all_cpus_at(
+    base: &std::path::Path,
+    cpu_count: u32,
+    path_suffix: &str,
+    value: &str,
+    fallback: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
     let mut errors = 0usize;
     for i in 0..cpu_count {
-        let path = format!("/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_governor");
-        if std::fs::write(&path, governor).is_err() {
+        let path = base.join(format!("cpu{i}")).join(path_suffix);
+        if std::fs::write(&path, value).is_err() {
             errors += 1;
         }
     }
-    if errors == cpu_count as usize {
-        // Every direct sysfs write was refused — fall back to the polkit
-        // helper, which owns the privileged path now.
-        crate::cpu_park::set_governor_via_helper(governor)
+    if errors > 0 {
+        fallback(value)
     } else {
         Ok(())
     }
+}
+
+fn set_governor(governor: &str) -> Result<(), String> {
+    write_sysfs_all_cpus(
+        "cpufreq/scaling_governor",
+        governor,
+        crate::cpu_park::set_governor_via_helper,
+    )
 }
 
 fn read_epp() -> String {
@@ -645,20 +676,11 @@ fn read_available_epps() -> Vec<String> {
 }
 
 fn set_epp(epp: &str) -> Result<(), String> {
-    // Try direct sysfs write first, fall back to privileged helper.
-    let cpu_count = crate::utils::get_cpu_count();
-    let mut errors = 0usize;
-    for i in 0..cpu_count {
-        let path = format!("/sys/devices/system/cpu/cpu{i}/cpufreq/energy_performance_preference");
-        if std::fs::write(&path, epp).is_err() {
-            errors += 1;
-        }
-    }
-    if errors == cpu_count as usize {
-        crate::cpu_park::set_epp_via_helper(epp)
-    } else {
-        Ok(())
-    }
+    write_sysfs_all_cpus(
+        "cpufreq/energy_performance_preference",
+        epp,
+        crate::cpu_park::set_epp_via_helper,
+    )
 }
 
 fn check_autostart_enabled() -> bool {
@@ -742,4 +764,96 @@ fn disable_autostart() -> std::io::Result<String> {
     };
 
     Ok(format!("Autostart disabled (XDG{systemd_note})"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_sysfs_all_cpus_at;
+    use std::cell::Cell;
+
+    fn fake_cpu_dir(root: &std::path::Path, writable_cpus: &[u32], cpu_count: u32) {
+        std::fs::create_dir_all(root).unwrap();
+        for i in 0..cpu_count {
+            if writable_cpus.contains(&i) {
+                // A regular directory: the write below will succeed.
+                std::fs::create_dir_all(root.join(format!("cpu{i}"))).unwrap();
+            }
+            // Cores not in `writable_cpus` get no directory at all, so
+            // writing "cpu{i}/governor" fails with NotFound — standing in
+            // for a real permission failure without needing root to set up
+            // an actually-unwritable file.
+        }
+    }
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "argus-settings-tab-test-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn no_fallback_when_every_core_writes_successfully() {
+        let root = temp_root("all-ok");
+        fake_cpu_dir(&root, &[0, 1, 2], 3);
+        let fallback_called = Cell::new(false);
+        let result = write_sysfs_all_cpus_at(&root, 3, "governor", "performance", |_| {
+            fallback_called.set(true);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(
+            !fallback_called.get(),
+            "fallback must not run when nothing failed"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The bug this exists for: previously the fallback only ran when EVERY
+    /// core failed. One failure out of several must still trigger it.
+    #[test]
+    fn fallback_runs_when_only_one_of_several_cores_fails() {
+        let root = temp_root("one-fails");
+        fake_cpu_dir(&root, &[0, 2], 3); // cpu1 has no directory -> its write fails
+        let fallback_called = Cell::new(false);
+        let result = write_sysfs_all_cpus_at(&root, 3, "governor", "performance", |_| {
+            fallback_called.set(true);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(
+            fallback_called.get(),
+            "a single core's failed write must still trigger the fallback"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fallback_runs_when_every_core_fails() {
+        let root = temp_root("all-fail");
+        fake_cpu_dir(&root, &[], 3); // no cpu directories at all
+        let fallback_called = Cell::new(false);
+        let result = write_sysfs_all_cpus_at(&root, 3, "governor", "performance", |_| {
+            fallback_called.set(true);
+            Ok(())
+        });
+        assert!(result.is_ok());
+        assert!(fallback_called.get());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn fallback_error_propagates() {
+        let root = temp_root("fallback-fails");
+        fake_cpu_dir(&root, &[], 1);
+        let result = write_sysfs_all_cpus_at(&root, 1, "governor", "performance", |_| {
+            Err("helper unavailable".to_string())
+        });
+        assert_eq!(result, Err("helper unavailable".to_string()));
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

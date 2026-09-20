@@ -1,6 +1,16 @@
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
+/// Bump this on any field addition/removal/reorder in a type sent over the
+/// wire (IpcMessage and anything it contains, e.g. OverlayConfig,
+/// TelemetryFrame). bincode's struct decoding is purely positional — unlike
+/// this crate's TOML config-file path, `#[serde(default)]` on a wire struct
+/// cannot fill in a missing trailing field, because bincode has no per-field
+/// wire tag to detect "missing" in the first place; the reader's own struct
+/// definition dictates exactly how many bytes it consumes regardless of what
+/// the writer actually sent. Some structs here carry `#[serde(default)]`
+/// only because they're ALSO deserialized from user TOML on disk, where it
+/// does work as intended — don't mistake that for wire-format safety.
 pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_MESSAGE_SIZE: usize = 256 * 1024;
 pub const BUILD_ID: &str = env!("ARGUS_BUILD_ID");
@@ -221,6 +231,10 @@ impl OverlayMetric {
 }
 
 /// Individual visibility flags, grouped by the existing section switches.
+///
+/// Also sent over the bincode wire as part of OverlayConfig: adding a field
+/// here needs a PROTOCOL_VERSION bump too, `#[serde(default)]` below only
+/// covers the TOML-on-disk path (see PROTOCOL_VERSION's doc comment).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct OverlayFields {
@@ -292,6 +306,9 @@ impl Default for OverlayFields {
     }
 }
 
+/// Sent over the bincode wire as `IpcMessage::Config`, and also stored in the
+/// user's TOML config file. Adding a field needs a PROTOCOL_VERSION bump —
+/// `#[serde(default)]` below only covers the TOML path, see its doc comment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct OverlayConfig {

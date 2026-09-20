@@ -145,7 +145,7 @@ pub struct ArgusLassoApp {
     // fsync the config ~60×/sec. Persist at most once per 300ms instead.
     // (The live value is already in shared state each frame; only the disk
     // write is throttled.)
-    last_col_save: std::time::Instant,
+    last_disk_save: std::time::Instant,
     /// Set only by --ui-tour: drives the app through every screen, capturing
     /// each, then exits. None in every normal run.
     tour: Option<crate::ui_tour::Tour>,
@@ -263,21 +263,23 @@ impl ArgusLassoApp {
             }),
             events_seen: 0,
             cpu_model,
-            last_col_save: std::time::Instant::now(),
+            last_disk_save: std::time::Instant::now(),
         }
     }
 
-    /// Debounce gate for column-resize saves. `cols_dirty` is true on every
-    /// frame of a divider drag (including the release frame that applies the
-    /// final delta), so saving immediately would fsync the config ~60×/sec.
-    /// Allow at most one save per 300ms; the live width is already in shared
-    /// state each frame, so throttling only the disk write loses nothing.
-    fn col_save_due(&mut self) -> bool {
+    /// Debounce gate shared by every "live" config save (column resizing,
+    /// opacity/theme dragging): the dirty flag/changed check is true on every
+    /// frame the value is still moving (including the release frame that
+    /// applies the final delta), so saving immediately would fsync the
+    /// config ~60×/sec. Allow at most one save per 300ms across all of them;
+    /// the live value is already in shared state each frame regardless, so
+    /// throttling only the disk write loses nothing.
+    fn disk_save_due(&mut self) -> bool {
         let now = std::time::Instant::now();
-        if now.duration_since(self.last_col_save) < std::time::Duration::from_millis(300) {
+        if now.duration_since(self.last_disk_save) < std::time::Duration::from_millis(300) {
             return false;
         }
-        self.last_col_save = now;
+        self.last_disk_save = now;
         true
     }
 
@@ -1061,12 +1063,12 @@ impl eframe::App for ArgusLassoApp {
                         self.active_tab = Tab::Rules;
                     }
                     // Persist col_widths when user drags a column divider
-                    // (debounced — see col_save_due).
+                    // (debounced — see disk_save_due).
                     if self.process_tab.cols_dirty {
                         if let Ok(mut s) = self.state.lock() {
                             s.config.ui.col_widths = self.process_tab.col_widths.clone();
                         }
-                        if self.col_save_due() {
+                        if self.disk_save_due() {
                             self.save_config();
                         }
                     }
@@ -1107,15 +1109,30 @@ impl eframe::App for ArgusLassoApp {
                             .lock()
                             .map(|re| re.to_config_list())
                             .unwrap_or_default();
-                        if let Ok(mut s) = self.state.lock() {
+                        // ReapplyDefaults alone doesn't touch the daemon's
+                        // own config mirror (it only re-runs the shared
+                        // RuleEngine against known PIDs) — without also
+                        // sending UpdateConfig, a later CLI overlay toggle
+                        // merging that stale mirror into shared state could
+                        // permanently discard the user's just-edited rules
+                        // the next time anything calls save_config().
+                        let full = self.state.lock().ok().map(|mut s| {
                             s.config.rules = rules_cfg;
+                            s.config.clone()
+                        });
+                        if let Some(full) = full {
+                            self.send(DaemonCmd::UpdateConfig(Box::new(full)));
                         }
                         self.send(DaemonCmd::ReapplyDefaults);
                         self.save_config();
                     }
                     if profiles_changed {
-                        if let Ok(mut s) = self.state.lock() {
+                        let full = self.state.lock().ok().map(|mut s| {
                             s.config.rule_profiles = rule_profiles;
+                            s.config.clone()
+                        });
+                        if let Some(full) = full {
+                            self.send(DaemonCmd::UpdateConfig(Box::new(full)));
                         }
                         self.save_config();
                     }
@@ -1145,7 +1162,7 @@ impl eframe::App for ArgusLassoApp {
                         if let Ok(mut s) = self.state.lock() {
                             s.config.ui.hw_mon_col_widths = widths;
                         }
-                        if self.col_save_due() {
+                        if self.disk_save_due() {
                             self.save_config();
                         }
                     }
@@ -1218,11 +1235,27 @@ impl eframe::App for ArgusLassoApp {
                     {
                         self.last_saved_opacity = cur_opacity;
                         self.last_saved_theme = cur_theme.clone();
-                        if let Ok(mut s) = self.state.lock() {
+                        // Re-lock-and-clone the same way the Apply handler
+                        // above does, then send UpdateConfig: without this,
+                        // the daemon's own config mirror never learns about
+                        // the change, and a later CLI overlay toggle merging
+                        // its stale mirror back into shared state (see
+                        // run_loop) would have nothing to preserve it with.
+                        let full = self.state.lock().ok().map(|mut s| {
                             s.config.ui.opacity = cur_opacity;
                             s.config.ui.theme = cur_theme;
+                            s.config.clone()
+                        });
+                        if let Some(full) = full {
+                            self.send(DaemonCmd::UpdateConfig(Box::new(full)));
                         }
-                        self.save_config();
+                        // Same 300ms debounce as column-width dragging:
+                        // egui reports a changed value on every frame of a
+                        // slider drag, so saving unconditionally here would
+                        // fsync the config on every one of those frames.
+                        if self.disk_save_due() {
+                            self.save_config();
+                        }
                     }
                 }
 

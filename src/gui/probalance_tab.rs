@@ -57,264 +57,264 @@ impl ProBalanceTab {
             .auto_shrink([false, false])
             .show(ui, |ui| {
 
-        // ── Status card: state, plain-language summary, live count ────────
-        crate::gui::theme::card_untitled(ui, |ui| {
-            ui.horizontal(|ui| {
-                th::toggle(ui, &mut self.cfg.enabled);
-                ui.add_space(tokens::SPACE_S);
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(if self.cfg.enabled {
-                            "ProBalance is on"
-                        } else {
-                            "ProBalance is off"
-                        })
-                        .font(th::bold_font(tokens::FONT_HERO))
-                        .color(crate::gui::theme::strong_color(ui)),
-                    );
-                    ui.label(
-                        RichText::new(self.summary())
-                            .size(tokens::FONT_HELP)
-                            .color(ui.visuals().weak_text_color()),
-                    );
-                    ui.label(format!("Current system CPU: {system_cpu:.1}% of available capacity"));
-                    // When nothing is throttled the fact belongs here, under
-                    // the state it qualifies — as its own grey strip below a
-                    // card it read as an unrelated warning.
-                    if throttle_infos.is_empty() {
+            // ── Status card: state, plain-language summary, live count ────────
+            crate::gui::theme::card_untitled(ui, |ui| {
+                ui.horizontal(|ui| {
+                    th::toggle(ui, &mut self.cfg.enabled);
+                    ui.add_space(tokens::SPACE_S);
+                    ui.vertical(|ui| {
                         ui.label(
                             RichText::new(if self.cfg.enabled {
-                                "Nothing is being throttled right now"
+                                "ProBalance is on"
                             } else {
-                                "Nothing is being throttled"
+                                "ProBalance is off"
                             })
-                            .size(tokens::FONT_HELP)
-                            .color(ui.visuals().weak_text_color()),
+                            .font(th::bold_font(tokens::FONT_HERO))
+                            .color(crate::gui::theme::strong_color(ui)),
                         );
-                    }
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let n = throttle_infos.len();
-                    if n > 0 {
-                        th::badge_outline_colored(ui, &format!("{n} throttled now"), s.warning);
-                    }
+                        ui.label(
+                            RichText::new(self.summary())
+                                .size(tokens::FONT_HELP)
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.label(format!("Current system CPU: {system_cpu:.1}% of available capacity"));
+                        // When nothing is throttled the fact belongs here, under
+                        // the state it qualifies — as its own grey strip below a
+                        // card it read as an unrelated warning.
+                        if throttle_infos.is_empty() {
+                            ui.label(
+                                RichText::new(if self.cfg.enabled {
+                                    "Nothing is being throttled right now"
+                                } else {
+                                    "Nothing is being throttled"
+                                })
+                                .size(tokens::FONT_HELP)
+                                .color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let n = throttle_infos.len();
+                        if n > 0 {
+                            th::badge_outline_colored(ui, &format!("{n} throttled now"), s.warning);
+                        }
+                    });
                 });
             });
-        });
-        ui.add_space(tokens::SPACE_M);
+            ui.add_space(tokens::SPACE_M);
 
-        // ── Live throttle view ────────────────────────────────────────────
-        // Hidden entirely when empty: an empty table card is a panel-sized
-        // reminder that there is nothing to show. The status card above
-        // already says so in one line.
-        if !throttle_infos.is_empty() {
-            crate::gui::theme::card_untitled(ui, |ui| {
-                egui::Grid::new("pb_throttle_rows")
-                    .num_columns(5)
-                    .min_row_height(tokens::ROW_H_DENSE)
-                    .spacing([tokens::SPACE_M, 2.0])
-                    .show(ui, |ui| {
-                        for h in ["PID", "NAME", "CPU%", "THROTTLE", "RESTORE IN"] {
-                            ui.label(th::header_text(ui, h, false));
-                        }
-                        ui.end_row();
+            // ── Live throttle view ────────────────────────────────────────────
+            // Hidden entirely when empty: an empty table card is a panel-sized
+            // reminder that there is nothing to show. The status card above
+            // already says so in one line.
+            if !throttle_infos.is_empty() {
+                crate::gui::theme::card_untitled(ui, |ui| {
+                    egui::Grid::new("pb_throttle_rows")
+                        .num_columns(5)
+                        .min_row_height(tokens::ROW_H_DENSE)
+                        .spacing([tokens::SPACE_M, 2.0])
+                        .show(ui, |ui| {
+                            for h in ["PID", "NAME", "CPU%", "THROTTLE", "RESTORE IN"] {
+                                ui.label(th::header_text(ui, h, false));
+                            }
+                            ui.end_row();
 
-                        let cpu_map: std::collections::HashMap<u32, f32> =
-                            snapshot.iter().map(|p| (p.pid, p.cpu_percent)).collect();
+                            let cpu_map: std::collections::HashMap<u32, f32> =
+                                snapshot.iter().map(|p| (p.pid, p.cpu_percent)).collect();
 
-                        for info in throttle_infos {
-                            let cpu = cpu_map.get(&info.pid).copied().unwrap_or(info.cpu_percent);
+                            for info in throttle_infos {
+                                let cpu = cpu_map.get(&info.pid).copied().unwrap_or(info.cpu_percent);
 
-                            ui.label(
-                                RichText::new(info.pid.to_string())
-                                    .font(th::num_font(tokens::FONT_BODY))
-                                    .color(ui.visuals().weak_text_color()),
-                            );
-                            ui.label(RichText::new(&info.name).color(s.warning));
-                            ui.label(
-                                RichText::new(format!("{cpu:.1}"))
-                                    .font(th::num_font(tokens::FONT_BODY))
-                                    .color(th::load_color(ui, cpu)),
-                            );
-                            match &info.unit {
-                                Some(unit) => {
-                                    ui.label(
-                                        RichText::new(format!("unit {unit}"))
+                                ui.label(
+                                    RichText::new(info.pid.to_string())
+                                        .font(th::num_font(tokens::FONT_BODY))
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                                ui.label(RichText::new(&info.name).color(s.warning));
+                                ui.label(
+                                    RichText::new(format!("{cpu:.1}"))
+                                        .font(th::num_font(tokens::FONT_BODY))
+                                        .color(th::load_color(ui, cpu)),
+                                );
+                                match &info.unit {
+                                    Some(unit) => {
+                                        ui.label(
+                                            RichText::new(format!("unit {unit}"))
+                                                .size(tokens::FONT_HELP)
+                                                .color(ui.visuals().weak_text_color()),
+                                        );
+                                    }
+                                    None => {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "nice {} → {}",
+                                                info.original_nice, info.throttle_nice
+                                            ))
                                             .size(tokens::FONT_HELP)
                                             .color(ui.visuals().weak_text_color()),
-                                    );
+                                        );
+                                    }
                                 }
-                                None => {
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "nice {} → {}",
-                                            info.original_nice, info.throttle_nice
-                                        ))
-                                        .size(tokens::FONT_HELP)
-                                        .color(ui.visuals().weak_text_color()),
-                                    );
-                                }
+                                restore_progress(
+                                    ui,
+                                    info.consecutive_low,
+                                    info.restore_hysteresis,
+                                    s.warning,
+                                );
+                                ui.end_row();
                             }
-                            restore_progress(
-                                ui,
-                                info.consecutive_low,
-                                info.restore_hysteresis,
-                                s.warning,
+                        });
+                });
+                ui.add_space(tokens::SPACE_M);
+            }
+
+            // ── Throttling and restore ────────────────────────────────────────
+            th::card_hinted(ui, "Activation and recovery",
+                "100% means all available CPU capacity. Act only under sustained system load; protect detected games, their child processes and exemptions.", |ui| {
+                egui::Grid::new("pb_thresholds")
+                    .num_columns(2)
+                    .min_row_height(tokens::ROW_H)
+                    .spacing([tokens::SPACE_S, tokens::SPACE_XS])
+                    .show(ui, |ui| {
+                        form_label(ui, LABEL_W, "Throttle method");
+                        egui::ComboBox::from_id_salt("pb_method")
+                            .selected_text(match self.cfg.method.as_str() {
+                                "cgroup" => "cgroup (per-app CPUWeight)",
+                                "auto" => "auto (cgroup, nice fallback)",
+                                _ => "nice (process priority)",
+                            })
+                            .show_ui(ui, |ui| {
+                                for (val, label) in [
+                                    ("nice", "nice (process priority)"),
+                                    ("cgroup", "cgroup (per-app CPUWeight)"),
+                                    ("auto", "auto (cgroup, nice fallback)"),
+                                ] {
+                                    ui.selectable_value(&mut self.cfg.method, val.to_string(), label);
+                                }
+                            });
+                        ui.end_row();
+
+                        form_label(ui, LABEL_W, "System CPU above");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.cfg.system_cpu_threshold_percent)
+                                    .range(1.0f32..=100.0)
+                                    .suffix(" %"),
                             );
+                            weak(ui, "for");
+                            ui.add(
+                                egui::DragValue::new(&mut self.cfg.consecutive_seconds)
+                                    .range(1.0f32..=60.0)
+                                    .suffix(" s"),
+                            );
+                        });
+                        ui.end_row();
+
+                        form_label(ui, LABEL_W, "Minimum process CPU");
+                        ui.add(egui::DragValue::new(&mut self.cfg.process_min_cpu_percent)
+                            .range(0.1..=100.0).speed(0.1).suffix(" % of total"))
+                            .on_hover_text("Only processes consuming at least this share are candidates. This does not activate ProBalance by itself.");
+                        ui.end_row();
+                        form_label(ui, LABEL_W, "Nice adjustment");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.cfg.nice_adjustment)
+                                    .range(1..=19)
+                                    .prefix("+"),
+                            );
+                            weak(ui, "capped at");
+                            ui.add(egui::DragValue::new(&mut self.cfg.nice_floor).range(1..=19));
+                        });
+                        ui.end_row();
+
+                        form_label(ui, LABEL_W, "System CPU below");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut self.cfg.system_restore_threshold_percent)
+                                    .range(0.0f32..=99.0)
+                                    .suffix(" %"),
+                            );
+                            weak(ui, "for");
+                            ui.add(
+                                egui::DragValue::new(&mut self.cfg.restore_hysteresis_seconds)
+                                    .range(1.0f32..=120.0)
+                                    .suffix(" s"),
+                            );
+                        });
+                        ui.end_row();
+
+                        if self.cfg.method != "nice" {
+                            form_label(ui, LABEL_W, "Throttled CPUWeight");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.cfg.cgroup_throttle_weight)
+                                        .range(1..=100),
+                                );
+                                weak(ui, "kernel default is 100");
+                            });
+                            ui.end_row();
+
+                            form_label(ui, LABEL_W, "Hard CPU quota");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut self.cfg.cgroup_quota_percent)
+                                        .range(0..=800)
+                                        .suffix(" %"),
+                                );
+                                weak(ui, "0 = no cap");
+                            });
                             ui.end_row();
                         }
                     });
             });
             ui.add_space(tokens::SPACE_M);
-        }
 
-        // ── Throttling and restore ────────────────────────────────────────
-        th::card_hinted(ui, "Activation and recovery",
-            "100% means all available CPU capacity. Act only under sustained system load; protect detected games, their child processes and exemptions.", |ui| {
-            egui::Grid::new("pb_thresholds")
-                .num_columns(2)
-                .min_row_height(tokens::ROW_H)
-                .spacing([tokens::SPACE_S, tokens::SPACE_XS])
-                .show(ui, |ui| {
-                    form_label(ui, LABEL_W, "Throttle method");
-                    egui::ComboBox::from_id_salt("pb_method")
-                        .selected_text(match self.cfg.method.as_str() {
-                            "cgroup" => "cgroup (per-app CPUWeight)",
-                            "auto" => "auto (cgroup, nice fallback)",
-                            _ => "nice (process priority)",
-                        })
-                        .show_ui(ui, |ui| {
-                            for (val, label) in [
-                                ("nice", "nice (process priority)"),
-                                ("cgroup", "cgroup (per-app CPUWeight)"),
-                                ("auto", "auto (cgroup, nice fallback)"),
-                            ] {
-                                ui.selectable_value(&mut self.cfg.method, val.to_string(), label);
+            ui.small("Recovery also starts when a candidate falls below its minimum CPU share. Foreground detection is not universal on Wayland; add an exemption for unrecognized games or important apps.");
+            // ── Exempt processes (chips) ──────────────────────────────────────
+            th::card(ui, "Exempt processes", |ui| {
+                ui.label(
+                    RichText::new("Processes whose name contains one of these patterns are never throttled.")
+                        .size(tokens::FONT_HELP)
+                        .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_space(tokens::SPACE_S);
+
+                let mut remove: Option<usize> = None;
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(tokens::SPACE_XS, tokens::SPACE_XS);
+                    for (i, pat) in self.cfg.exempt_patterns.iter().enumerate() {
+                        if removable_chip(ui, pat) {
+                            remove = Some(i);
+                        }
+                    }
+
+                    if self.adding_exempt {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.new_exempt)
+                                .hint_text("pattern")
+                                .desired_width(140.0),
+                        );
+                        resp.request_focus();
+                        let commit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if commit {
+                            let pat = self.new_exempt.trim().to_string();
+                            if !pat.is_empty() && !self.cfg.exempt_patterns.contains(&pat) {
+                                self.cfg.exempt_patterns.push(pat);
                             }
-                        });
-                    ui.end_row();
-
-                    form_label(ui, LABEL_W, "System CPU above");
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut self.cfg.system_cpu_threshold_percent)
-                                .range(1.0f32..=100.0)
-                                .suffix(" %"),
-                        );
-                        weak(ui, "for");
-                        ui.add(
-                            egui::DragValue::new(&mut self.cfg.consecutive_seconds)
-                                .range(1.0f32..=60.0)
-                                .suffix(" s"),
-                        );
-                    });
-                    ui.end_row();
-
-                    form_label(ui, LABEL_W, "Minimum process CPU");
-                    ui.add(egui::DragValue::new(&mut self.cfg.process_min_cpu_percent)
-                        .range(0.1..=100.0).speed(0.1).suffix(" % of total"))
-                        .on_hover_text("Only processes consuming at least this share are candidates. This does not activate ProBalance by itself.");
-                    ui.end_row();
-                    form_label(ui, LABEL_W, "Nice adjustment");
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut self.cfg.nice_adjustment)
-                                .range(1..=19)
-                                .prefix("+"),
-                        );
-                        weak(ui, "capped at");
-                        ui.add(egui::DragValue::new(&mut self.cfg.nice_floor).range(1..=19));
-                    });
-                    ui.end_row();
-
-                    form_label(ui, LABEL_W, "System CPU below");
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut self.cfg.system_restore_threshold_percent)
-                                .range(0.0f32..=99.0)
-                                .suffix(" %"),
-                        );
-                        weak(ui, "for");
-                        ui.add(
-                            egui::DragValue::new(&mut self.cfg.restore_hysteresis_seconds)
-                                .range(1.0f32..=120.0)
-                                .suffix(" s"),
-                        );
-                    });
-                    ui.end_row();
-
-                    if self.cfg.method != "nice" {
-                        form_label(ui, LABEL_W, "Throttled CPUWeight");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut self.cfg.cgroup_throttle_weight)
-                                    .range(1..=100),
-                            );
-                            weak(ui, "kernel default is 100");
-                        });
-                        ui.end_row();
-
-                        form_label(ui, LABEL_W, "Hard CPU quota");
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut self.cfg.cgroup_quota_percent)
-                                    .range(0..=800)
-                                    .suffix(" %"),
-                            );
-                            weak(ui, "0 = no cap");
-                        });
-                        ui.end_row();
+                            self.new_exempt.clear();
+                            self.adding_exempt = false;
+                        } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            self.new_exempt.clear();
+                            self.adding_exempt = false;
+                        }
+                    } else if add_chip(ui, "+ Add pattern") {
+                        self.adding_exempt = true;
                     }
                 });
-        });
-        ui.add_space(tokens::SPACE_M);
-
-        ui.small("Recovery also starts when a candidate falls below its minimum CPU share. Foreground detection is not universal on Wayland; add an exemption for unrecognized games or important apps.");
-        // ── Exempt processes (chips) ──────────────────────────────────────
-        th::card(ui, "Exempt processes", |ui| {
-            ui.label(
-                RichText::new("Processes whose name contains one of these patterns are never throttled.")
-                    .size(tokens::FONT_HELP)
-                    .color(ui.visuals().weak_text_color()),
-            );
-            ui.add_space(tokens::SPACE_S);
-
-            let mut remove: Option<usize> = None;
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(tokens::SPACE_XS, tokens::SPACE_XS);
-                for (i, pat) in self.cfg.exempt_patterns.iter().enumerate() {
-                    if removable_chip(ui, pat) {
-                        remove = Some(i);
-                    }
-                }
-
-                if self.adding_exempt {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.new_exempt)
-                            .hint_text("pattern")
-                            .desired_width(140.0),
-                    );
-                    resp.request_focus();
-                    let commit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if commit {
-                        let pat = self.new_exempt.trim().to_string();
-                        if !pat.is_empty() && !self.cfg.exempt_patterns.contains(&pat) {
-                            self.cfg.exempt_patterns.push(pat);
-                        }
-                        self.new_exempt.clear();
-                        self.adding_exempt = false;
-                    } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                        self.new_exempt.clear();
-                        self.adding_exempt = false;
-                    }
-                } else if add_chip(ui, "+ Add pattern") {
-                    self.adding_exempt = true;
+                if let Some(i) = remove {
+                    self.cfg.exempt_patterns.remove(i);
                 }
             });
-            if let Some(i) = remove {
-                self.cfg.exempt_patterns.remove(i);
-            }
-        });
 
         });
 
