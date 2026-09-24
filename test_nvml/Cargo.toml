@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-nvml-wrapper = "0.12"
+nvml-wrapper = "0.13"
