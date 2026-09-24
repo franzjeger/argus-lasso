@@ -22,7 +22,7 @@ argus-ipc = { path = "argus-ipc" }
 eframe      = { version = "0.34", default-features = false, features = [
     "accesskit", "default_fonts", "glow", "wayland", "x11",
 ] }
-egui        = "0.34"
+egui        = "0.36"
 egui_extras = "0.34"
 # GNOME's Mutter never draws server-side window decorations on Wayland, and
 # eframe's "wayland" feature does not enable winit's client-side fallback —
