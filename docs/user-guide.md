@@ -33,6 +33,11 @@ use a draft until applied. Settings and Gaming preserve each other's saved field
 
 ## Process table
 
+Wine/Proton processes use the executable filename where available. If a game
+clears its process name and command line, Argus-Lasso checks its mapped `.exe`
+files; ambiguous or unreadable mappings retain the ordinary process name.
+Cached names refresh on process renames and at least every five seconds.
+
 Right-click a process for actions; double-click for details. Process identity is
 shown once at the top of the context menu. Priority, CPU assignment and rule
 creation are grouped separately from termination. The GUI Delete action offers
