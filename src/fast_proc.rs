@@ -132,15 +132,33 @@ pub fn read_cmdline(pid: u32, buf: &mut Vec<u8>) -> Vec<String> {
     }
 
     // Command line arguments are null-separated.
+    parse_cmdline(buf)
+}
+
+fn parse_cmdline(buf: &[u8]) -> Vec<String> {
+    // Keep an erased argv[0] in place; later arguments must not become the name.
     buf.split(|&b| b == 0)
-        .filter(|arg| !arg.is_empty())
-        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .enumerate()
+        .filter(|(index, arg)| *index == 0 || !arg.is_empty())
+        .map(|(_, arg)| String::from_utf8_lossy(arg).into_owned())
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::proc_stat_path;
+
+    #[test]
+    fn erased_argv_zero_does_not_promote_an_option_to_program_name() {
+        assert_eq!(
+            super::parse_cmdline(b"\0/WineDetectionEnabled:False\0\0\0"),
+            vec!["", "/WineDetectionEnabled:False"]
+        );
+        assert_eq!(
+            super::parse_cmdline(b"/games/game.exe\0-option\0"),
+            vec!["/games/game.exe", "-option"]
+        );
+    }
 
     #[test]
     fn proc_stat_path_formats_without_heap_allocation() {

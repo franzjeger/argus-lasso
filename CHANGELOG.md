@@ -31,6 +31,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Recover Wine/Proton process names from unambiguous mapped executables when
+  games clear their name and command line (including The Last of Us Part II).
+  Refresh cached identities after renames and periodically after startup.
 - Completed the shared process-string and reusable snapshot migration across
   the GUI, JSON exports and read-only preview so the workspace builds again.
 - Restored independent one-second sensor sampling and the existing weighted CPU

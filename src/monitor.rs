@@ -1258,16 +1258,23 @@ fn park_non_preferred(log_cb: &impl Fn(String)) {
 
 // ── Process collection ────────────────────────────────────────────────────────
 
-/// Per-PID facts that never change while the process lives.
-///
-/// `cmdline` was re-read, re-joined and re-allocated for every process on
-/// every pass — several hundred file reads a second for strings that cannot
-/// have changed. `start_time` guards against PID reuse handing a recycled PID
-/// the previous occupant's name.
+/// Cached process identity. Processes can rename themselves or rewrite argv;
+/// refresh on comm changes and periodically to catch exec/argv changes too.
+/// `start_time` guards against PID reuse.
 struct ProcMeta {
     start_time: u64,
+    comm: String,
+    refreshed: Instant,
     name: std::sync::Arc<str>,
     cmdline: std::sync::Arc<String>,
+}
+
+impl ProcMeta {
+    fn is_current(&self, start_time: u64, comm: &str, now: Instant) -> bool {
+        self.start_time == start_time
+            && self.comm == comm
+            && now.duration_since(self.refreshed) < Duration::from_secs(5)
+    }
 }
 
 /// Caches that let a collection pass skip work the callers do not need.
@@ -1330,12 +1337,14 @@ fn collect_snapshot(
             .get(&pid)
             .is_some_and(|m| m.start_time == stat.starttime);
         let meta = match caches.meta.get(&pid) {
-            Some(m) if m.start_time == stat.starttime => m,
+            Some(m) if m.is_current(stat.starttime, &stat.comm, Instant::now()) => m,
             _ => {
                 let cmdline = crate::fast_proc::read_cmdline(pid, &mut cmd_buf);
                 let entry = ProcMeta {
                     start_time: stat.starttime,
-                    name: utils::resolve_name(&stat.comm, &cmdline).into(),
+                    comm: stat.comm.clone(),
+                    refreshed: Instant::now(),
+                    name: utils::resolve_process_name(pid, &stat.comm, &cmdline).into(),
                     cmdline: std::sync::Arc::new(cmdline.join(" ")),
                 };
                 caches.meta.entry(pid).insert_entry(entry).into_mut()
@@ -1674,7 +1683,7 @@ fn reapply_defaults(
             .split('\0')
             .map(|s| s.to_string())
             .collect();
-        let name = utils::resolve_name(comm, &cmdline_raw);
+        let name = utils::resolve_process_name(pid, comm, &cmdline_raw);
 
         let matched = if let Ok(mut re) = rule_engine.lock() {
             let m = re.matches_any(&name);
@@ -1764,6 +1773,22 @@ mod tests {
             cmdline: std::sync::Arc::new(cmd.to_string()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn process_identity_cache_tracks_renames_expiry_and_pid_reuse() {
+        let now = Instant::now();
+        let meta = ProcMeta {
+            start_time: 123,
+            comm: "Main".into(),
+            refreshed: now,
+            name: "game.exe".into(),
+            cmdline: std::sync::Arc::new(String::new()),
+        };
+        assert!(meta.is_current(123, "Main", now));
+        assert!(!meta.is_current(124, "Main", now));
+        assert!(!meta.is_current(123, "", now));
+        assert!(!meta.is_current(123, "Main", now + Duration::from_secs(5)));
     }
 
     #[test]

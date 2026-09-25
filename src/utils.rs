@@ -332,8 +332,8 @@ pub fn build_core_pairs() -> HashMap<u32, Vec<u32>> {
 /// Also handles comm truncated at 15 chars.
 pub fn resolve_name(comm: &str, cmdline: &[String]) -> String {
     if let Some(arg0) = cmdline.first() {
-        // Windows path: contains backslash and ends with .exe
-        if arg0.contains('\\') && arg0.to_lowercase().ends_with(".exe") {
+        // Windows, Unix and bare executable paths used by Wine/Proton.
+        if arg0.to_ascii_lowercase().ends_with(".exe") {
             let basename = arg0.replace('\\', "/");
             let basename = basename.trim_end_matches('/');
             if let Some(name) = basename.rsplit('/').next() {
@@ -353,6 +353,58 @@ pub fn resolve_name(comm: &str, cmdline: &[String]) -> String {
         }
     }
     comm.to_string()
+}
+
+/// Resolve Wine executables even when the application clears argv[0] and comm.
+/// Only inspect maps for Wine hosts without an executable name in argv[0].
+/// Multiple distinct mapped executables are ambiguous, so never guess between them.
+pub fn resolve_process_name(pid: u32, comm: &str, cmdline: &[String]) -> String {
+    let name = resolve_name(comm, cmdline);
+    if cmdline
+        .first()
+        .is_some_and(|arg| arg.to_ascii_lowercase().ends_with(".exe"))
+    {
+        return name;
+    }
+    let Ok(exe) = fs::read_link(format!("/proc/{pid}/exe")) else {
+        return name;
+    };
+    let host = exe.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+    if matches!(
+        host,
+        "wine" | "wine64" | "wine-preloader" | "wine64-preloader"
+    ) {
+        if let Ok(maps) = fs::read_to_string(format!("/proc/{pid}/maps")) {
+            if let Some(mapped) = mapped_executable_name(&maps) {
+                return mapped;
+            }
+        }
+    } else if name.trim().is_empty() {
+        return host.to_owned();
+    }
+    name
+}
+
+fn mapped_executable_name(maps: &str) -> Option<String> {
+    let mut executable = None;
+    for line in maps.lines() {
+        // The first five fields contain no slashes. Taking the path intact
+        // preserves spaces in Steam library and game directory names.
+        let Some(start) = line.find('/') else {
+            continue;
+        };
+        let path = line[start..]
+            .strip_suffix(" (deleted)")
+            .unwrap_or(&line[start..]);
+        if !path.to_ascii_lowercase().ends_with(".exe") {
+            continue;
+        }
+        match executable {
+            Some(previous) if previous != path => return None,
+            _ => executable = Some(path),
+        }
+    }
+    executable?.rsplit('/').next().map(str::to_owned)
 }
 
 // ── Per-process detail readout (for the details window) ──────────────────────
@@ -590,6 +642,49 @@ pub(crate) static PROCESS_NICE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mute
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wine_names_accept_windows_unix_and_bare_paths() {
+        for path in [
+            r"Z:\games\Game Name\game.exe",
+            "/games/Game Name/game.exe",
+            "game.exe",
+        ] {
+            assert_eq!(resolve_name("Main", &[path.into()]), "game.exe");
+        }
+    }
+
+    #[test]
+    fn mapped_wine_executable_survives_erased_process_name() {
+        let maps = "1000-2000 r--p 00000000 00:24 123 /games/The Last of Us Part II/tlou-ii.exe\n\
+                    3000-4000 r--p 03aa6000 00:24 123 /games/The Last of Us Part II/tlou-ii.exe\n\
+                    5000-6000 r-xp 00000000 00:24 124 /wine/ntdll.dll\n";
+        assert_eq!(mapped_executable_name(maps).as_deref(), Some("tlou-ii.exe"));
+        assert_eq!(
+            mapped_executable_name("1000-2000 r--p 0 00:24 1 /games/OTHER.EXE (deleted)")
+                .as_deref(),
+            Some("OTHER.EXE")
+        );
+        assert_eq!(
+            mapped_executable_name("1000-2000 rw-p 0 00:00 0 [heap]"),
+            None
+        );
+        assert_eq!(
+            mapped_executable_name(&format!("{maps}7000-8000 r--p 0 00:24 2 /games/helper.exe")),
+            None
+        );
+        assert_eq!(
+            mapped_executable_name(&format!(
+                "{maps}7000-8000 r--p 0 00:24 2 /other/tlou-ii.exe"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_procfs_preserves_known_name() {
+        assert_eq!(resolve_process_name(u32::MAX, "native", &[]), "native");
+    }
 
     #[test]
     fn affinity_updates_worker_even_when_main_thread_matches() {
