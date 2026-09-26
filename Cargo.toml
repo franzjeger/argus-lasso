@@ -19,7 +19,7 @@ argus-ipc = { path = "argus-ipc" }
 # 0.34 flipped the default renderer to wgpu. glow is selected explicitly to
 # keep the OpenGL backend this app has always used — wgpu pulls a much larger
 # tree and changes the surface eframe hands to the Wayland opacity code.
-eframe      = { version = "0.34", default-features = false, features = [
+eframe      = { version = "0.36", default-features = false, features = [
     "accesskit", "default_fonts", "glow", "wayland", "x11",
 ] }
 egui        = "0.34"
