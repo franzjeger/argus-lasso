@@ -15,6 +15,7 @@ mod mem_bench;
 mod monitor;
 mod overlay_toggle;
 mod probalance;
+mod process_control;
 mod rules;
 mod sensor_access;
 mod sensor_data;
@@ -40,6 +41,7 @@ fn make_icon_rgba() -> Vec<u8> {
 struct ArgusLassoTray {
     state: Arc<Mutex<monitor::AppState>>,
     cmd_tx: crossbeam_channel::Sender<monitor::DaemonCmd>,
+    context: Arc<Mutex<Option<egui::Context>>>,
 }
 
 /// Convert embedded RGBA bytes to ARGB32 network-byte-order as required by D-Bus SNI.
@@ -103,11 +105,17 @@ impl ksni::Tray for ArgusLassoTray {
             ksni::MenuItem::Standard(ksni::menu::StandardItem {
                 label: "Quit".into(),
                 activate: Box::new(|tray: &mut Self| {
-                    // Ask the daemon to restore everything (nices, throttles,
-                    // parked CPUs), then wait for its completion flag instead
-                    // of sleeping a fixed interval.
-                    monitor::shutdown_and_wait(&tray.state, &tray.cmd_tx);
-                    std::process::exit(0);
+                    // Let the GUI close normally so pending Undo actions and
+                    // debounced settings are flushed before daemon shutdown.
+                    if let Ok(mut s) = tray.state.lock() {
+                        s.quit_requested = true;
+                    }
+                    if let Ok(context) = tray.context.lock() {
+                        if let Some(ctx) = context.as_ref() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            ctx.request_repaint();
+                        }
+                    }
                 }),
                 ..Default::default()
             }),
@@ -117,6 +125,10 @@ impl ksni::Tray for ArgusLassoTray {
 
 #[derive(clap::Subcommand, Debug)]
 enum Cmd {
+    /// Report the app identity for matched app/layer packaging.
+    BuildInfo,
+    /// Restore the previous app and overlay (close Argus first).
+    RollbackUpdate,
     /// Toggle a per-frame game capture without starting another daemon.
     Record {
         #[arg(long, default_value_t = 60)]
@@ -201,6 +213,34 @@ fn main() {
     // Handle CLI subcommands — run action and exit without launching the GUI.
     if let Some(cmd) = args.command {
         match cmd {
+            Cmd::BuildInfo => {
+                println!(
+                    "{}",
+                    serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "build_id": argus_ipc::BUILD_ID,
+                    "protocol": argus_ipc::PROTOCOL_VERSION, "arch": std::env::consts::ARCH })
+                );
+                return;
+            }
+            Cmd::RollbackUpdate => {
+                let Some(_lock) = acquire_single_instance_lock() else {
+                    eprintln!("Close Argus before rollback.");
+                    std::process::exit(1);
+                };
+                match updater::rollback_update() {
+                    Ok(true) => {
+                        println!("Previous app and overlay restored. Restart Argus and games.")
+                    }
+                    Ok(false) => {
+                        eprintln!("No previous installation is available.");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Rollback failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
             Cmd::Record { seconds } => {
                 match argus_ipc::capture::toggle(seconds) {
                     Ok(c) => println!(
@@ -316,6 +356,20 @@ fn main() {
         }
     };
 
+    if args.ui_tour.is_none() {
+        match updater::recover_pending_update() {
+            Ok(true) => {
+                eprintln!("Recovered interrupted update. {}", updater::restart());
+                std::process::exit(1);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("Update recovery failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Build icon RGBA once; reused for window decoration icon.
     let icon_rgba = make_icon_rgba();
 
@@ -361,11 +415,13 @@ fn main() {
 
     // System tray via D-Bus StatusNotifierItem (KDE/freedesktop, no libxdo).
     // Spawned after state + cmd_tx exist so the menu can read/toggle gaming mode.
+    let gui_context = Arc::new(Mutex::new(None));
     let _tray_handle = if !args.no_tray && args.ui_tour.is_none() {
         use ksni::blocking::TrayMethods;
         match (ArgusLassoTray {
             state: Arc::clone(&state),
             cmd_tx: cmd_tx.clone(),
+            context: Arc::clone(&gui_context),
         })
         .spawn()
         {
@@ -422,6 +478,9 @@ fn main() {
         "Argus-Lasso",
         native_options,
         Box::new(move |cc| {
+            if let Ok(mut context) = gui_context.lock() {
+                *context = Some(cc.egui_ctx.clone());
+            }
             Ok(Box::new(app::ArgusLassoApp::new(
                 cc, state_gui, cmd_tx_gui, re_gui, cfg_gui, tour_dir,
             )))

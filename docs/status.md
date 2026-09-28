@@ -1,75 +1,69 @@
 # Project status
 
-Reviewed on **2026-09-28** against source commit
-[`8ff0f9b`](https://github.com/franzjeger/argus-lasso/commit/8ff0f9b).
-This is a dated verification record. Later source changes require their own
-checks; the [changelog](../CHANGELOG.md) separates unreleased work from releases.
+Reviewed on **2026-09-28**. This working tree includes the reliability, recording
+comparison, rule explanation and paired-updater changes listed under
+[Unreleased](../CHANGELOG.md). They have not been published or installed by this
+review. Package version remains `1.3.1`; IPC protocol remains 5.
 
-## Source, release and installation
+## Current source verification
 
-| Item | Verified state |
-|---|---|
-| Current development code | `master`, including sensor improvements in `8ff0f9b` |
-| Cargo package version | `1.3.1`; source commits after the release retain this version |
-| Latest published release | [v1.3.1](https://github.com/franzjeger/argus-lasso/releases/tag/v1.3.1), published 2026-08-23; checked through GitHub on 2026-09-28 |
-| Local paired installation | Build `8ff0f9b1b6e7-1de5f47218b7`; app service restarted and running executable verified |
-| Installed overlay | Manifest points to the matching versioned library; existing games need restart to load it |
-| Overlay protocol | 5 |
-| Platforms | Linux application; CI configured for x86_64 and aarch64 |
+- `cargo fmt --all --check` and workspace Clippy with `-D warnings` passed.
+- Workspace tests passed: **175 tests**, including shared sensor tests in two
+  binaries. The systemd integration test is excluded from ordinary test runs.
+- The opt-in systemd test passed separately on this host: an isolated transient
+  unit's existing 37% CPU quota and weight 123 were restored after throttling;
+  a subsequent weight-only intervention left its quota intact. The test removed
+  its own unit and did not modify the app service or game units.
+- `cargo build --release --workspace --locked` passed.
+- The read-only X11/Xvfb tour completed all 20 screens. Changed process, recording,
+  rules and update screens were reviewed. The comparison preview uses explicitly
+  synthetic fixtures, not measured game-performance evidence. See the
+  [updated screenshots](screenshots.md#reliability-and-comparison-update).
+- Updater tests cover mismatched bundle hashes, failed staged verification,
+  matched installation, preserved loading preferences, rollback and recovery of
+  an interrupted transaction, all in temporary directories. Release metadata was
+  generated from the locally built app/layer pair. No production update or
+  rollback was performed.
 
-The installed build is a development build, not a new published release. The
-published v1.3.1 predates the current overlay, recording and navigation work.
-The in-app updater compares package/release versions and does not track commits
-or update the Vulkan layer. See [installation](installation.md) and
+## Installation and releases
+
+The earlier paired installation verified at `8ff0f9b` used build
+`8ff0f9b1b6e7-1de5f47218b7`. This review did not replace it or restart its service.
+The published release last checked on 2026-09-28 was
+[v1.3.1](https://github.com/franzjeger/argus-lasso/releases/tag/v1.3.1), which predates
+much of the current source. A successful source build is not a published release.
+
+The current updater compares stable release versions, not commits. New signed
+archives must include matched app/layer metadata. It preserves a previous pair
+for rollback and recovers pending transactions on startup. The privileged sensor
+helper remains separate. See [installation](installation.md) and
 [updater behavior](design-updates.md).
 
-## Verified for this source
+The earlier [CI run for 8ff0f9b](https://github.com/franzjeger/argus-lasso/actions/runs/36382981168)
+is historical evidence, not a CI run for these local changes. CI is configured
+for x86_64/aarch64, formatting/lint and Rust 1.92. The new changes were validated
+locally on x86_64; neither compilation nor unit tests establish game compatibility.
 
-- `cargo fmt --all --check` passed.
-- `cargo clippy --workspace --all-targets --locked -- -D warnings` passed.
-- `cargo test --workspace --locked` passed: 161 tests across app, IPC, layer and
-  sensor-helper test binaries (including shared sensor tests in two binaries).
-- `cargo build --release --workspace --locked` passed.
-- `make install` built and installed the matched app/layer pair. The running
-  executable matched the installed binary, and startup logs reported its build
-  ID and protocol 5.
-- The read-only screenshot tour completed all 20 steps under X11/Xvfb with
-  software rendering. The 17 main-page captures were visually reviewed and
-  published in the [gallery](screenshots.md). Root-window captures do not verify
-  native child windows or Wayland compositor effects.
-
-The [GitHub CI run for this source commit](https://github.com/franzjeger/argus-lasso/actions/runs/36382981168)
-also completed successfully. The [workflow](../.github/workflows/ci.yml) covers
-x86_64/aarch64 builds and tests, lint/formatting and a Rust 1.92 check. Neither
-local nor CI compilation establishes game/driver compatibility.
-
-## Current behavior and limits
+## Behavior and remaining limits
 
 The app provides process management, persistent rules, system-pressure-based
-ProBalance, game launch profiles, sensors, a Vulkan HUD and CPU present-interval
+ProBalance, game profiles, sensors, a Vulkan HUD and CPU present-interval
 recording. The [user guide](user-guide.md) describes controls and defaults.
 
-The latest sensor change reduces redundant cache reads and limits failed NVML
-initialization attempts to once per minute. Hardware history and alerts still
-collect data when HUD fields are hidden. Missing/stale readings are not replaced
-with measured zeroes. No FPS improvement or percentage reduction in CPU use has
-been measured for this change. See [sensor sources and validation](sensors.md).
+Configuration writes have one owner; failed saves remain visible with a retry.
+GUI termination uses stable process handles and cleans up pending Undo actions.
+The optional cgroup backend preserves readable, exactly representable existing
+quotas; its default remains `nice`. Broader distribution, shared-unit and load
+behavior still needs validation. See [cgroup details](design-cgroup-probalance.md).
 
-ProBalance defaults to `nice`. Its optional cgroup backend changes entire units,
-skips protected units and does not preserve an existing CPUQuota on restoration.
-See [backend behavior and remaining validation](design-cgroup-probalance.md).
+Recording comparisons use full-capture summary statistics and peak-per-bin graph
+reduction. They cannot establish causal FPS improvements from unmatched scenes,
+incomplete recordings or different settings. No performance gain is claimed for
+these changes.
 
-Earlier native Vulkan/Steam-runtime tests and synthetic timings are documented
-in the [overlay guide](overlay.md#validation-status), with staged evidence in the
-[historical investigation](archive/overlay-investigation-2026-09-12.md). They are
-not fresh tests of this build. Controlled same-scene game comparisons, actual
-DXVK/VKD3D game-path validation and wider GPU/driver testing remain pending.
-There is no 32-bit layer package or OpenGL/WineD3D overlay implementation.
-
-## Documentation scope
-
-Current guides describe the source tree. Screenshots carry their capture dates;
-the native customization and light-theme examples remain dated September 13 and
-19 respectively. The changelog's released sections and `docs/archive/` preserve
-history, not the current installation. `dist/PKGBUILD` is explicitly a historical
-v1.3.0 desktop-only template and does not package the current overlay.
+Earlier native Vulkan/Steam-runtime tests are documented in the
+[overlay guide](overlay.md#validation-status). They are not fresh tests of this
+build. Controlled same-scene game comparisons, DXVK/VKD3D validation and wider
+GPU/driver testing remain pending. There is no 32-bit layer package or
+OpenGL/WineD3D implementation. Native child-window and Wayland compositor behavior
+are not validated by Xvfb framebuffer captures.

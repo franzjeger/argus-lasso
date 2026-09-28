@@ -57,10 +57,12 @@ monitor session.
 
 ## Restoration limits
 
-The recorded CPUWeight is restored, or reset to its unset default when no
-numeric original was read. Restoration **always clears CPUQuota**. An existing
-quota is not recorded or restored, even when Argus's configured quota is zero.
-Therefore this backend does not preserve pre-existing custom quota settings.
+The recorded CPUWeight is restored, including its unset default. If Argus will
+change CPUQuota, it first reads the effective limit from the unit's `cpu.max`.
+Restoration reinstates that ratio, or unlimited when it was unlimited. Weight-only
+interventions do not write CPUQuota. systemctl accepts two decimal places for quota
+percentages; a limit that cannot be expressed exactly at that precision is refused
+rather than rounded. A failed original-policy read also prevents cgroup throttling.
 Nice restoration and cgroup restoration use the mechanism recorded for the
 intervention, even after the selected method changes.
 
@@ -70,7 +72,7 @@ shutdown is not proof that every external scheduling change succeeded.
 
 ## Validation status and remaining work
 
-Unit tests cover cgroup path classification and the ProBalance policy/protected
+Unit tests cover quota conversion, cgroup path classification and the ProBalance policy/protected
 process behavior. The current workspace tests pass locally; this does not
 establish actual CPUWeight enforcement across desktop environments.
 
@@ -80,8 +82,16 @@ Before changing the default, validate on real KDE/GNOME systems:
 2. Throughput under controlled contention, with observed `cpu.weight` values.
 3. Shared-unit behavior for Steam/Proton, Flatpak and Snap applications.
 4. Controller availability and `auto` fallback across supported distributions.
-5. Preservation of pre-existing resource policy, particularly CPUQuota.
+5. Pre-existing resource policy across distributions and non-default CPU periods.
 
 The older proposal considered creating delegated cgroups or writing system
 cgroups through a root helper. Neither mechanism is implemented here; the
 current backend uses the existing systemd user unit.
+
+An opt-in integration test creates only its own short-lived user unit, verifies a
+37% quota and weight 123, throttles/restores both, then verifies a weight-only
+intervention preserves the quota:
+
+```bash
+cargo test --bin argus-lasso real_user_unit_restores_existing_quota_and_weight -- --ignored
+```

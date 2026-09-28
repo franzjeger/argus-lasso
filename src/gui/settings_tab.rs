@@ -503,7 +503,7 @@ impl SettingsTab {
                     theme::card(ui, "Updates", |ui| {
                         help_text(
                             ui,
-                            "Argus-Lasso can replace its own binary from the project's GitHub \
+                            "Argus-Lasso updates the app and Vulkan overlay together from GitHub \
                      releases. A system-wide install is left to your package manager.",
                         );
                         ui.add_space(tokens::SPACE_S);
@@ -565,6 +565,14 @@ impl SettingsTab {
                                 }
                             }
                         });
+
+                        ui.horizontal_wrapped(|ui| {
+                            if updates.installed && updates.available.is_none() && ui.button("Restart now").clicked() { updates.restart_requested = true; }
+                            if ui.add_enabled(!updates.busy && crate::updater::rollback_available(), egui::Button::new("Restore previous app and overlay")).clicked() {
+                                updates.start_rollback();
+                            }
+                        });
+                        help_text(ui, "A previous installation is retained after an update. Restart games to load the matching overlay. Local service customizations are preserved.");
 
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Check on startup", |ui| {
                             ui.checkbox(&mut self.config.ui.check_updates_on_start, "Enabled");

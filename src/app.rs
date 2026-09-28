@@ -7,7 +7,7 @@ use egui::RichText;
 
 use crossbeam_channel::Sender;
 
-use crate::config::{self, Config};
+use crate::config::Config;
 use crate::gui::bench_tab::BenchTab;
 use crate::gui::gaming_mode_tab::{GamingEvent, GamingModeTab};
 use crate::gui::hw_monitor_tab::HwMonitorTab;
@@ -301,14 +301,7 @@ impl ArgusLassoApp {
         if self.tour.is_some() {
             return;
         }
-        let cfg = if let Ok(s) = self.state.lock() {
-            s.config.clone()
-        } else {
-            return;
-        };
-        if let Err(e) = config::save(&cfg) {
-            log::warn!("Config save failed: {e}");
-        }
+        self.send(DaemonCmd::SaveConfig);
     }
 
     /// Put the UI into the state the current tour step documents.
@@ -399,6 +392,7 @@ impl ArgusLassoApp {
                 if self.pending_kill.is_none() {
                     self.pending_kill = Some(crate::gui::process_tab::PendingKill {
                         pid,
+                        target: None,
                         name: "argus-lasso".into(),
                         force: false,
                         deadline: std::time::Instant::now() + std::time::Duration::from_secs(3600),
@@ -428,12 +422,13 @@ impl eframe::App for ArgusLassoApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Closing the window exits the whole process (daemon included) — ask
-        // the daemon to restore nices/throttles/parked CPUs and wait briefly.
-        crate::monitor::shutdown_and_wait(&self.state, &self.cmd_tx);
+        // Resume any process awaiting Undo before the GUI disappears.
+        self.pending_kill = None;
+        // Flush settings before stopping the single configuration writer.
         if self.pending_config_save.dirty {
             self.save_config();
         }
+        crate::monitor::shutdown_and_wait(&self.state, &self.cmd_tx);
     }
 
     /// 0.34 makes `ui` the required entry point and deprecates `update`.
@@ -441,6 +436,9 @@ impl eframe::App for ArgusLassoApp {
     /// thing that had to change — so it is taken from the `Ui` we are given.
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root_ui.ctx().clone();
+        if self.state.lock().is_ok_and(|s| s.quit_requested) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         self.gaming_mode_tab.poll_game_process();
         let events: Vec<GamingEvent> = std::mem::take(&mut self.gaming_mode_tab.events);
         for event in events {
@@ -631,16 +629,19 @@ impl eframe::App for ArgusLassoApp {
             .show(ctx, &snapshot, &proc_cpu_history, cpu_gen, self.opacity);
 
         // Check pending kill
-        if let Some(ref pk) = self.pending_kill {
+        if let Some(ref mut pk) = self.pending_kill {
             if std::time::Instant::now() >= pk.deadline {
                 let name = pk.name.clone();
                 let pid = pk.pid;
                 let force = pk.force;
-                let msg = match crate::gui::action_handler::ActionHandler::deliver_kill(pid, force)
-                {
+                let msg = match pk.deliver() {
                     Ok(_) => format!(
-                        "{}illed {} ({})",
-                        if force { "Force k" } else { "K" },
+                        "{} {} ({})",
+                        if force {
+                            "Force-kill signal sent to"
+                        } else {
+                            "Termination requested for"
+                        },
                         name,
                         pid
                     ),
@@ -780,10 +781,8 @@ impl eframe::App for ArgusLassoApp {
         }
 
         if undo_requested {
-            if let Some(ref pk) = self.pending_kill {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-                let cont = signal::kill(Pid::from_raw(pk.pid as i32), Signal::SIGCONT);
+            if let Some(ref mut pk) = self.pending_kill {
+                let cont = pk.cancel();
                 let name = pk.name.clone();
                 let pid = pk.pid;
                 if let Ok(mut s) = self.state.lock() {
@@ -799,6 +798,39 @@ impl eframe::App for ArgusLassoApp {
                 }
             }
             self.pending_kill = None;
+        }
+
+        let operation_error = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|s| s.operation_error.clone());
+        if let Some(error) = operation_error {
+            egui::Panel::top("operation_error").show_inside(root_ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(crate::gui::theme::sem(ui).negative, error);
+                    if ui.button("Dismiss").clicked() {
+                        if let Ok(mut s) = self.state.lock() {
+                            s.operation_error = None;
+                        }
+                    }
+                });
+            });
+        }
+        let save_error = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|s| s.config_save_error.clone());
+        if let Some(error) = save_error {
+            egui::Panel::top("config_save_error").show_inside(root_ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(crate::gui::theme::sem(ui).negative, error);
+                    if ui.button("Retry saving").clicked() {
+                        self.save_config();
+                    }
+                });
+            });
         }
 
         egui::CentralPanel::default()
@@ -1101,14 +1133,13 @@ impl eframe::App for ArgusLassoApp {
                     let mut profiles_changed = false;
                     let mut rule_profiles = config.rule_profiles.clone();
                     // Process names for the rule dialog's live match count.
-                    let proc_names: Vec<String> = snapshot.iter().map(|p| p.name.to_string()).collect();
                     self.rules_tab.show(
                         ui,
                         ctx,
                         &self.rule_engine,
                         &mut rules_changed,
                         self.opacity,
-                        &proc_names,
+                        &snapshot,
                         &mut rule_profiles,
                         &mut profiles_changed,
                     );
@@ -1280,17 +1311,18 @@ impl eframe::App for ArgusLassoApp {
                         let content = log_lines.iter().cloned().collect::<Vec<_>>().join("\n");
                         let state = self.state.clone();
                         std::thread::spawn(move || {
-                            if let Some(p) =
-                                crate::file_dialog::save("argus-lasso.log", "*.log *.txt")
-                            {
-                                let msg = match std::fs::write(&p, content) {
-                                    Ok(_) => format!("Log saved to {}", p.display()),
-                                    Err(e) => format!("Log save FAILED: {e}"),
-                                };
-                                if let Ok(mut s) = state.lock() {
-                                    s.append_log(msg);
+                            let result = crate::file_dialog::save("argus-lasso.log", "*.log *.txt")
+                                .and_then(|p| p.map(|p| std::fs::write(&p, &content)
+                                    .map(|_| format!("Log saved to {}", p.display()))
+                                    .map_err(|e| format!("Log save failed: {e}"))).transpose());
+                            if let Ok(mut s) = state.lock() {
+                                match result {
+                                    Ok(Some(msg)) => s.append_log(msg),
+                                    Ok(None) => {},
+                                    Err(e) => { s.append_log(e.clone()); s.operation_error = Some(e); }
                                 }
                             }
+
                         });
                     }
                 }
@@ -1341,10 +1373,11 @@ impl eframe::App for ArgusLassoApp {
         // values were. restart() only returns when it failed.
         if self.updates.restart_requested {
             self.updates.restart_requested = false;
-            crate::monitor::shutdown_and_wait(&self.state, &self.cmd_tx);
+            self.pending_kill = None;
             if self.pending_config_save.dirty {
                 self.save_config();
             }
+            crate::monitor::shutdown_and_wait(&self.state, &self.cmd_tx);
             // The daemon has stopped for good by now, so a failed exec leaves
             // the window up but no longer monitoring — say so plainly.
             self.updates.message = format!(

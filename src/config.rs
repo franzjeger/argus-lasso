@@ -348,24 +348,70 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
     let dir = config_dir();
     fs::create_dir_all(&dir)?;
     let path = config_path();
-    let tmp = path.with_extension("toml.tmp");
-    let text = toml::to_string_pretty(cfg).map_err(|e| std::io::Error::other(e.to_string()))?;
-    // fsync before rename — plain write+rename can leave an empty/truncated
-    // config after a crash or power loss on some filesystems.
-    {
-        use std::io::Write;
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, &path)?;
+    atomic_write(
+        &path,
+        toml::to_string_pretty(cfg)
+            .map_err(|e| std::io::Error::other(e.to_string()))?
+            .as_bytes(),
+    )?;
     log::debug!("Config saved to {}", path.display());
     Ok(())
+}
+
+/// Private, unique staging files avoid cross-process collisions and symlink
+/// truncation. Sync the parent directory as well as the file for durability.
+pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("missing parent"))?;
+    let tmp = parent.join(format!(".argus-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_writes_do_not_follow_destination_symlinks_or_share_staging_files() {
+        let dir = std::env::temp_dir().join(format!("argus-config-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let victim = dir.join("victim");
+        let path = dir.join("config.toml");
+        fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        let workers: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    atomic_write(&path, format!("[ui]\ntheme = 'theme-{i}'\n").as_bytes()).unwrap()
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        toml::from_str::<Config>(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     /// A config with every shape the file uses: nested tables, string and
     /// float arrays, a map of profiles, and an Option that is Some.

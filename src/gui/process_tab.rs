@@ -135,6 +135,34 @@ pub struct PendingKill {
     pub name: String,
     pub force: bool,
     pub deadline: std::time::Instant,
+    pub target: Option<crate::process_control::ProcessHandle>,
+}
+
+impl PendingKill {
+    pub fn deliver(&mut self) -> Result<(), nix::Error> {
+        use nix::sys::signal::Signal;
+        if let Some(target) = self.target.take() {
+            let result = target.signal(if self.force {
+                Signal::SIGKILL
+            } else {
+                Signal::SIGTERM
+            });
+            let _ = target.signal(Signal::SIGCONT);
+            result
+        } else {
+            Ok(())
+        } // Read-only UI preview has no target.
+    }
+    pub fn cancel(&mut self) -> Result<(), nix::Error> {
+        self.target
+            .take()
+            .map_or(Ok(()), |t| t.signal(nix::sys::signal::Signal::SIGCONT))
+    }
+}
+impl Drop for PendingKill {
+    fn drop(&mut self) {
+        let _ = self.cancel();
+    }
 }
 
 // ── Format affinity string with grouped physical+HT pairs ─────────────────────
@@ -322,7 +350,9 @@ impl ProcessTab {
             // frame either, so the row read as two loose fragments rather
             // than a pair — and the grid ended up the taller of the two.
             let row_h = GRID_ROWS as f32 * CELL_H + 16.0;
-            theme::plot_card(ui, hist_w, row_h, |ui| self.history.show(ui));
+            theme::plot_card(ui, hist_w, row_h, |ui| {
+                ui.vertical(|ui| self.history.show(ui));
+            });
             ui.add_space(theme::tokens::SPACE_S);
             theme::plot_card(ui, grid_w, row_h, |ui| self.bars.show(ui));
         });
@@ -347,7 +377,7 @@ impl ProcessTab {
         }
 
         // Filter row + view toggles
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("🔍");
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
@@ -384,8 +414,8 @@ impl ProcessTab {
             ui.label("Port");
             ui.add(
                 egui::TextEdit::singleline(&mut self.port_filter)
-                    .hint_text("e.g. 8080")
-                    .desired_width(70.0),
+                    .hint_text("8080")
+                    .desired_width(88.0),
             );
             if !self.port_filter.is_empty() && ui.small_button("✕").clicked() {
                 self.port_filter.clear();

@@ -164,6 +164,7 @@ impl CpuBarsWidget {
 pub struct CpuHistoryWidget {
     pub history: VecDeque<f32>,
     pub max_samples: usize,
+    sampled_at: VecDeque<std::time::Instant>,
 }
 
 impl CpuHistoryWidget {
@@ -171,17 +172,34 @@ impl CpuHistoryWidget {
         Self {
             history: VecDeque::new(),
             max_samples: 120,
+            sampled_at: VecDeque::new(),
         }
     }
 
     pub fn push(&mut self, avg: f32) {
         self.history.push_back(avg);
+        self.sampled_at.push_back(std::time::Instant::now());
         while self.history.len() > self.max_samples {
             self.history.pop_front();
+            self.sampled_at.pop_front();
         }
     }
 
     pub fn show(&self, ui: &mut Ui) {
+        let seconds = self
+            .sampled_at
+            .front()
+            .zip(self.sampled_at.back())
+            .map_or(0.0, |(first, last)| {
+                last.duration_since(*first).as_secs_f32()
+            });
+        ui.label(
+            egui::RichText::new(format!("CPU total · {seconds:.0} s of history"))
+                .size(theme::tokens::FONT_SMALL),
+        )
+        .on_hover_text(
+            "0–100% of all online CPU capacity. History contains up to 120 displayed samples.",
+        );
         if self.history.len() < 2 {
             // Still claim the space and draw the frame: collapsing to nothing
             // for the first two samples left a card-shaped hole beside the

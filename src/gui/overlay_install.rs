@@ -1,5 +1,7 @@
 //! Preserve the installed, versioned layer when changing automatic loading.
 use std::{io, path::PathBuf};
+pub(crate) static MANIFEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn manifest_path() -> io::Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is unavailable"))?;
     Ok(PathBuf::from(home).join(".local/share/vulkan/implicit_layer.d/ArgusOverlay.json"))
@@ -37,15 +39,16 @@ fn configure(manifest: &mut serde_json::Value, global: bool) -> io::Result<()> {
     Ok(())
 }
 pub fn set_global(global: bool) -> io::Result<()> {
+    let _guard = MANIFEST_LOCK.try_lock().map_err(|_| {
+        io::Error::other("An app/overlay update is in progress; try again when it finishes")
+    })?;
     let mut manifest = read()?;
     configure(&mut manifest, global)?;
     let path = manifest_path()?;
-    let temporary = path.with_extension("json.new");
-    std::fs::write(
-        &temporary,
-        serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?,
-    )?;
-    std::fs::rename(temporary, path)
+    crate::config::atomic_write(
+        &path,
+        &serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?,
+    )
 }
 #[cfg(test)]
 mod tests {

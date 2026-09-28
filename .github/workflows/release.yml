@@ -66,6 +66,7 @@ jobs:
           mkdir -p "${pkg}/assets"
           cp target/release/argus-lasso target/release/libargus_layer.so target/release/argus-sensors "${pkg}/"
           printf '%s\n' "$ARGUS_BUILD_ID" > "${pkg}/BUILD_ID"
+          python3 scripts/package-bundle.py "${pkg}" "$version"
           mkdir -p "${pkg}/scripts"
           cp scripts/install-binaries.sh scripts/install-sensors.sh "${pkg}/scripts/"
           cp -r dist packaging docs LICENSE README.md "${pkg}/"

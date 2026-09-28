@@ -10,19 +10,6 @@ use crate::monitor::{AppState, ProcInfo};
 pub struct ActionHandler;
 
 impl ActionHandler {
-    pub fn deliver_kill(pid: u32, force: bool) -> Result<(), nix::Error> {
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid;
-        let sig = if force {
-            Signal::SIGKILL
-        } else {
-            Signal::SIGTERM
-        };
-        let result = signal::kill(Pid::from_raw(pid as i32), sig);
-        let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGCONT);
-        result
-    }
-
     // One dispatch point borrows the existing UI state without duplicating ownership.
     #[allow(clippy::too_many_arguments)]
     pub fn handle(
@@ -35,80 +22,85 @@ impl ActionHandler {
         notify_error: &impl Fn(&str),
         trigger_rules_tab: &mut Option<crate::rules::Rule>,
     ) {
+        let suspend = matches!(action, TableAction::Suspend { .. });
         match action {
             TableAction::Kill { pid, name, force } => {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-                if let Some(old) = pending_kill.take() {
-                    let msg = match Self::deliver_kill(old.pid, old.force) {
-                        Ok(_) => format!(
-                            "{}illed {} ({}) — superseded by new kill",
-                            if old.force { "Force k" } else { "K" },
-                            old.name,
-                            old.pid
-                        ),
-                        Err(e) => format!("Kill failed for {} ({}): {e}", old.name, old.pid),
-                    };
+                use nix::sys::signal::Signal;
+                let target = snapshot
+                    .iter()
+                    .find(|p| p.pid == pid)
+                    .ok_or(nix::Error::ESRCH)
+                    .and_then(|p| crate::process_control::ProcessHandle::open(pid, p.start_ticks));
+                let target = match target {
+                    Ok(target) => target,
+                    Err(e) => {
+                        notify_error(&format!("Cannot identify {name} ({pid}): {e}"));
+                        return;
+                    }
+                };
+                if let Err(e) = target.signal(Signal::SIGSTOP) {
+                    notify_error(&format!(
+                        "Could not suspend {name} ({pid}); no kill scheduled: {e}"
+                    ));
+                    return;
+                }
+                if let Some(mut old) = pending_kill.take() {
+                    let outcome = old.cancel();
                     if let Ok(mut s) = state.lock() {
-                        s.append_log(msg);
+                        s.append_log(format!(
+                            "Previous kill cancelled for {} ({}): {}",
+                            old.name,
+                            old.pid,
+                            outcome
+                                .map(|_| "resumed".to_owned())
+                                .unwrap_or_else(|e| e.to_string())
+                        ));
                     }
                 }
-                match signal::kill(Pid::from_raw(pid as i32), Signal::SIGSTOP) {
+                *pending_kill = Some(PendingKill {
+                    pid,
+                    name: name.clone(),
+                    force,
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                    target: Some(target),
+                });
+                if let Ok(mut s) = state.lock() {
+                    s.append_log(format!(
+                        "Suspended {name} ({pid}) — will {} in 5s",
+                        if force { "force kill" } else { "terminate" }
+                    ));
+                }
+            }
+            TableAction::Suspend { pid, name } | TableAction::Resume { pid, name } => {
+                let result = snapshot
+                    .iter()
+                    .find(|p| p.pid == pid)
+                    .ok_or(nix::Error::ESRCH)
+                    .and_then(|p| crate::process_control::ProcessHandle::open(pid, p.start_ticks))
+                    .and_then(|t| {
+                        t.signal(if suspend {
+                            nix::sys::signal::Signal::SIGSTOP
+                        } else {
+                            nix::sys::signal::Signal::SIGCONT
+                        })
+                    });
+                match result {
                     Ok(()) => {
-                        *pending_kill = Some(PendingKill {
-                            pid,
-                            name: name.clone(),
-                            force,
-                            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
-                        });
                         if let Ok(mut s) = state.lock() {
+                            if suspend {
+                                s.suspended_pids.insert(pid);
+                            } else {
+                                s.suspended_pids.remove(&pid);
+                            }
                             s.append_log(format!(
-                                "Suspended {} ({}) — will {} in 5s",
-                                name,
-                                pid,
-                                if force { "force kill" } else { "kill" }
+                                "{} {name} ({pid})",
+                                if suspend { "Suspended" } else { "Resumed" }
                             ));
                         }
                     }
                     Err(e) => {
-                        let outcome = match Self::deliver_kill(pid, force) {
-                            Ok(()) => format!(
-                                "{}illed it immediately.",
-                                if force { "Force k" } else { "K" }
-                            ),
-                            Err(ke) => format!("kill also failed: {ke}"),
-                        };
-                        notify_error(&format!(
-                            "Suspend failed for {} ({}): {e}. {outcome}",
-                            name, pid
-                        ));
+                        notify_error(&format!("Process action failed for {name} ({pid}): {e}"))
                     }
-                }
-            }
-            TableAction::Suspend { pid, name } => {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-                match signal::kill(Pid::from_raw(pid as i32), Signal::SIGSTOP) {
-                    Ok(()) => {
-                        if let Ok(mut s) = state.lock() {
-                            s.suspended_pids.insert(pid);
-                            s.append_log(format!("Suspended {} ({})", name, pid));
-                        }
-                    }
-                    Err(e) => notify_error(&format!("Suspend failed for {} ({}): {e}", name, pid)),
-                }
-            }
-            TableAction::Resume { pid, name } => {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-                match signal::kill(Pid::from_raw(pid as i32), Signal::SIGCONT) {
-                    Ok(()) => {
-                        if let Ok(mut s) = state.lock() {
-                            s.suspended_pids.remove(&pid);
-                            s.append_log(format!("Resumed {} ({})", name, pid));
-                        }
-                    }
-                    Err(e) => notify_error(&format!("Resume failed for {} ({}): {e}", name, pid)),
                 }
             }
             TableAction::SetAffinity { pid, name, current } => {
@@ -131,58 +123,55 @@ impl ActionHandler {
                 detail_window.set_pid(pid);
             }
             TableAction::KillTree { pid, name } => {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-                let edges: Vec<(u32, u32)> = snapshot.iter().map(|p| (p.pid, p.ppid)).collect();
+                use nix::sys::signal::Signal;
+                let edges: Vec<_> = snapshot.iter().map(|p| (p.pid, p.ppid)).collect();
                 let tree = crate::utils::process_tree(pid, &edges);
-                if tree.is_empty() {
-                    notify_error(&format!("No process tree found for {} ({})", name, pid));
-                    return;
+                let mut targets = Vec::new();
+                let mut failures = 0;
+                for pid in tree.iter().rev() {
+                    let handle = snapshot
+                        .iter()
+                        .find(|p| p.pid == *pid)
+                        .ok_or(nix::Error::ESRCH)
+                        .and_then(|p| {
+                            crate::process_control::ProcessHandle::open(*pid, p.start_ticks)
+                        });
+                    match handle {
+                        Ok(target) => match target.signal(Signal::SIGTERM) {
+                            Ok(()) => {
+                                let _ = target.signal(Signal::SIGCONT);
+                                targets.push(target);
+                            }
+                            Err(_) => failures += 1,
+                        },
+                        Err(_) => failures += 1,
+                    }
                 }
-                let count = tree.len();
-                let mut killed = 0u32;
-                let mut failed = 0u32;
-                let mut survivors: Vec<u32> = Vec::new();
-                for &t in tree.iter().rev() {
-                    match signal::kill(Pid::from_raw(t as i32), Signal::SIGTERM) {
-                        Ok(()) => {
-                            killed += 1;
-                            let _ = signal::kill(Pid::from_raw(t as i32), Signal::SIGCONT);
-                        }
-                        Err(_) => {
-                            failed += 1;
+                if let Ok(mut s) = state.lock() {
+                    s.append_log(format!("Termination requested for {} processes in tree of {name} ({pid}); {failures} failed", targets.len()));
+                }
+                if failures > 0 {
+                    notify_error(&format!(
+                        "Could not terminate {failures} processes in tree of {name}"
+                    ));
+                }
+                let state = Arc::clone(state);
+                std::thread::spawn(move || {
+                    // Give applications time to flush data before escalation.
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    let mut forced = 0;
+                    let mut failed = 0;
+                    for target in targets {
+                        match target.signal(Signal::SIGKILL) {
+                            Ok(()) => forced += 1,
+                            Err(nix::Error::ESRCH) => {}
+                            Err(_) => failed += 1,
                         }
                     }
-                    survivors.push(t);
-                }
-                // Force-kill anything still alive after a grace period, off
-                // the GUI thread: this ran inline before, blocking every
-                // repaint for 300ms on every "End process and children"
-                // click. The summary below only reflects the SIGTERM pass
-                // either way (the original code didn't track SIGKILL
-                // outcomes separately), so there's nothing this background
-                // sweep needs to report back.
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    for &t in &survivors {
-                        if let Err(nix::Error::ESRCH) =
-                            signal::kill(Pid::from_raw(t as i32), Signal::SIGKILL)
-                        {
-                            continue;
-                        }
-                        let _ = signal::kill(Pid::from_raw(t as i32), Signal::SIGCONT);
+                    if let Ok(mut s) = state.lock() {
+                        s.append_log(format!("Process tree cleanup: {forced} force-kill signals sent; {failed} failed"));
                     }
                 });
-                let msg = format!(
-                    "Killed {} of {} processes in tree of {} ({})",
-                    killed, count, name, pid
-                );
-                if let Ok(mut s) = state.lock() {
-                    s.append_log(msg.clone());
-                }
-                if failed > 0 {
-                    notify_error(&format!("{} — {} failed (permissions?)", msg, failed));
-                }
             }
             TableAction::Export { format } => {
                 let ext = match format {
@@ -194,9 +183,6 @@ impl ActionHandler {
                     crate::gui::process_tab::ExportFormat::Csv => "*.csv",
                     crate::gui::process_tab::ExportFormat::Json => "*.json",
                 };
-                let Some(path) = crate::file_dialog::save(&default_name, filter) else {
-                    return;
-                };
                 let content = match format {
                     crate::gui::process_tab::ExportFormat::Csv => {
                         crate::utils::export_csv(snapshot)
@@ -205,19 +191,33 @@ impl ActionHandler {
                         crate::utils::export_json(snapshot)
                     }
                 };
-                match std::fs::write(&path, content) {
-                    Ok(_) => {
-                        if let Ok(mut s) = state.lock() {
-                            s.append_log(format!(
-                                "Exported {} processes to {}",
-                                snapshot.len(),
-                                path.display()
-                            ));
+                let count = snapshot.len();
+                let state = Arc::clone(state);
+                std::thread::spawn(move || {
+                    let result = (|| -> Result<Option<String>, String> {
+                        let Some(path) = crate::file_dialog::save(&default_name, filter)? else {
+                            return Ok(None);
+                        };
+                        std::fs::write(&path, content)
+                            .map_err(|e| format!("Export failed: {e}"))?;
+                        Ok(Some(format!(
+                            "Exported {count} processes to {}",
+                            path.display()
+                        )))
+                    })();
+                    if let Ok(mut s) = state.lock() {
+                        match result {
+                            Ok(Some(message)) => s.append_log(message),
+                            Ok(None) => {}
+                            Err(error) => {
+                                s.append_log(error.clone());
+                                s.operation_error = Some(error);
+                            }
                         }
                     }
-                    Err(e) => notify_error(&format!("Export failed: {e}")),
-                }
+                });
             }
+
             TableAction::None => {}
         }
     }

@@ -62,7 +62,7 @@ impl ProcEntry {
 #[derive(Debug, Clone)]
 struct UnitThrottle {
     count: usize,
-    original_weight: Option<u64>,
+    original: crate::cgroup::CpuPolicy,
 }
 
 // ── Throttle detail for UI display ───────────────────────────────────────────
@@ -286,12 +286,14 @@ impl ProBalance {
         };
         t.count = t.count.saturating_sub(1);
         if t.count == 0 {
-            let original = t.original_weight;
-            if crate::cgroup::restore_unit(unit, original) {
+            let original = t.original.clone();
+            if crate::cgroup::restore_unit(unit, &original) {
                 self.unit_refs.remove(unit);
                 logs.push(format!(
                     "[ProBalance] RESTORE ({reason}) unit {unit} CPUWeight→{}",
-                    original.map_or("default".to_string(), |w| w.to_string())
+                    original
+                        .weight
+                        .map_or("default".to_string(), |w| w.to_string())
                 ));
             } else {
                 logs.push(format!(
@@ -310,8 +312,10 @@ impl ProBalance {
             .map(|(u, _)| u.clone())
             .collect();
         for unit in pending {
-            let original = self.unit_refs.get(&unit).and_then(|t| t.original_weight);
-            if crate::cgroup::restore_unit(&unit, original) {
+            let Some(original) = self.unit_refs.get(&unit).map(|t| t.original.clone()) else {
+                continue;
+            };
+            if crate::cgroup::restore_unit(&unit, &original) {
                 self.unit_refs.remove(&unit);
                 logs.push(format!("[ProBalance] RESTORE (retry) unit {unit}"));
             }
@@ -342,19 +346,19 @@ impl ProBalance {
                         ));
                         return Some(Applied::Cgroup { unit });
                     }
-                    let original = crate::cgroup::read_unit_cpu_weight(&unit);
-                    if crate::cgroup::throttle_unit(
+                    let original = crate::cgroup::read_unit_cpu_policy(
                         &unit,
-                        self.cfg.cgroup_throttle_weight,
-                        self.cfg.cgroup_quota_percent,
-                    ) {
-                        self.unit_refs.insert(
-                            unit.clone(),
-                            UnitThrottle {
-                                count: 1,
-                                original_weight: original,
-                            },
-                        );
+                        self.cfg.cgroup_quota_percent > 0,
+                    );
+                    if let Some(original) = original.filter(|_| {
+                        crate::cgroup::throttle_unit(
+                            &unit,
+                            self.cfg.cgroup_throttle_weight,
+                            self.cfg.cgroup_quota_percent,
+                        )
+                    }) {
+                        self.unit_refs
+                            .insert(unit.clone(), UnitThrottle { count: 1, original });
                         logs.push(format!(
                             "[ProBalance] THROTTLE {}({}) cpu={:.1}% unit {unit} CPUWeight→{}",
                             proc.name, proc.pid, proc.cpu_percent, self.cfg.cgroup_throttle_weight

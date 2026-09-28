@@ -77,6 +77,7 @@ pub struct GamingModeTab {
     pub watch_phase: WatchPhase,
     pub launched_pid: Option<u32>,
     pub watch_status: String,
+    launch_error: bool,
     pub last_poll: std::time::Instant,
 
     // Profiles
@@ -147,6 +148,7 @@ impl GamingModeTab {
             watch_phase: WatchPhase::Idle,
             launched_pid: None,
             watch_status: String::new(),
+            launch_error: false,
             last_poll: std::time::Instant::now(),
             selected_profile: String::new(),
             show_install_dialog: false,
@@ -770,7 +772,7 @@ impl GamingModeTab {
                         }
                         ui.checkbox(&mut self.auto_restore, "Disable Gaming Mode when the game exits");
                         if !self.watch_status.is_empty() {
-                            ui.colored_label(s.ok, &self.watch_status);
+                            ui.colored_label(if self.launch_error { s.negative } else { s.ok }, &self.watch_status);
                         }
                     });
                 });
@@ -986,23 +988,46 @@ impl GamingModeTab {
     }
 
     fn launch_game(&mut self) {
-        if !self.parked {
+        self.launch_error = false;
+        let parts = match parse_launch_command(&self.command) {
+            Ok(parts) => parts,
+            Err(error) => {
+                self.launch_error = true;
+                self.watch_status = error.clone();
+                self.append_log(format!("[Launcher] {error}"));
+                return;
+            }
+        };
+        let was_parked = self.parked;
+        if !was_parked {
             self.enable_gaming_mode();
         }
-
-        let cmd = self.command.clone();
-        self.append_log(format!("[Launcher] Launching '{}': {cmd}", self.game_name));
-        self.watch_phase = WatchPhase::Waiting;
-        self.watch_status = "Waiting for game process…".into();
-        self.last_poll = std::time::Instant::now();
-
-        // Spawn detached
-        let parts: Vec<_> = cmd.split_whitespace().collect();
-        if let Some((prog, args)) = parts.split_first() {
-            let _ = std::process::Command::new(prog)
-                .args(args)
-                .env("ARGUS_LASSO_HUD", "1")
-                .spawn();
+        match std::process::Command::new(&parts[0])
+            .args(&parts[1..])
+            .env("ARGUS_LASSO_HUD", "1")
+            .spawn()
+        {
+            Ok(mut child) => {
+                // Reap the launcher even when it exits before the actual game.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                self.append_log(format!(
+                    "[Launcher] Launching '{}': {}",
+                    self.game_name, self.command
+                ));
+                self.watch_phase = WatchPhase::Waiting;
+                self.watch_status = "Waiting for game process…".into();
+                self.last_poll = std::time::Instant::now();
+            }
+            Err(error) => {
+                if !was_parked && self.parked {
+                    self.disable_gaming_mode();
+                }
+                self.launch_error = true;
+                self.watch_status = format!("Could not launch {}: {error}", parts[0]);
+                self.append_log(format!("[Launcher] {}", self.watch_status));
+            }
         }
     }
 }
@@ -1159,4 +1184,28 @@ fn proc_name_matches(game_name: &str, pid: u32) -> bool {
         }
     }
     false
+}
+
+fn parse_launch_command(command: &str) -> Result<Vec<String>, String> {
+    let parts =
+        shlex::split(command).ok_or("Invalid command: close all quotes and escape sequences.")?;
+    if parts.first().is_none_or(String::is_empty) {
+        return Err("Enter a program to launch.".into());
+    }
+    Ok(parts)
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::parse_launch_command;
+    #[test]
+    fn quoted_arguments_and_paths_are_preserved_without_shell_execution() {
+        assert_eq!(
+            parse_launch_command(r#""/games/My Game/game" --name 'Player One' "" '$HOME'"#)
+                .unwrap(),
+            ["/games/My Game/game", "--name", "Player One", "", "$HOME"]
+        );
+        assert!(parse_launch_command("game 'unterminated").is_err());
+        assert!(parse_launch_command("  ").is_err());
+    }
 }

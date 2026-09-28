@@ -30,6 +30,9 @@ memory bandwidth benchmarks report decimal GB/s. Temperature readings use °C.
 
 Appearance and HUD edits save immediately. Forms with an **Apply changes** button
 use a draft until applied. Settings and Gaming preserve each other's saved fields.
+One monitor-thread writer persists the latest shared configuration. A failed save
+appears in a persistent banner with **Retry saving**; it is not silently treated
+as a successful disk write.
 
 ## Process table
 
@@ -41,7 +44,12 @@ Cached names refresh on process renames and at least every five seconds.
 Right-click a process for actions; double-click for details. Process identity is
 shown once at the top of the context menu. Priority, CPU assignment and rule
 creation are grouped separately from termination. The GUI Delete action offers
-an undo window; a CLI kill does not.
+a five-second undo window. Scheduling another termination cancels and resumes
+the previous pending target. Closing Argus or restarting it also cancels a pending
+termination. Delayed signals use Linux process handles so PID reuse cannot redirect
+them. Process actions report an error if those handles are unavailable. A CLI kill
+has no undo window. Ending a process tree sends SIGTERM first, then SIGKILL after
+three seconds to remaining targets.
 
 Numeric columns align right. Font-aware minimum widths keep long PIDs and
 multicore CPU readings inside their cells, including when reusing older saved
@@ -91,9 +99,10 @@ responsiveness algorithm.
 
 The existing nice and optional cgroup CPUWeight backends remain available. They
 adjust scheduling priority under contention, not the measured CPU percentage.
-Cgroup also offers a separate optional quota. Its current restore path clears
-CPUQuota instead of restoring a previous custom quota. The default remains
-`nice`. [Backend details and limits](design-cgroup-probalance.md).
+Cgroup also offers a separate optional quota. Argus records the existing quota
+before changing it and restores it afterward. Weight-only interventions leave
+quotas unchanged. Unreadable or unrepresentable original policies are not modified
+through the cgroup backend. The default remains `nice`. [Backend details and limits](design-cgroup-probalance.md).
 
 Configuration uses `system_cpu_threshold_percent`,
 `system_restore_threshold_percent` and `process_min_cpu_percent` under
@@ -103,7 +112,19 @@ than silently reinterpreted. Existing exemptions, timing, method and nice settin
 are preserved. Subsequent config saves write the new keys. Recovery is constrained
 to stay below activation, and all percentage controls reject non-finite values.
 
+**Process rules → Live rule effects** lists running matches and requested versus
+observed values. Selecting a rule narrows the list; **Show all rules** clears it.
+Rules run top to bottom, with the last matching assignment winning for each field.
+Conflicting overlapping assignments are marked. Requested values are not a promise
+of successful enforcement: permissions, manual overrides and ProBalance can differ.
+
 ## Gaming, telemetry and windows
+
+Launcher commands support quoted paths and arguments, including spaces. Commands
+are executed directly: shell operators and variable expansion are not evaluated.
+An invalid command or failed launch is shown immediately. If this launch enabled
+CPU parking but the program could not start, that parking is undone.
+
 
 Enable the display under **Gaming → Overlay** to unlock **Customize overlay**.
 The separate window controls visible readings, individual value colors, text size,
@@ -122,6 +143,14 @@ ordinary visibility, color and layout edits apply while it runs.
 GlobalShortcuts portal suggests Shift+F2; your desktop confirms the actual key.
 The registration lasts for the Argus session. A desktop without a compatible
 portal can use the recording button or `argus-lasso record --seconds 60`.
+
+Recent recordings show executable name, local date/time, duration and completeness.
+Choose **Compare latest two**, or expand recordings and use **Use as A** / **Use as B**.
+The comparison shows average FPS, 1% low FPS, p99 frametime and percentage change
+from A to B. The graph retains the peak interval in each time bin; summary metrics
+use the original full capture. Compare the same scene and settings, and check
+completeness and duration before drawing conclusions. File scanning and bounded
+CSV loading run on workers so a large recording does not block the UI.
 
 **Gaming → Sensors** explains which fields the optional root reader can provide.
 The desktop app and game layer always run as the regular user. See

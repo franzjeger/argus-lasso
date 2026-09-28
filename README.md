@@ -76,6 +76,10 @@ from 5 to 600 seconds. Set up the desktop-authorized global shortcut there
 argus-lasso record --seconds 60
 ```
 
+Recent recordings show application, local time, duration and completeness. Use
+**Compare latest two**, or **Use as A** / **Use as B** inside recordings, to compare
+average/1% low FPS, p99 frametime and peak-preserving frametime graphs.
+
 Every accepted Vulkan present interval is recorded; disk I/O happens on a worker.
 CSV, metadata and summaries are saved privately under
 `~/.local/share/argus-lasso/benchmarks`. Loss or write failures mark a result
@@ -156,8 +160,9 @@ argus-lasso kill 1234                # SIGTERM; --force uses SIGKILL
 RUST_LOG=debug argus-lasso           # diagnostics
 ```
 
-The process-table Delete action has an undo countdown. The CLI kill command does
-not. File dialogs use `kdialog`, `zenity` or `qarma`; Lutris scanning uses `sqlite3`.
+The process-table Delete action has an undo countdown; another pending action
+cancels the previous one. Closing/restarting resumes a pending target. GUI signals
+use stable process handles. The CLI kill command has no undo countdown. File dialogs use `kdialog`, `zenity` or `qarma`; Lutris scanning uses `sqlite3`.
 
 ## License
 

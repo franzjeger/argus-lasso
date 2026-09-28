@@ -48,14 +48,60 @@ fn systemctl_user(args: &[&str]) -> Option<std::process::Output> {
         .ok()
 }
 
-/// Read the unit's current CPUWeight. None = not set (kernel default 100).
-pub fn read_unit_cpu_weight(unit: &str) -> Option<u64> {
-    // "--" so a unit name starting with '-' can't be parsed as a flag
-    let out = systemctl_user(&["show", "-p", "CPUWeight", "--value", "--", unit])?;
+#[derive(Debug, Clone, PartialEq)]
+pub struct CpuPolicy {
+    pub weight: Option<u64>,
+    /// None means we did not change quota. Empty assignment restores unlimited.
+    pub quota: Option<String>,
+}
+
+/// Refuse to throttle when original settings cannot be read reliably.
+pub fn read_unit_cpu_policy(unit: &str, change_quota: bool) -> Option<CpuPolicy> {
+    let out = systemctl_user(&["show", "-p", "CPUWeight", "-p", "ControlGroup", "--", unit])?;
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    let text = String::from_utf8_lossy(&out.stdout);
+    let value = |key: &str| text.lines().find_map(|l| l.strip_prefix(key));
+    let weight = match value("CPUWeight=")? {
+        "[not set]" | "infinity" | "18446744073709551615" => None,
+        n => Some(n.parse().ok()?),
+    };
+    let quota = if change_quota {
+        let group = value("ControlGroup=")?;
+        if !group.starts_with("/user.slice/") || group.split('/').any(|c| c == "..") {
+            return None;
+        }
+        let raw = std::fs::read_to_string(format!("/sys/fs/cgroup{group}/cpu.max")).ok()?;
+        Some(quota_assignment(&raw)?)
+    } else {
+        None
+    };
+    Some(CpuPolicy { weight, quota })
+}
+
+fn quota_assignment(raw: &str) -> Option<String> {
+    let mut parts = raw.split_whitespace();
+    let quota = parts.next()?;
+    let period: u64 = parts.next()?.parse().ok()?;
+    if period == 0 || parts.next().is_some() {
+        return None;
+    }
+    if quota == "max" {
+        return Some(String::new());
+    }
+    let quota: u64 = quota.parse().ok()?;
+    if quota == 0 {
+        return None;
+    }
+    // systemctl accepts at most two decimal places. Refuse policies that
+    // cannot be represented exactly instead of rounding away a user limit.
+    let scaled = u128::from(quota) * 10_000;
+    if !scaled.is_multiple_of(u128::from(period)) {
+        return None;
+    }
+    let hundredths = scaled / u128::from(period);
+    Some(format!("{}.{:02}%", hundredths / 100, hundredths % 100))
 }
 
 /// Apply a throttle to a unit. `quota_percent` 0 = no hard cap.
@@ -79,29 +125,84 @@ pub fn throttle_unit(unit: &str, weight: u32, quota_percent: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Undo a throttle. Restores the recorded original weight, or resets the
-/// property to its unset default (empty assignment) when none was recorded;
-/// always clears any quota we may have set.
-pub fn restore_unit(unit: &str, original_weight: Option<u64>) -> bool {
-    let weight_prop = match original_weight {
-        Some(w) => format!("CPUWeight={w}"),
-        None => "CPUWeight=".to_string(),
-    };
-    systemctl_user(&[
-        "set-property",
-        "--runtime",
-        "--",
-        unit,
-        weight_prop.as_str(),
-        "CPUQuota=",
-    ])
-    .map(|o| o.status.success())
-    .unwrap_or(false)
+/// Restore only the properties we changed, preserving pre-existing quotas.
+pub fn restore_unit(unit: &str, original: &CpuPolicy) -> bool {
+    let weight = original.weight.map_or_else(
+        || "CPUWeight=".into(),
+        |w| {
+            if w == 0 {
+                "CPUWeight=idle".into()
+            } else {
+                format!("CPUWeight={w}")
+            }
+        },
+    );
+    let quota = original.quota.as_ref().map(|q| format!("CPUQuota={q}"));
+    let mut args = vec!["set-property", "--runtime", "--", unit, &weight];
+    if let Some(ref q) = quota {
+        args.push(q);
+    }
+    systemctl_user(&args).is_some_and(|o| o.status.success())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn quota_round_trip_preserves_finite_and_unlimited_limits() {
+        assert_eq!(quota_assignment("50000 100000"), Some("50.00%".into()));
+        assert_eq!(quota_assignment("250000 100000"), Some("250.00%".into()));
+        assert_eq!(quota_assignment("max 100000"), Some(String::new()));
+        assert_eq!(quota_assignment("12345 100000"), None);
+        assert_eq!(quota_assignment("37120 100000"), Some("37.12%".into()));
+        assert_eq!(quota_assignment("100 0"), None);
+        assert_eq!(quota_assignment("garbage"), None);
+    }
+
+    #[test]
+    #[ignore = "requires a running systemd user manager and delegated CPU controller"]
+    fn real_user_unit_restores_existing_quota_and_weight() {
+        let unit = format!("argus-policy-test-{}.service", uuid::Uuid::new_v4());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = systemctl_user(&["stop", "--", &self.0]);
+            }
+        }
+        let _cleanup = Cleanup(unit.clone());
+        assert!(Command::new("systemd-run")
+            .args([
+                "--user",
+                "--quiet",
+                "--collect",
+                "--unit",
+                &unit,
+                "--property=CPUQuota=37%",
+                "--property=CPUWeight=123",
+                "sleep",
+                "30"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        let original = read_unit_cpu_policy(&unit, true).expect("original CPU policy");
+        assert_eq!(original.weight, Some(123));
+        assert_eq!(original.quota.as_deref(), Some("37.00%"));
+        assert!(throttle_unit(&unit, 25, 10));
+        assert_eq!(
+            read_unit_cpu_policy(&unit, true).unwrap().quota.as_deref(),
+            Some("10.00%")
+        );
+        assert!(restore_unit(&unit, &original));
+        assert_eq!(read_unit_cpu_policy(&unit, true), Some(original));
+        let weight_only = read_unit_cpu_policy(&unit, false).unwrap();
+        assert!(throttle_unit(&unit, 25, 0));
+        assert!(restore_unit(&unit, &weight_only));
+        assert_eq!(
+            read_unit_cpu_policy(&unit, true).unwrap().quota.as_deref(),
+            Some("37.00%")
+        );
+    }
 
     #[test]
     fn app_scope_is_throttleable() {

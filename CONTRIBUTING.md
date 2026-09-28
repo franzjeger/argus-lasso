@@ -52,5 +52,5 @@ configuration, credentials or build output.
 The release workflow packages a matching app/layer/helper and installer scripts
 and requires the configured minisign secret to sign archives. It runs only for a
 tag or explicit release dispatch; pushing source does not publish a new release.
-The in-app updater still updates only the desktop binary and integration, so
-current overlay installations must use the paired installer.
+The in-app updater requires signed matched-bundle metadata and retains a previous
+app/layer pair for rollback. The source installer remains available for local builds.

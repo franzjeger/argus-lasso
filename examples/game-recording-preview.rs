@@ -16,9 +16,13 @@ struct Preview {
     sensors: sensor_access::SensorAccess,
     last: String,
     started: std::time::Instant,
+    compare_requested: bool,
 }
 impl eframe::App for Preview {
     fn ui(&mut self, root: &mut egui::Ui, _: &mut eframe::Frame) {
+        if self.compare_requested && self.bench.compare_recent() {
+            self.compare_requested = false;
+        }
         egui::CentralPanel::default().show_inside(root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.bench.show(ui);
@@ -58,6 +62,7 @@ fn main() -> eframe::Result {
                 sensors: Default::default(),
                 last: String::new(),
                 started: std::time::Instant::now(),
+                compare_requested: std::env::args().any(|a| a == "--compare"),
             }))
         }),
     )

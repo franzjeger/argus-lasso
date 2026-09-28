@@ -99,3 +99,20 @@ This verifies text hierarchy and contrast; the embedded window does not test
 native window decorations or compositor transparency.
 
 ![Light-theme overlay controls](../assets/screenshots/2026-09-19/overlay-settings-light.png)
+
+
+## Reliability and comparison update
+
+Captured on 2026-09-28 from the subsequent local working tree. These replace the
+corresponding earlier views for the changed controls; the other screenshots above
+retain their original source attribution. The main-window images use the read-only
+X11/Xvfb tour. The comparison image uses the real recording UI in its isolated
+preview with **synthetic demo recordings**, not measured game-performance results.
+
+| Process history and filters | Rule effects entry point |
+|---|---|
+| ![Processes](../assets/screenshots/2026-09-28-reliability/processes.png) | ![Rules](../assets/screenshots/2026-09-28-reliability/rules.png) |
+| **Readable recording history** | **Matched updates and rollback** |
+| ![Recording](../assets/screenshots/2026-09-28-reliability/recording.png) | ![Updates](../assets/screenshots/2026-09-28-reliability/updates.png) |
+
+![Recording comparison with synthetic demo data](../assets/screenshots/2026-09-28-reliability/comparison-demo.png)

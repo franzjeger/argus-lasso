@@ -68,10 +68,11 @@ impl RulesTab {
         rule_engine: &Arc<Mutex<RuleEngine>>,
         on_rules_changed: &mut bool,
         opacity: f32,
-        proc_names: &[String],
+        snapshot: &[crate::monitor::ProcInfo],
         rule_profiles: &mut std::collections::HashMap<String, Vec<crate::config::RuleConfig>>,
         on_profiles_changed: &mut bool,
     ) {
+        let proc_names: Vec<String> = snapshot.iter().map(|p| p.name.to_string()).collect();
         // ── Drain background file-dialog results ───────────────────────────
         while let Ok(result) = self.file_rx.try_recv() {
             match result {
@@ -108,6 +109,34 @@ impl RulesTab {
         // ── Toolbar ────────────────────────────────────────────────────────
         self.toolbar(ui, rule_engine, rule_profiles, on_profiles_changed, &rules);
 
+        egui::CollapsingHeader::new("Live rule effects").show(ui, |ui| {
+            theme::help_text(ui, "Rules run from top to bottom. The last matching rule that sets a field supplies its requested value. Actual values can differ because of permissions, manual overrides or ProBalance.");
+            egui::ScrollArea::vertical().id_salt("rule_effects").max_height(230.0).show(ui, |ui| {
+                egui::Grid::new("rule_effects_grid").striped(true).num_columns(4).show(ui, |ui| {
+                    for label in ["Process", "Matching rules", "Requested values", "Observed values"] { ui.strong(label); }
+                    ui.end_row();
+                    let mut count = 0;
+                    for process in snapshot {
+                        let effect = crate::rules::preview_effect(&rules, &process.name);
+                        if effect.matches.is_empty() { continue; }
+                        if self.selected_rule_id.as_ref().is_some_and(|id| !effect.matches.iter().any(|r| &r.rule_id == id)) { continue; }
+                        count += 1;
+                        ui.label(format!("{} ({})", process.name, process.pid));
+                        ui.label(effect.matches.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join(" → "));
+                        ui.vertical(|ui| {
+                            ui.label(format!("CPU {} · nice {} · I/O {}", effect.affinity.unwrap_or("unchanged"),
+                                effect.nice.map_or("unchanged".into(), |v| v.to_string()),
+                                effect.ionice.map_or("unchanged".into(), |(c,l)| format!("{c}:{l}"))));
+                            if effect.conflict { ui.colored_label(theme::sem(ui).warning, "Overlapping rules set different values"); }
+                        });
+                        ui.label(format!("CPU {} · nice {} · I/O {}", process.affinity, process.nice, process.ionice));
+                        ui.end_row();
+                    }
+                    if count == 0 { ui.label("No running processes match the selected rules."); ui.end_row(); }
+                });
+            });
+            if self.selected_rule_id.is_some() && ui.small_button("Show all rules").clicked() { self.selected_rule_id = None; }
+        });
         if !self.status.is_empty() {
             ui.label(
                 RichText::new(&self.status)
@@ -493,7 +522,7 @@ impl RulesTab {
 
         // ── Dialogs ────────────────────────────────────────────────────────
         if let Some(ref mut dlg) = self.edit_dialog {
-            if let Some(result) = dlg.show(ctx, opacity, proc_names) {
+            if let Some(result) = dlg.show(ctx, opacity, &proc_names) {
                 self.edit_dialog = None;
                 if let Some(rule) = result {
                     if let Ok(mut re) = rule_engine.lock() {
@@ -681,8 +710,12 @@ impl RulesTab {
         let tx = self.file_tx.clone();
         std::thread::spawn(move || {
             let path = match crate::file_dialog::open("*.json") {
-                Some(p) => p,
-                None => return,
+                Ok(Some(p)) => p,
+                Ok(None) => return,
+                Err(e) => {
+                    let _ = tx.send(FileDialogResult::ExportDone(e));
+                    return;
+                }
             };
             let result = match std::fs::read_to_string(&path) {
                 Err(e) => Err(format!("Read error: {e}")),
@@ -701,8 +734,12 @@ impl RulesTab {
         let tx = self.file_tx.clone();
         std::thread::spawn(move || {
             let path = match crate::file_dialog::save("argus_lasso_rules.json", "*.json") {
-                Some(p) => p,
-                None => return,
+                Ok(Some(p)) => p,
+                Ok(None) => return,
+                Err(e) => {
+                    let _ = tx.send(FileDialogResult::ExportDone(e));
+                    return;
+                }
             };
             let msg = match serde_json::to_string_pretty(&rules) {
                 Err(e) => format!("Serialise error: {e}"),

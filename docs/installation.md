@@ -98,9 +98,10 @@ and minisign signature, extract it and run from the extracted directory:
 ```
 
 Older archives lack these files. They install only their original app. The in-app
-updater currently replaces the GUI binary and existing desktop integration; it
-does **not** upgrade the Vulkan layer or privileged sensor binary. Use the paired
-installer for current overlay builds. No new release is implied by an Unreleased
+updater in the current source installs a matched app/layer pair from signed
+archives containing bundle metadata and retains a rollback. The privileged
+sensor helper remains separate. Older archives without bundle metadata require
+manual installation. See [updater behavior](design-updates.md). No new release is implied by an Unreleased
 changelog entry.
 
 `dist/PKGBUILD` is an older-release packaging template, not evidence of a published

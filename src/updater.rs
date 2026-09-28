@@ -13,6 +13,8 @@
 //! with a key that does not live in the release; see the note in
 //! `docs/design-updates.md`.
 
+mod bundle;
+
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -49,6 +51,7 @@ pub enum Status {
     Available(Box<Update>),
     /// Install finished; the new binary is in place and needs a restart.
     Installed,
+    RolledBack,
     Error(String),
 }
 
@@ -216,25 +219,31 @@ fn verify_signature(
         .map_err(|e| format!("signature check failed: {e}. The download was not installed."))
 }
 
-/// Compare dotted numeric versions. Non-numeric parts sort as 0, so a
-/// pre-release suffix never reads as newer than the release it precedes.
+/// SemVer prereleases sort below stable releases; build metadata does not affect precedence.
 fn is_newer(candidate: &str, current: &str) -> bool {
-    let parts = |v: &str| -> Vec<u64> {
-        v.split(['.', '-', '+'])
-            .map(|p| p.parse::<u64>().unwrap_or(0))
-            .collect()
-    };
-    let (a, b) = (parts(candidate), parts(current));
-    for i in 0..a.len().max(b.len()) {
-        let (x, y) = (
-            a.get(i).copied().unwrap_or(0),
-            b.get(i).copied().unwrap_or(0),
-        );
-        if x != y {
-            return x > y;
-        }
+    match (
+        semver::Version::parse(candidate),
+        semver::Version::parse(current),
+    ) {
+        (Ok(a), Ok(b)) => a.cmp_precedence(&b).is_gt(),
+        _ => false,
     }
-    false
+}
+
+pub fn rollback_available() -> bool {
+    install_target().is_ok_and(|p| bundle::available(&p))
+}
+pub fn rollback_update() -> Result<bool, String> {
+    let _guard = crate::gui::overlay_install::MANIFEST_LOCK
+        .lock()
+        .map_err(|_| "Overlay update lock failed")?;
+    bundle::rollback(&install_target()?, false)
+}
+pub fn recover_pending_update() -> Result<bool, String> {
+    let _guard = crate::gui::overlay_install::MANIFEST_LOCK
+        .lock()
+        .map_err(|_| "Overlay update lock failed")?;
+    bundle::rollback(&install_target()?, true)
 }
 
 // ── Install ───────────────────────────────────────────────────────────────
@@ -270,8 +279,12 @@ fn can_write(path: &Path) -> bool {
     };
     // Probe by creating and removing a temp file; a read-only check on the
     // mode bits would miss ACLs, read-only mounts and root-owned dirs.
-    let probe = dir.join(".argus-lasso-write-probe");
-    match std::fs::File::create(&probe) {
+    let probe = dir.join(format!(".argus-write-probe-{}", uuid::Uuid::new_v4()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);
             true
@@ -325,23 +338,7 @@ fn install_blocking(update: &Update) -> Result<(), String> {
         .map_err(|_| "signature file is not valid text".to_string())?;
     verify_signature(PUBLIC_KEY, &tarball, &signature_text)?;
 
-    let binary = extract_binary(&tarball)?;
-
-    // Write beside the target and rename: rename is atomic, and it works
-    // even though the old binary is running, whereas writing over it in
-    // place fails with ETXTBSY.
-    let dir = target.parent().ok_or("binary has no parent directory")?;
-    let staged = dir.join(".argus-lasso.update");
-    std::fs::write(&staged, &binary).map_err(|e| format!("could not stage the update: {e}"))?;
-    set_executable(&staged)?;
-    if let Err(e) = verify_staged_binary_is_an_upgrade(&staged) {
-        let _ = std::fs::remove_file(&staged);
-        return Err(e);
-    }
-    std::fs::rename(&staged, &target).map_err(|e| {
-        let _ = std::fs::remove_file(&staged);
-        format!("could not replace the binary: {e}")
-    })?;
+    bundle::install(&tarball, &target, &update.version)?;
 
     // Best-effort, and deliberately after the rename: the update has already
     // succeeded by this point, so a desktop file we could not rewrite is a
@@ -544,6 +541,30 @@ fn extract_binary(tarball: &[u8]) -> Result<Vec<u8>, String> {
     Ok(binary)
 }
 
+/// Required bundle members must match exactly once, just like the application.
+fn extract_exact(tarball: &[u8], pattern: &str) -> Result<Vec<u8>, String> {
+    let listing = run_tar(
+        &["-tz", TAR_MATCH_FLAGS[0], TAR_MATCH_FLAGS[1], pattern],
+        tarball,
+    )?;
+    if String::from_utf8_lossy(&listing)
+        .lines()
+        .filter(|s| !s.is_empty())
+        .count()
+        != 1
+    {
+        return Err(format!("Release must contain exactly one {pattern}"));
+    }
+    let bytes = run_tar(
+        &["-xzO", TAR_MATCH_FLAGS[0], TAR_MATCH_FLAGS[1], pattern],
+        tarball,
+    )?;
+    if bytes.is_empty() {
+        return Err(format!("Release member {pattern} is empty"));
+    }
+    Ok(bytes)
+}
+
 // ── Support files ─────────────────────────────────────────────────────────
 
 /// Pull one member out of the tarball, or `None` if it is not there.
@@ -601,19 +622,18 @@ fn refresh_support_files(tarball: &[u8], target: &Path) -> Vec<String> {
         }
     }
 
-    // systemd user unit — ExecStart carries an absolute path plus flags, so
-    // swap only the path and keep whatever arguments the release ships.
-    if let Some(raw) = extract_member(tarball, "*/dist/argus-lasso.service") {
+    // Local systemd service customizations belong to the user.
+    if let Some(raw) = extract_member(
+        tarball,
+        "*/packaging/io.github.franzjeger.ArgusLasso.desktop",
+    ) {
         if let Ok(text) = String::from_utf8(raw) {
-            let patched = text.replace("%h/.local/bin/argus-lasso", &exe);
-            let unit = home.join(".config/systemd/user/argus-lasso.service");
-            if let Some(note) = refresh_if_present(&unit, patched.as_bytes(), "systemd user unit") {
-                notes.push(note);
-                // A rewritten unit is inert until systemd re-reads it.
-                let _ = std::process::Command::new("systemctl")
-                    .args(["--user", "daemon-reload"])
-                    .output();
-            }
+            notes.extend(refresh_if_present(
+                &home.join(".local/share/applications/io.github.franzjeger.ArgusLasso.desktop"),
+                text.replace("Exec=argus-lasso", &format!("Exec={exe}"))
+                    .as_bytes(),
+                "portal desktop entry",
+            ));
         }
     }
 
@@ -733,12 +753,6 @@ fn render_icon(renderer: &str, svg: &Path, size: u32, dest: &Path) -> bool {
             .arg(dest);
     }
     cmd.output().is_ok_and(|o| o.status.success())
-}
-
-fn set_executable(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("could not mark the update executable: {e}"))
 }
 
 /// Replace this process with the freshly installed binary.
@@ -880,9 +894,17 @@ mod tests {
     }
 
     #[test]
-    fn missing_components_count_as_zero() {
-        assert!(is_newer("1.1", "1.0.9"));
+    fn malformed_versions_are_rejected() {
+        assert!(!is_newer("1.1", "1.0.9"));
         assert!(!is_newer("1.0", "1.0.0"));
+    }
+
+    #[test]
+    fn semver_ignores_build_metadata_and_orders_prereleases() {
+        assert!(!is_newer("1.3.1+new", "1.3.1+old"));
+        assert!(!is_newer("1.4.0-rc.1", "1.4.0"));
+        assert!(is_newer("1.4.0", "1.4.0-rc.1"));
+        assert!(is_newer("1.4.0-rc.10", "1.4.0-rc.2"));
     }
 
     #[test]
@@ -1090,6 +1112,22 @@ impl UpdateState {
         self.job = Some(check());
     }
 
+    pub fn start_rollback(&mut self) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.message = "Restoring previous app and overlay…".into();
+        self.job = Some(spawn(|tx| {
+            let status = match rollback_update() {
+                Ok(true) => Status::RolledBack,
+                Ok(false) => Status::Error("No previous installation is available.".into()),
+                Err(e) => Status::Error(e),
+            };
+            let _ = tx.send(status);
+        }));
+    }
+
     pub fn start_install(&mut self) {
         let Some(update) = self.available.clone() else {
             return;
@@ -1116,7 +1154,10 @@ impl UpdateState {
         match status {
             Status::UpToDate => {
                 self.available = None;
-                self.message = format!("Up to date — v{} is the latest.", current_version());
+                self.message = format!(
+                    "No newer stable release than v{}. Development commits are not checked.",
+                    current_version()
+                );
             }
             Status::Available(u) => {
                 self.message = format!("v{} is available.", u.version);
@@ -1130,7 +1171,13 @@ impl UpdateState {
                     .as_ref()
                     .map(|u| u.tag.clone())
                     .unwrap_or_default();
-                self.message = format!("{tag} installed — restart to run it.");
+                self.message =
+                    format!("{tag} app and overlay installed — restart Argus and games.");
+            }
+            Status::RolledBack => {
+                self.installed = true;
+                self.available = None;
+                self.message = "Previous app and overlay restored. Restart Argus and games.".into();
             }
             Status::Error(e) => {
                 self.message = e;

@@ -9,6 +9,42 @@ use regex::Regex;
 use crate::config::RuleConfig;
 use crate::utils;
 
+/// Pure explanation of requested policy; never performs a syscall.
+pub struct RuleEffect<'a> {
+    pub matches: Vec<&'a Rule>,
+    pub affinity: Option<&'a str>,
+    pub nice: Option<i32>,
+    pub ionice: Option<(i32, i32)>,
+    pub conflict: bool,
+}
+pub fn preview_effect<'a>(rules: &'a [Rule], name: &str) -> RuleEffect<'a> {
+    let mut effect = RuleEffect {
+        matches: Vec::new(),
+        affinity: None,
+        nice: None,
+        ionice: None,
+        conflict: false,
+    };
+    let lower = name.to_lowercase();
+    for rule in rules.iter().filter(|r| r.matches(name, &lower)) {
+        effect.matches.push(rule);
+        if let Some(v) = rule.affinity.as_deref() {
+            effect.conflict |= effect.affinity.is_some_and(|old| old != v);
+            effect.affinity = Some(v);
+        }
+        if let Some(v) = rule.nice {
+            effect.conflict |= effect.nice.is_some_and(|old| old != v);
+            effect.nice = Some(v);
+        }
+        if let Some(class) = rule.ionice_class {
+            let v = (class, rule.ionice_level.unwrap_or(0));
+            effect.conflict |= effect.ionice.is_some_and(|old| old != v);
+            effect.ionice = Some(v);
+        }
+    }
+    effect
+}
+
 // ── Rule ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -340,6 +376,28 @@ impl Default for RuleEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preview_reports_field_precedence_and_ignores_disabled_rules() {
+        let mut first = Rule::new_empty();
+        first.pattern = "game".into();
+        first.match_type = "exact".into();
+        first.enabled = true;
+        first.affinity = Some("0-3".into());
+        first.nice = Some(5);
+        let mut last = first.clone();
+        last.affinity = None;
+        last.nice = Some(10);
+        let mut disabled = first.clone();
+        disabled.enabled = false;
+        disabled.nice = Some(-10);
+        let rules = [first, last, disabled];
+        let effect = preview_effect(&rules, "game");
+        assert_eq!(effect.matches.len(), 2);
+        assert_eq!(effect.affinity, Some("0-3"));
+        assert_eq!(effect.nice, Some(10));
+        assert!(effect.conflict);
+        assert!(preview_effect(&rules, "other").matches.is_empty());
+    }
 
     fn rule_with(pattern: &str, match_type: &str) -> Rule {
         let mut r = Rule::new_empty();

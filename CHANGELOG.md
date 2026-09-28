@@ -12,6 +12,14 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Added
 
+- Readable game recording history and A/B comparison with average/1% low FPS,
+  p99 frametime and a peak-preserving graph loaded off the GUI thread.
+- Live rule effects showing matching processes, overlapping assignments and
+  requested versus observed CPU affinity and priorities.
+- Signed matched app/layer update bundles, compatibility checks, durable recovery,
+  one-step rollback and `build-info` / `rollback-update` commands. Local systemd
+  service customizations are preserved.
+
 - Overall CPU-load activation for ProBalance: above 85% for 3 seconds, a separate
   1% minimum process share, and recovery below 75% for 5 seconds by default.
   Detected games, verified launch trees, priority/manual targets and exempt
@@ -33,6 +41,19 @@ current source, release and verification status, see [docs/status.md](docs/statu
   workspace-wide build, lint, test and minimum-Rust checks.
 
 ### Fixed
+
+- One configuration writer persists current shared settings; unique staging files
+  prevent collisions, directory fsync improves durability and save errors appear
+  with a retry action.
+- GUI process signals use stable pidfds. A new pending termination cancels the
+  previous one; closing/restarting resumes pending targets. Tree termination has
+  a three-second grace period and reports signal outcomes accurately.
+- cgroup interventions preserve existing CPU quotas and refuse original policies
+  that cannot be read or restored exactly through systemctl.
+- Quoted game launcher paths/arguments, visible launch failures and cleanup of
+  parking enabled by an unsuccessful launch.
+- Non-blocking process exports and explicit missing/failed file-dialog errors.
+- CPU history duration label, wider port filter and wrapping process toolbar.
 
 - Failed NVML initialization is retried only once per minute instead of every
   sensor tick; successful contexts remain shared and reused.

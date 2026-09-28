@@ -20,6 +20,12 @@ pub struct GameBenchmark {
     active: bool,
     error: String,
     results: Vec<(PathBuf, Summary)>,
+    scan: Option<mpsc::Receiver<RecordingScan>>,
+    compare: [Option<PathBuf>; 2],
+    comparison_dirty: bool,
+    graphs: [Vec<(f64, f64)>; 2],
+    graph_job: Option<mpsc::Receiver<GraphResult>>,
+    graph_error: String,
 }
 impl Default for GameBenchmark {
     fn default() -> Self {
@@ -33,10 +39,30 @@ impl Default for GameBenchmark {
             active: false,
             error: String::new(),
             results: Vec::new(),
+            scan: None,
+            compare: [None, None],
+            comparison_dirty: false,
+            graphs: Default::default(),
+            graph_job: None,
+            graph_error: String::new(),
         }
     }
 }
 impl GameBenchmark {
+    pub fn compare_recent(&mut self) -> bool {
+        if self.results.len() < 2 {
+            return false;
+        }
+        let next = [
+            Some(self.results[0].0.clone()),
+            Some(self.results[1].0.clone()),
+        ];
+        if self.compare != next {
+            self.compare = next;
+            self.comparison_dirty = true;
+        }
+        true
+    }
     pub fn status(&self) -> &str {
         &self.status
     }
@@ -47,14 +73,59 @@ impl GameBenchmark {
                 self.checked = None;
             }
         }
-        if self
-            .checked
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+        if let Some(scan) = &self.scan {
+            match scan.try_recv() {
+                Ok(data) => {
+                    self.active = data.active;
+                    self.results = data.results;
+                    self.error = data.error;
+                    self.scan = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.scan = None;
+                    self.error = "Could not read recordings.".into();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if self.scan.is_none()
+            && self
+                .checked
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
         {
-            self.active = capture::read_control().is_active();
-            self.results = capture::load_summaries();
-            self.error = read_bounded_text(&capture::directory().join("latest-error.txt"));
+            let (tx, rx) = mpsc::channel();
+            self.scan = Some(rx);
             self.checked = Some(Instant::now());
+            let ctx = ui.ctx().clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(RecordingScan {
+                    active: capture::read_control().is_active(),
+                    results: capture::load_summaries(),
+                    error: read_bounded_text(&capture::directory().join("latest-error.txt")),
+                });
+                ctx.request_repaint();
+            });
+        }
+        if let Some(job) = &self.graph_job {
+            match job.try_recv() {
+                Ok(result) => {
+                    self.graph_job = None;
+                    if result.selection == self.compare {
+                        match result.data {
+                            Ok(data) => {
+                                self.graphs = data;
+                                self.graph_error.clear();
+                            }
+                            Err(e) => self.graph_error = e,
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.graph_job = None;
+                    self.graph_error = "Graph loading failed.".into();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
         }
         ui.heading("Game benchmark recording");
         theme::help_text(ui, "Record game performance for comparison. Results are saved locally as CSV and a summary.");
@@ -134,41 +205,120 @@ impl GameBenchmark {
         if self.results.is_empty() {
             ui.weak("Your completed recordings will appear here.");
         }
+        if ui
+            .add_enabled(
+                self.results.len() >= 2,
+                egui::Button::new("Compare latest two"),
+            )
+            .clicked()
+        {
+            self.compare_recent();
+        }
+        let mut selection_changed = std::mem::take(&mut self.comparison_dirty);
         for (path, result) in &self.results {
-            egui::CollapsingHeader::new(format!(
-                "{} · PID {} · {} frames{}",
-                result.session,
-                result.pid,
-                result.frames,
-                if result.complete {
-                    ""
-                } else {
-                    " · Incomplete"
-                }
-            ))
-            .id_salt(path)
-            .show(ui, |ui| {
-                let val =
-                    |v: Option<f64>| v.map(|n| format!("{n:.2}")).unwrap_or_else(|| "—".into());
-                ui.label(format!(
-                    "Average {} FPS · 1% low {} FPS · p99 {} ms · {:.2} s",
-                    val(result.average_fps),
-                    val(result.low_1_fps),
-                    val(result.p99_frametime_ms),
-                    result.duration_seconds
-                ));
-                ui.label(format!(
-                    "Lost samples: {} · failed presents: {}",
-                    result.dropped_samples, result.failed_presents
-                ));
+            egui::CollapsingHeader::new(recording_label(result)).id_salt(path).show(ui, |ui| {
+                ui.label(format!("Average {} FPS · 1% low {} FPS · p99 {} ms", metric(result.average_fps), metric(result.low_1_fps), metric(result.p99_frametime_ms)));
+                ui.label(format!("{} frames · PID {} · swapchain {:x} · lost samples {} · failed presents {}",
+                    result.frames, result.pid, result.swapchain, result.dropped_samples, result.failed_presents));
                 ui.label(&result.executable);
                 theme::help_text(ui, &result.metric);
-                if ui.button("Open recording folder").clicked() {
-                    let _ = std::process::Command::new("xdg-open")
-                        .arg(capture::directory())
-                        .spawn();
-                }
+                ui.horizontal_wrapped(|ui| {
+                    for (i, label) in ["Use as A", "Use as B"].iter().enumerate() {
+                        if ui.selectable_label(self.compare[i].as_ref() == Some(path), *label).clicked() {
+                            self.compare[i] = Some(path.clone());
+                            selection_changed = true;
+                        }
+                    }
+                    if ui.button("Open recording folder").clicked() {
+                        let _ = std::process::Command::new("xdg-open").arg(capture::directory()).spawn();
+                    }
+                });
             });
+        }
+        if selection_changed {
+            self.graphs = Default::default();
+            self.graph_error.clear();
+            let selection = self.compare.clone();
+            let summaries: Vec<_> = selection
+                .iter()
+                .map(|p| {
+                    self.results
+                        .iter()
+                        .find(|(path, _)| Some(path) == p.as_ref())
+                        .cloned()
+                })
+                .collect();
+            let (tx, rx) = mpsc::channel();
+            self.graph_job = Some(rx);
+            let ctx = ui.ctx().clone();
+            std::thread::spawn(move || {
+                let data = (|| {
+                    let mut graphs: Graphs = Default::default();
+                    for (i, entry) in summaries.iter().enumerate() {
+                        if let Some((path, summary)) = entry {
+                            graphs[i] = read_graph(path, summary.duration_seconds)?;
+                        }
+                    }
+                    Ok(graphs)
+                })();
+                let _ = tx.send(GraphResult { selection, data });
+                ctx.request_repaint();
+            });
+        }
+        if self.compare.iter().any(Option::is_some) {
+            ui.separator();
+            ui.heading("Compare recordings");
+            theme::help_text(ui, "Compare the same scene and settings. Different durations or incomplete recordings can bias results. FPS here describes CPU present intervals.");
+            let selected: Vec<_> = self
+                .compare
+                .iter()
+                .map(|p| {
+                    self.results
+                        .iter()
+                        .find(|(path, _)| Some(path) == p.as_ref())
+                        .map(|(_, s)| s)
+                })
+                .collect();
+            for (i, summary) in selected.iter().enumerate() {
+                ui.label(format!(
+                    "{}: {}",
+                    if i == 0 { "A" } else { "B" },
+                    summary.map_or("Choose a recording above".into(), recording_label)
+                ));
+            }
+            if let [Some(a), Some(b)] = selected.as_slice() {
+                egui::Grid::new("recording_metrics")
+                    .min_col_width(110.0)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for label in ["Metric", "A", "B", "Change B vs A"] {
+                            ui.strong(label);
+                        }
+                        ui.end_row();
+                        for (name, av, bv) in [
+                            ("Average FPS ↑", a.average_fps, b.average_fps),
+                            ("1% low FPS ↑", a.low_1_fps, b.low_1_fps),
+                            (
+                                "p99 frametime (ms) ↓",
+                                a.p99_frametime_ms,
+                                b.p99_frametime_ms,
+                            ),
+                        ] {
+                            ui.label(name);
+                            ui.label(metric(av));
+                            ui.label(metric(bv));
+                            ui.label(delta(av, bv));
+                            ui.end_row();
+                        }
+                    });
+            }
+            if self.graph_job.is_some() {
+                ui.label("Loading frametimes…");
+            }
+            if !self.graph_error.is_empty() {
+                ui.colored_label(theme::sem(ui).negative, &self.graph_error);
+            }
+            draw_comparison(ui, &self.graphs);
         }
     }
     pub fn register(&mut self) {
@@ -300,4 +450,187 @@ fn read_bounded_text(path: &std::path::Path) -> String {
         return String::new();
     }
     String::from_utf8_lossy(&buf).into_owned()
+}
+
+struct RecordingScan {
+    active: bool,
+    results: Vec<(PathBuf, Summary)>,
+    error: String,
+}
+type Graphs = [Vec<(f64, f64)>; 2];
+struct GraphResult {
+    selection: [Option<PathBuf>; 2],
+    data: Result<Graphs, String>,
+}
+fn metric(value: Option<f64>) -> String {
+    value
+        .filter(|v| v.is_finite())
+        .map_or("—".into(), |v| format!("{v:.2}"))
+}
+fn delta(a: Option<f64>, b: Option<f64>) -> String {
+    match a.zip(b) {
+        Some((a, b)) if a > 0.0 && a.is_finite() && b.is_finite() => {
+            format!("{:+.1}%", (b / a - 1.0) * 100.0)
+        }
+        _ => "—".into(),
+    }
+}
+fn recording_label(s: &Summary) -> String {
+    let name = std::path::Path::new(&s.executable)
+        .file_name()
+        .map(|p| p.to_string_lossy())
+        .unwrap_or("Unknown application".into());
+    let date = s
+        .session
+        .split('-')
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|ms| {
+            let seconds = nix::libc::time_t::try_from(ms / 1000).ok()?;
+            // SAFETY: localtime_r writes into the provided initialized tm.
+            let mut tm = unsafe { std::mem::zeroed::<nix::libc::tm>() };
+            if unsafe { nix::libc::localtime_r(&seconds, &mut tm) }.is_null() {
+                return None;
+            }
+            Some(format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec
+            ))
+        })
+        .unwrap_or_else(|| "Unknown time".into());
+    format!(
+        "{name} · {date} · {:.1} s · {}",
+        s.duration_seconds,
+        if s.complete { "Complete" } else { "Incomplete" }
+    )
+}
+
+/// Stream bounded CSV input and retain the maximum in each time bin so stalls
+/// survive reduction. The graph is explicitly labelled as peak-per-bin data.
+fn read_graph(summary: &std::path::Path, duration: f64) -> Result<Vec<(f64, f64)>, String> {
+    use std::io::{BufRead, Read};
+    if !duration.is_finite() || duration <= 0.0 {
+        return Err("Recording has no valid duration.".into());
+    }
+    let name = summary
+        .file_name()
+        .and_then(|p| p.to_str())
+        .and_then(|p| p.strip_suffix(".summary.json"))
+        .ok_or("Invalid recording filename")?;
+    let path = summary.with_file_name(format!("{name}.csv"));
+    let file = std::fs::File::open(&path)
+        .or_else(|_| std::fs::File::open(path.with_extension("csv.partial")))
+        .map_err(|e| format!("Could not read frametimes: {e}"))?;
+    const LIMIT: u64 = 128 * 1024 * 1024;
+    if file.metadata().map_err(|e| e.to_string())?.len() > LIMIT {
+        return Err("Recording CSV exceeds 128 MiB.".into());
+    }
+    let mut reader = std::io::BufReader::new(file.take(LIMIT + 1));
+    let mut line = String::new();
+    let mut bins: Vec<Option<(f64, f64)>> = vec![None; 1000];
+    let mut total = 0;
+    loop {
+        line.clear();
+        let n = reader
+            .by_ref()
+            .take(4097)
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if n > 4096 || total > LIMIT {
+            return Err("Recording CSV exceeds read limits.".into());
+        }
+        if line.starts_with("present_begin_ns,") {
+            continue;
+        }
+        let mut values = line.trim().split(',');
+        let t = values
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or("Invalid CSV time")? as f64
+            / 1e9;
+        let ms = values
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or("Invalid CSV interval")? as f64
+            / 1e6;
+        let bin = ((t / duration) * 999.0).clamp(0.0, 999.0) as usize;
+        if bins[bin].is_none_or(|(_, old)| ms > old) {
+            bins[bin] = Some((t, ms));
+        }
+    }
+    Ok(bins.into_iter().flatten().collect())
+}
+fn draw_comparison(ui: &mut egui::Ui, graphs: &Graphs) {
+    if graphs.iter().all(Vec::is_empty) {
+        return;
+    }
+    let colors = [theme::sem(ui).accent, theme::sem(ui).warning];
+    ui.horizontal(|ui| {
+        ui.colored_label(colors[0], "A");
+        ui.colored_label(colors[1], "B");
+        ui.label("Frametime · peak per time bin");
+    });
+    let max_t = graphs
+        .iter()
+        .flatten()
+        .map(|(t, _)| *t)
+        .fold(1.0_f64, f64::max);
+    let max_ms = graphs
+        .iter()
+        .flatten()
+        .map(|(_, v)| *v)
+        .fold(1.0_f64, f64::max);
+    ui.label(format!(
+        "0–{max_t:.1} s from capture start · 0–{max_ms:.1} ms"
+    ));
+    let (response, painter) = ui.allocate_painter(
+        egui::vec2(ui.available_width(), 160.0),
+        egui::Sense::hover(),
+    );
+    let rect = response.rect.shrink(4.0);
+    painter.rect_filled(rect, 0.0, theme::plot_fill(ui));
+    for (i, graph) in graphs.iter().enumerate() {
+        let points: Vec<_> = graph
+            .iter()
+            .map(|(t, ms)| {
+                egui::pos2(
+                    rect.left() + (*t / max_t) as f32 * rect.width(),
+                    rect.bottom() - (*ms / max_ms) as f32 * rect.height(),
+                )
+            })
+            .collect();
+        painter.add(egui::Shape::line(
+            points,
+            egui::Stroke::new(1.5_f32, colors[i]),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+    #[test]
+    fn differences_handle_missing_zero_and_nonfinite_metrics() {
+        assert_eq!(delta(Some(100.0), Some(110.0)), "+10.0%");
+        assert_eq!(delta(Some(0.0), Some(110.0)), "—");
+        assert_eq!(metric(Some(f64::NAN)), "—");
+    }
+    #[test]
+    fn graph_preserves_stalls_and_reads_partial_captures() {
+        let dir = std::env::temp_dir().join(format!("argus-graph-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("sample.csv.partial"), "present_begin_ns,interval_ns,vulkan_result\n1000000,1000000,0\n2000000,50000000,0\n3000000,2000000,0\n").unwrap();
+        let points = read_graph(&dir.join("sample.summary.json"), 60.0).unwrap();
+        assert_eq!(points, [(0.002, 50.0)]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

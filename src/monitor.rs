@@ -27,6 +27,8 @@ use crate::utils;
 #[derive(Debug)]
 pub enum DaemonCmd {
     UpdateConfig(Box<Config>),
+    /// Persist the latest shared configuration on the monitor thread.
+    SaveConfig,
     GameLaunched {
         pid: u32,
         profile: String,
@@ -118,6 +120,9 @@ pub struct AppState {
     pub log_lines: std::collections::VecDeque<String>,
     /// Current config (read by GUI for settings display)
     pub config: Config,
+    pub config_save_error: Option<String>,
+    pub operation_error: Option<String>,
+    pub quit_requested: bool,
     /// Is Gaming Mode currently active?
     pub gaming_active: bool,
     /// Hardware sensor data (updated every display_refresh_interval)
@@ -135,6 +140,32 @@ pub struct AppState {
     /// Notable events (throttles, alerts, gaming mode, kills) for the
     /// status-bar notification center — small ring buffer, newest last.
     pub notable_events: std::collections::VecDeque<String>,
+}
+
+/// Single writer: callers send SaveConfig instead of serializing stale copies.
+fn persist_config(state: &Arc<Mutex<AppState>>) {
+    persist_config_with(state, crate::config::save);
+}
+
+fn persist_config_with(
+    state: &Arc<Mutex<AppState>>,
+    save: impl FnOnce(&Config) -> std::io::Result<()>,
+) {
+    let cfg = match state.lock() {
+        Ok(s) => s.config.clone(),
+        Err(_) => return,
+    };
+    let error = save(&cfg)
+        .err()
+        .map(|e| format!("Settings could not be saved: {e}"));
+    if let Ok(mut s) = state.lock() {
+        if error != s.config_save_error {
+            if let Some(message) = &error {
+                s.append_log(message.clone());
+            }
+        }
+        s.config_save_error = error;
+    }
 }
 
 pub fn read_cpu_model() -> String {
@@ -623,9 +654,6 @@ fn run_loop(
         // ── Check for CLI overlay toggle ────────────────────────────────────
         if !crate::overlay_toggle::drain(&toggle_dir).is_multiple_of(2) {
             config.gaming_mode.overlay.show_overlay = !config.gaming_mode.overlay.show_overlay;
-            if let Err(e) = crate::config::save(&config) {
-                log::error!("Failed to save config after toggling overlay: {e}");
-            }
             ipc.broadcast(&argus_ipc::IpcMessage::Config(
                 config.gaming_mode.overlay.clone(),
             ));
@@ -638,8 +666,9 @@ fn run_loop(
             // could silently discard them — including, in the rules case, a
             // user's just-edited rule definitions on the next config save.
             if let Ok(mut s) = state.lock() {
-                s.config.gaming_mode.overlay = config.gaming_mode.overlay.clone();
+                s.config.gaming_mode.overlay.show_overlay = config.gaming_mode.overlay.show_overlay;
             }
+            persist_config(&state);
             log_cb(format!(
                 "Overlay visibility toggled to {}",
                 config.gaming_mode.overlay.show_overlay
@@ -649,6 +678,7 @@ fn run_loop(
         // ── Drain commands from GUI ─────────────────────────────────────────
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
+                DaemonCmd::SaveConfig => persist_config(&state),
                 DaemonCmd::GameLaunched { pid, profile } => {
                     if let Some(stat) = crate::fast_proc::read_stat(pid, &mut [0; 1024]) {
                         launch_profiles.retain(|p| p.pid != pid);
@@ -660,7 +690,7 @@ fn run_loop(
                     }
                 }
                 DaemonCmd::UpdateConfig(cfg) => {
-                    let cfg = *cfg;
+                    let cfg = state.lock().map(|s| s.config.clone()).unwrap_or(*cfg);
                     probalance.update_config(cfg.probalance.clone());
                     config = cfg.clone();
                     ipc.broadcast(&argus_ipc::IpcMessage::Config(
@@ -679,9 +709,6 @@ fn run_loop(
                             "off"
                         },
                     ));
-                    if let Ok(mut s) = state.lock() {
-                        s.config = cfg;
-                    }
                 }
                 DaemonCmd::SetGamingMode {
                     active,
@@ -1962,5 +1989,36 @@ mod cpu_accounting_tests {
             assert!(protected.contains(&pid));
         }
         assert!(!protected.contains(&4200));
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    #[test]
+    fn writes_latest_shared_values_and_surfaces_then_clears_failures() {
+        let state = Arc::new(Mutex::new(AppState::default()));
+        {
+            let mut s = state.lock().unwrap();
+            s.config.ui.theme = "AdwaitaLight".into();
+            s.config.gaming_mode.overlay.show_overlay = false;
+        }
+        persist_config_with(&state, |cfg| {
+            assert_eq!(cfg.ui.theme, "AdwaitaLight");
+            assert!(!cfg.gaming_mode.overlay.show_overlay);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "test failure",
+            ))
+        });
+        assert!(state
+            .lock()
+            .unwrap()
+            .config_save_error
+            .as_ref()
+            .unwrap()
+            .contains("test failure"));
+        persist_config_with(&state, |_| Ok(()));
+        assert!(state.lock().unwrap().config_save_error.is_none());
     }
 }

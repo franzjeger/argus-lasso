@@ -388,8 +388,12 @@ fn show_results(
                 let tx = csv_tx.clone();
                 std::thread::spawn(move || {
                     let path = match crate::file_dialog::save("memory_latency.csv", "*.csv") {
-                        Some(p) => p,
-                        None => return,
+                        Ok(Some(p)) => p,
+                        Ok(None) => return,
+                        Err(e) => {
+                            let _ = tx.send(e);
+                            return;
+                        }
                     };
                     let msg = match std::fs::write(&path, &csv) {
                         Ok(_) => "CSV saved.".to_string(),
