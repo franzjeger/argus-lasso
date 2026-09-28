@@ -1,4 +1,4 @@
-//! Hardware sensor collection: reads hwmon sysfs, procfs, DRM sysfs, and nvidia-smi.
+//! Hardware sensor collection: reads hwmon sysfs, procfs, DRM sysfs, and NVML.
 //!
 //! `HwCollector` owns the persistent state (min/max/history). Call `update()` each
 //! sensor-sampling tick; it merges new readings into `self.data` in-place so history
@@ -324,14 +324,21 @@ impl HwCollector {
         c
     }
 
-    pub fn update(&mut self) {
+    pub fn update(&mut self, extended: Option<&crate::sensor_data::ExtendedSensors>) {
         let now = Instant::now();
         let dt = now.duration_since(self.prev_time).as_secs_f32().max(0.1);
 
         let new_disk = read_disk_raw();
         let new_net = read_net_raw();
 
-        let readings = collect_all(&self.prev_disk, &new_disk, &self.prev_net, &new_net, dt);
+        let readings = collect_all(
+            &self.prev_disk,
+            &new_disk,
+            &self.prev_net,
+            &new_net,
+            dt,
+            extended,
+        );
 
         self.prev_disk = new_disk;
         self.prev_net = new_net;
@@ -400,6 +407,7 @@ fn collect_all(
     prev_net: &HashMap<String, [u64; 2]>,
     new_net: &HashMap<String, [u64; 2]>,
     dt: f32,
+    extended: Option<&crate::sensor_data::ExtendedSensors>,
 ) -> Vec<GroupReading> {
     let mut out: Vec<GroupReading> = Vec::new();
 
@@ -414,7 +422,7 @@ fn collect_all(
     if let Some(g) = collect_load_avg() {
         out.push(g);
     }
-    out.extend(collect_rapl_power());
+    out.extend(collect_rapl_power(extended));
 
     out.extend(collect_nvidia_nvml());
 
@@ -616,7 +624,34 @@ where
 // Keep NVML handle alive across calls (init is expensive, ~50ms).
 // Module-level so both the sensor collector and the per-process utilization
 // query share one context.
-static NVML: std::sync::Mutex<Option<nvml_wrapper::Nvml>> = std::sync::Mutex::new(None);
+const NVML_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+// Failed initialization must not repeatedly load the driver on machines without
+// NVIDIA support. Retry eventually so a driver loaded after startup is detected.
+struct RetryInit<T> {
+    value: Option<T>,
+    retry_at: Option<Instant>,
+}
+
+impl<T> RetryInit<T> {
+    const fn new() -> Self {
+        Self {
+            value: None,
+            retry_at: None,
+        }
+    }
+
+    fn get_or_init(&mut self, now: Instant, init: impl FnOnce() -> Option<T>) -> Option<&T> {
+        if self.value.is_none() && self.retry_at.is_none_or(|at| now >= at) {
+            self.value = init();
+            self.retry_at = self.value.is_none().then_some(now + NVML_RETRY_INTERVAL);
+        }
+        self.value.as_ref()
+    }
+}
+
+static NVML: std::sync::Mutex<RetryInit<nvml_wrapper::Nvml>> =
+    std::sync::Mutex::new(RetryInit::new());
 
 /// Per-process GPU utilization (SM %) across all NVIDIA devices, keyed by PID.
 /// Empty on systems without NVML. Uses the driver's rolling sample buffer,
@@ -626,7 +661,7 @@ pub fn collect_gpu_process_util() -> HashMap<u32, f32> {
 
     let mut map: HashMap<u32, f32> = HashMap::new();
     let guard = NVML.lock().unwrap();
-    let Some(nvml) = guard.as_ref() else {
+    let Some(nvml) = guard.value.as_ref() else {
         return map; // sensor collector initializes NVML; nothing yet
     };
     let Ok(count) = nvml.device_count() else {
@@ -655,15 +690,8 @@ pub fn collect_gpu_process_util() -> HashMap<u32, f32> {
 
 fn collect_nvidia_nvml() -> Vec<GroupReading> {
     let mut guard = NVML.lock().unwrap();
-    let nvml = match guard.as_ref() {
-        Some(n) => n,
-        None => match nvml_wrapper::Nvml::init() {
-            Ok(n) => {
-                *guard = Some(n);
-                guard.as_ref().unwrap()
-            }
-            Err(_) => return Vec::new(),
-        },
+    let Some(nvml) = guard.get_or_init(Instant::now(), || nvml_wrapper::Nvml::init().ok()) else {
+        return Vec::new();
     };
 
     let count = match nvml.device_count() {
@@ -776,8 +804,8 @@ fn rapl_watts(prev_uj: u64, now_uj: u64, max_uj: u64, dt_secs: f64) -> Option<f3
     Some(watts as f32)
 }
 
-fn collect_rapl_power() -> Vec<GroupReading> {
-    if let Some(watts) = crate::sensor_data::read().ok().and_then(|s| s.cpu_power_w) {
+fn collect_rapl_power(extended: Option<&crate::sensor_data::ExtendedSensors>) -> Vec<GroupReading> {
+    if let Some(watts) = extended.and_then(|s| s.cpu_power_w) {
         return vec![(
             "CPU",
             "CPU Package Power [RAPL]".into(),
@@ -1235,6 +1263,50 @@ fn build_core_id_to_cpu_map() -> HashMap<u32, u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_provider_init_is_throttled_but_can_recover() {
+        let mut provider = RetryInit::new();
+        let start = Instant::now();
+        let attempts = std::cell::Cell::new(0);
+        for second in 0..60 {
+            assert!(provider
+                .get_or_init(start + std::time::Duration::from_secs(second), || {
+                    attempts.set(attempts.get() + 1);
+                    None::<u32>
+                })
+                .is_none());
+        }
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(
+            provider.get_or_init(start + NVML_RETRY_INTERVAL, || Some(42)),
+            Some(&42)
+        );
+        assert_eq!(
+            provider.get_or_init(start + NVML_RETRY_INTERVAL * 2, || {
+                panic!("an initialized provider must be reused")
+            }),
+            Some(&42)
+        );
+    }
+
+    #[test]
+    fn rapl_uses_the_supplied_snapshot_including_measured_zero() {
+        for watts in [0.0, 125.5] {
+            let extended = crate::sensor_data::ExtendedSensors {
+                cpu_power_w: Some(watts),
+                ..Default::default()
+            };
+            assert_eq!(
+                collect_rapl_power(Some(&extended)),
+                vec![(
+                    "CPU",
+                    "CPU Package Power [RAPL]".into(),
+                    vec![("Package total", "W", watts)],
+                )]
+            );
+        }
+    }
 
     #[test]
     fn sensor_history_keeps_newest_samples_in_order_after_wraps() {

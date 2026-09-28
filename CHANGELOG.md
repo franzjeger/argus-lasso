@@ -31,6 +31,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Failed NVML initialization is retried only once per minute instead of every
+  sensor tick; successful contexts remain shared and reused.
+- Hardware history, alerts and HUD reuse one extended sensor snapshot per daemon
+  sampling tick. RAM speed from the service no longer enters the permanent local
+  firmware cache. Cache reads are bounded and reject future timestamps and
+  invalid measurements while preserving measured zero power.
 - Recover Wine/Proton process names from unambiguous mapped executables when
   games clear their name and command line (including The Last of Us Part II).
   Refresh cached identities after renames and periodically after startup.

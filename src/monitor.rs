@@ -369,7 +369,7 @@ pub fn spawn_preview(
                 collect_snapshot(&mut snapshot, &mut times, total, &mut caches, true, elapsed);
             times = next_times;
             total = next_total;
-            hw.update();
+            hw.update(crate::sensor_data::read().ok().as_ref());
             let (mut cpus, cpu_total) = cpu_sampler.sample(read_percpu_stats());
             cpus.resize(utils::get_cpu_count() as usize, 0.0);
             if let Ok(mut s) = state.lock() {
@@ -435,15 +435,8 @@ fn get_ram_speed_mts() -> Option<u32> {
     use std::sync::OnceLock;
     static RAM_SPEED: OnceLock<Option<u32>> = OnceLock::new();
     *RAM_SPEED.get_or_init(|| {
-        // First try the root sensor daemon, which runs dmidecode for us
-        if let Some(mts) = crate::sensor_data::read()
-            .ok()
-            .and_then(|s| s.ram_speed_mts)
-        {
-            return Some(mts);
-        }
-
-        // Fallback to calling dmidecode directly if we happen to have privileges
+        // Only cache the local firmware fallback. Service values are read fresh
+        // each sampling tick and must never outlive the service snapshot.
         let out = std::process::Command::new("dmidecode")
             .arg("-t")
             .arg("memory")
@@ -991,7 +984,8 @@ fn run_loop(
 
         if now.duration_since(last_sensors) >= Duration::from_secs(1) {
             // Update hardware sensor readings
-            hw_collector.update();
+            let extended = crate::sensor_data::read().ok();
+            hw_collector.update(extended.as_ref());
 
             // Per-process GPU utilization (empty map without NVIDIA/NVML)
             let gpu_util = crate::hw_monitor::collect_gpu_process_util();
@@ -1021,7 +1015,6 @@ fn run_loop(
             let gpu_temp = hw_collector.data.get_gpu_temp();
             let cpu_temp = hw_collector.data.get_cpu_temp();
             let gpu_power = hw_collector.data.get_gpu_power();
-            let extended = crate::sensor_data::read().ok();
             let cpu_power = extended
                 .as_ref()
                 .and_then(|s| s.cpu_power_w)

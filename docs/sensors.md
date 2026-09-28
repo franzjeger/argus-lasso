@@ -6,6 +6,17 @@ Missing measurements are represented as unavailable, not manufactured zeroes.
 Connection failures replace hardware data with a status message; a real 0% load
 or stopped 0% fan remains a valid value.
 
+Each daemon sampling tick reads and validates the extended sensor snapshot once,
+then shares it between hardware history, alerts and overlay telemetry. Service
+RAM speed is not cached beyond the snapshot's lifetime. Sensor collection remains
+active for history and alerts even when individual HUD fields are hidden.
+
+NVML initialization failures are retried at most once per 60 seconds. This avoids
+loading an unavailable NVIDIA provider every sampling tick while allowing a
+driver loaded after Argus startup to be detected. A successfully initialized
+NVML context is reused; normal sensor sampling still runs approximately once per
+second.
+
 ## Data sources
 
 | Reading | Source and meaning |
@@ -63,8 +74,10 @@ privileged process per sample. The sandboxed `argus-sensors.service` has an empt
 capability set and a fixed writable runtime directory.
 
 It atomically publishes a small, versioned JSON snapshot at
-`/run/argus-sensors/telemetry.json`. The user consumer rejects a wrong schema or
-samples older than 3.5 seconds. The output includes source status and measurement
+`/run/argus-sensors/telemetry.json`. The user consumer bounds cache reads to 16 KiB
+and rejects an unsupported schema, samples older than 3.5 seconds, future
+timestamps, negative CPU power and zero configured RAM speed. Zero measured power
+remains valid. The output includes source status and measurement
 interval. Disabling the service makes its fields unavailable again when no
 unprivileged source exists. Configured RAM speed is static firmware information,
 not a live memory-clock probe; mixed configured DIMM speeds are not silently
