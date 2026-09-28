@@ -1,7 +1,7 @@
 # Using Argus-Lasso
 
 This guide describes the current source tree. The UI uses English labels.
-[Install](installation.md) · [Screenshot gallery](screenshots.md)
+[Install](installation.md) · [Screenshot gallery](screenshots.md) · [Project status](status.md)
 
 Memory values use binary units (MiB/GiB). Disk and network rates use MiB/s;
 memory bandwidth benchmarks report decimal GB/s. Temperature readings use °C.
@@ -91,7 +91,9 @@ responsiveness algorithm.
 
 The existing nice and optional cgroup CPUWeight backends remain available. They
 adjust scheduling priority under contention, not the measured CPU percentage.
-Cgroup also offers a separate optional quota. [Backend details](design-cgroup-probalance.md).
+Cgroup also offers a separate optional quota. Its current restore path clears
+CPUQuota instead of restoring a previous custom quota. The default remains
+`nice`. [Backend details and limits](design-cgroup-probalance.md).
 
 Configuration uses `system_cpu_threshold_percent`,
 `system_restore_threshold_percent` and `process_min_cpu_percent` under

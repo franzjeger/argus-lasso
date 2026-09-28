@@ -8,19 +8,20 @@ A Linux process manager and gaming toolkit, written in Rust with egui. Manage CP
 assignments and process priorities, inspect hardware sensors, customize a Vulkan
 HUD, and record game present intervals for performance comparisons.
 
-![Argus-Lasso Processes page — CPU as share of total capacity](assets/screenshots/2026-09-19/processes.png)
+![Argus-Lasso Processes page — CPU as share of total capacity](assets/screenshots/2026-09-28/processes.png)
 
-**Updated screenshots: September 13, 2026.** [Browse every main menu and settings section](docs/screenshots.md).
+**Main-page screenshots: September 28, 2026.** [Browse every main menu and settings section](docs/screenshots.md).
 
 **This README describes the current source tree.** The latest published release,
-v1.3.1, predates the overlay, recording and navigation work documented here. Build
+[v1.3.1](https://github.com/franzjeger/argus-lasso/releases/tag/v1.3.1)
+(checked 2026-09-28), predates the overlay, recording and navigation work documented here. Build
 from source for these features. The repository was renamed from
 `process-lasso-linux-rs`; GitHub redirects the old address.
 
 [Install](docs/installation.md) · [User guide](docs/user-guide.md) ·
 [All menus and screenshots](docs/screenshots.md) ·
 [Overlay and measurements](docs/overlay.md) · [Sensor access](docs/sensors.md) ·
-[Development](CONTRIBUTING.md) · [Changelog](CHANGELOG.md)
+[Development](CONTRIBUTING.md) · [Project status](docs/status.md) · [Changelog](CHANGELOG.md)
 
 ## What it does
 
@@ -61,7 +62,7 @@ For one Steam game, set its launch option to:
 ARGUS_LASSO_HUD=1 %command%
 ```
 
-Alternatively enable **Load in all Vulkan games** in Gaming → Overlay. Changes to
+Alternatively enable **Automatically show in detected Vulkan games** in Gaming → Overlay. Changes to
 layer loading or its binary take effect on the next game launch. Appearance and
 field choices update live. See [overlay setup and limitations](docs/overlay.md).
 
@@ -108,10 +109,10 @@ root is not a guarantee of sensor support. [Details and data sources](docs/senso
 
 ## Compatibility and validation
 
-The current layer was tested with native Vulkan on KDE Wayland, including a
+Earlier builds of the layer were tested with native Vulkan on KDE Wayland, including a
 Vulkan application inside SteamLinuxRuntime_sniper, with NVIDIA RTX 5090 and
 Ryzen 9 9950X3D hardware. Synchronization validation and independent CSV statistic
-checks were run. Native microbenchmarks compare layer-off, loaded-without-drawing
+checks were run. Recorded native microbenchmarks compare layer-off, loaded-without-drawing
 and full-HUD cases; they are **not** a controlled Path of Exile 2 result.
 
 DXVK (DX9/10/11) and VKD3D-Proton (DX12) are Vulkan paths the layer is intended to
@@ -121,17 +122,19 @@ The GPU/driver test matrix remains limited. [Tested, implemented and pending](do
 
 ## Current app screenshots
 
-Captured from the installed current build. Click an image to view it at full size.
+Main pages captured from source commit `8ff0f9b` on 2026-09-28 using the
+read-only X11/Xvfb preview. The native customization image is dated 2026-09-13.
+Click an image to view it at full size.
 The [complete gallery](docs/screenshots.md) includes all main pages and the Gaming
 and Settings subsections.
 
 | ProBalance: system-load activation | Gaming: CPU & performance |
 |---|---|
-| ![ProBalance](assets/screenshots/2026-09-19/probalance.png) | ![Gaming](assets/screenshots/2026-09-19/gaming-mode.png) |
+| ![ProBalance](assets/screenshots/2026-09-28/probalance.png) | ![Gaming](assets/screenshots/2026-09-28/gaming-mode.png) |
 | **Overlay customization** | **Game recording** |
-| ![Overlay settings](assets/screenshots/2026-09-13/overlay-settings.png) | ![Recording](assets/screenshots/2026-09-19/gamingrecording.png) |
+| ![Overlay settings](assets/screenshots/2026-09-13/overlay-settings.png) | ![Recording](assets/screenshots/2026-09-28/gamingrecording.png) |
 | **Hardware sensors** | **Appearance settings** |
-| ![Sensors](assets/screenshots/2026-09-19/hw-monitor.png) | ![Settings](assets/screenshots/2026-09-19/settings.png) |
+| ![Sensors](assets/screenshots/2026-09-28/hw-monitor.png) | ![Settings](assets/screenshots/2026-09-28/settings.png) |
 
 CPU usage is shown consistently as **0–100% of available capacity**. On 32 online
 logical CPUs, one fully busy CPU contributes 3.125% to the total. ProBalance's

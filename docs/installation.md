@@ -1,6 +1,7 @@
 # Installation
 
-These instructions apply to the current source tree. Published v1.3.1 packages
+These instructions apply to the current source tree. As checked on 2026-09-28,
+the latest published release is v1.3.1. Its packages
 contain the earlier desktop app; they do not contain the new overlay/recorder.
 Do not mix daemon and layer files from arbitrary revisions.
 
@@ -42,8 +43,9 @@ make enable  # optional autostart
 ```
 
 `make install` builds a matching app/layer pair, installs icons, desktop entries,
-a versioned layer and manifest, and starts/restarts the user service. Close an
-unmanaged manually launched Argus instance first; the installer refuses to run a
+a versioned layer and manifest, and starts/restarts the user service. Existing
+service-file customizations and the manifest's automatic-loading choice are
+preserved. Close an unmanaged manually launched Argus instance first; the installer refuses to run a
 second daemon beside it. The supplied paired installer targets `~/.local`.
 
 Installed locations:
@@ -56,6 +58,11 @@ Installed locations:
 | User service | `~/.config/systemd/user/argus-lasso.service` |
 | Desktop/portal entries | `~/.local/share/applications/` |
 | Config | `~/.config/argus-lasso/config.toml` |
+
+The installed startup log records the app/layer build ID and IPC version.
+`argus-lasso --version` reports the Cargo package version, which is still 1.3.1
+on current source builds; use the build ID to identify a particular installation.
+[Verified source and release status](status.md).
 
 The sensor helper is installed separately with `scripts/install-sensors.sh` and
 activated in Gaming → Sensors. See [sensor access](sensors.md). The CPU parking,

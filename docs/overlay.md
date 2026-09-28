@@ -115,7 +115,7 @@ Steam runtime. `ARGUS_LASSO_SOCKET` supplies an exclusive diagnostic override.
 Install a matching pair and restart a game to load the newly installed library.
 Do not infer the mapped library from the most recently copied filename.
 
-## Regression causes
+## Historical regression causes
 
 The original installed manifest selected an older library in a different
 directory from the newly copied build. That older implementation defaulted to a
@@ -132,13 +132,17 @@ these concrete faults; they do not alone prove a particular game's FPS recovery.
 
 ## Validation status
 
-Implemented and tested locally: transparent compact native Vulkan HUD, per-value
+The following validation was recorded during the September overlay work; it is
+not a fresh game/driver test of every subsequent commit. See [current build
+checks](status.md) for the latest source validation.
+
+Implemented and previously tested locally: transparent compact native Vulkan HUD, per-value
 colors and visibility, independent graph refresh, telemetry reconnection and
 staleness, matching installation, CSV statistics, sensor helper, and detached
 settings windows. Native Vulkan was also run in SteamLinuxRuntime_sniper with
 synchronization validation on KDE Wayland/NVIDIA RTX 5090.
 
-A repeated native vkcube comparison (same daemon, immediate presentation,
+A previously recorded native vkcube comparison (same daemon, immediate presentation,
 1280×720, three valid runs per case) measured median intervals of **0.049152 ms**
 (layer off), **0.049366 ms** (loaded, no draw), and **0.056796 ms** (HUD + 60 Hz
 graph). The HUD difference in that synthetic workload was about 0.00764 ms.

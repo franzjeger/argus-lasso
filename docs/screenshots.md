@@ -1,9 +1,13 @@
 # Screenshot gallery
 
-Main pages captured from the polished source in an isolated X11/Xvfb session,
-2026-09-19, using the read-only `--ui-tour` with real host readings and existing
-configuration. Sensor warmup can leave early history empty. Numbers
-are snapshots, not performance claims. Some pages scroll to additional controls.
+Main pages captured from source commit `8ff0f9b` (installed build
+`8ff0f9b1b6e7-1de5f47218b7`) in an isolated X11/Xvfb session on 2026-09-28,
+using the read-only `--ui-tour` with software rendering, real host readings and
+existing configuration. Shown selections are that configuration, not necessarily
+the defaults. ProBalance and Gaming Mode are off in this capture. Sensor warmup
+can leave early history empty. Numbers
+are snapshots, not performance claims; the software-rendered capture itself adds
+CPU load. Some pages scroll to additional controls.
 The tour does not apply policies or populate an activity log with invented events.
 
 Main-window captures are framebuffer images: compositor-applied desktop opacity
@@ -14,71 +18,71 @@ expanded sensor group or process-action confirmation.
 
 ## Overview
 
-![Overview](../assets/screenshots/2026-09-19/overview.png)
+![Overview](../assets/screenshots/2026-09-28/overview.png)
 
 ## Processes
 
-![Processes](../assets/screenshots/2026-09-19/processes.png)
+![Processes](../assets/screenshots/2026-09-28/processes.png)
 
 ## Process rules
 
-![Process rules](../assets/screenshots/2026-09-19/rules.png)
+![Process rules](../assets/screenshots/2026-09-28/rules.png)
 
 ## ProBalance
 
-![ProBalance](../assets/screenshots/2026-09-19/probalance.png)
+![ProBalance](../assets/screenshots/2026-09-28/probalance.png)
 
 ## Gaming — CPU & performance
 
-![Gaming — CPU & performance](../assets/screenshots/2026-09-19/gaming-mode.png)
+![Gaming — CPU & performance](../assets/screenshots/2026-09-28/gaming-mode.png)
 
 ## Gaming — Launcher & profiles
 
-![Gaming — Launcher & profiles](../assets/screenshots/2026-09-19/gaminglauncher.png)
+![Gaming — Launcher & profiles](../assets/screenshots/2026-09-28/gaminglauncher.png)
 
 ## Gaming — Overlay
 
-![Gaming — Overlay](../assets/screenshots/2026-09-19/gamingoverlay.png)
+![Gaming — Overlay](../assets/screenshots/2026-09-28/gamingoverlay.png)
 
 ## Gaming — Recording
 
-![Gaming — Recording](../assets/screenshots/2026-09-19/gamingrecording.png)
+![Gaming — Recording](../assets/screenshots/2026-09-28/gamingrecording.png)
 
 ## Gaming — Sensors
 
-![Gaming — Sensors](../assets/screenshots/2026-09-19/gamingsensors.png)
+![Gaming — Sensors](../assets/screenshots/2026-09-28/gamingsensors.png)
 
 ## Settings — Appearance
 
-![Settings — Appearance](../assets/screenshots/2026-09-19/settings.png)
+![Settings — Appearance](../assets/screenshots/2026-09-28/settings.png)
 
 ## Settings — Processes
 
-![Settings — Processes](../assets/screenshots/2026-09-19/settingsprocesses.png)
+![Settings — Processes](../assets/screenshots/2026-09-28/settingsprocesses.png)
 
 ## Settings — CPU power
 
-![Settings — CPU power](../assets/screenshots/2026-09-19/settingspower.png)
+![Settings — CPU power](../assets/screenshots/2026-09-28/settingspower.png)
 
 ## Settings — Notifications
 
-![Settings — Notifications](../assets/screenshots/2026-09-19/settingsnotifications.png)
+![Settings — Notifications](../assets/screenshots/2026-09-28/settingsnotifications.png)
 
 ## Settings — Startup & updates
 
-![Settings — Startup & updates](../assets/screenshots/2026-09-19/settingsstartup.png)
+![Settings — Startup & updates](../assets/screenshots/2026-09-28/settingsstartup.png)
 
 ## Tools — Hardware sensors
 
-![Tools — Hardware sensors](../assets/screenshots/2026-09-19/hw-monitor.png)
+![Tools — Hardware sensors](../assets/screenshots/2026-09-28/hw-monitor.png)
 
 ## Tools — Memory benchmarks
 
-![Tools — Memory benchmarks](../assets/screenshots/2026-09-19/benchmark.png)
+![Tools — Memory benchmarks](../assets/screenshots/2026-09-28/benchmark.png)
 
 ## Tools — Activity log
 
-![Tools — Activity log](../assets/screenshots/2026-09-19/log.png)
+![Tools — Activity log](../assets/screenshots/2026-09-28/log.png)
 
 ## Overlay customization — separate window
 
