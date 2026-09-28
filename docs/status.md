@@ -1,9 +1,11 @@
 # Project status
 
-Reviewed on **2026-09-28**. This working tree includes the reliability, recording
-comparison, rule explanation and paired-updater changes listed under
-[Unreleased](../CHANGELOG.md). They have not been published or installed by this
-review. Package version remains `1.3.1`; IPC protocol remains 5.
+Reviewed on **2026-09-28**. The reliability, recording comparison, rule explanation
+and paired-updater changes are committed in
+[`75a44ea`](https://github.com/franzjeger/argus-lasso/commit/75a44ea2ea47e227ea5244b375f067ec1c47e894)
+and pushed to `master`. The matching app/layer pair is installed locally as build
+`75a44ea2ea47-863b562f2519`. These are source changes, not a new tagged release;
+package version remains `1.3.1` and IPC protocol remains 5.
 
 ## Current source verification
 
@@ -27,8 +29,14 @@ review. Package version remains `1.3.1`; IPC protocol remains 5.
 
 ## Installation and releases
 
-The earlier paired installation verified at `8ff0f9b` used build
-`8ff0f9b1b6e7-1de5f47218b7`. This review did not replace it or restart its service.
+The paired installer replaced the earlier `8ff0f9b1b6e7-1de5f47218b7` installation
+with build `75a44ea2ea47-863b562f2519` and restarted the user service. The service
+was active/running with no restarts; its mapped executable matched the installed
+and freshly built app by SHA-256. The overlay manifest points to the new versioned
+library, whose SHA-256 matches the built layer. `build-info` and the startup IPC
+log confirm protocol 5 and the same build ID. A private backup of the previous
+app, manifest, configuration and service file was retained before installation.
+Existing games must restart to load the new library.
 The published release last checked on 2026-09-28 was
 [v1.3.1](https://github.com/franzjeger/argus-lasso/releases/tag/v1.3.1), which predates
 much of the current source. A successful source build is not a published release.
@@ -39,10 +47,11 @@ for rollback and recovers pending transactions on startup. The privileged sensor
 helper remains separate. See [installation](installation.md) and
 [updater behavior](design-updates.md).
 
-The earlier [CI run for 8ff0f9b](https://github.com/franzjeger/argus-lasso/actions/runs/36382981168)
-is historical evidence, not a CI run for these local changes. CI is configured
-for x86_64/aarch64, formatting/lint and Rust 1.92. The new changes were validated
-locally on x86_64; neither compilation nor unit tests establish game compatibility.
+The [CI run for 75a44ea](https://github.com/franzjeger/argus-lasso/actions/runs/36389275962)
+passed x86_64 and aarch64 release builds/tests, Clippy/formatting, the Rust 1.92
+minimum-version check and its security audit job. The separate
+[security audit](https://github.com/franzjeger/argus-lasso/actions/runs/36389275973)
+also passed. Neither compilation nor unit tests establish game compatibility.
 
 ## Behavior and remaining limits
 

@@ -103,7 +103,7 @@ native window decorations or compositor transparency.
 
 ## Reliability and comparison update
 
-Captured on 2026-09-28 from the subsequent local working tree. These replace the
+Captured on 2026-09-28 during development of source change `75a44ea`. These replace the
 corresponding earlier views for the changed controls; the other screenshots above
 retain their original source attribution. The main-window images use the read-only
 X11/Xvfb tour. The comparison image uses the real recording UI in its isolated
