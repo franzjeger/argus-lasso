@@ -187,16 +187,23 @@ fn persist_config_with(
     }
 }
 
+/// The CPU model named in /proc/cpuinfo, read once: it cannot change while
+/// we run, and the file is tens of kilobytes on a many-core machine.
 pub fn read_cpu_model() -> String {
-    std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split_once(':').map(|x| x.1))
-                .map(|s| s.trim().to_string())
+    static MODEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODEL
+        .get_or_init(|| {
+            std::fs::read_to_string("/proc/cpuinfo")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("model name"))
+                        .and_then(|l| l.split_once(':').map(|x| x.1))
+                        .map(|s| s.trim().to_string())
+                })
+                .unwrap_or_else(|| "Unknown CPU".to_string())
         })
-        .unwrap_or_else(|| "Unknown CPU".to_string())
+        .clone()
 }
 
 impl AppState {
@@ -466,19 +473,6 @@ pub fn join_daemon(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bo
         let _ = tx.send(());
     });
     rx.recv_timeout(timeout).is_ok()
-}
-
-fn get_cpu_name() -> String {
-    if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
-        for line in content.lines() {
-            if line.starts_with("model name") {
-                if let Some(name) = line.split(':').nth(1) {
-                    return name.trim().to_string();
-                }
-            }
-        }
-    }
-    "Unknown CPU".to_string()
 }
 
 fn get_ram_speed_mts() -> Option<u32> {
@@ -1040,7 +1034,7 @@ fn run_loop(
                 .and_then(|s| s.cpu_power_w)
                 .or_else(|| hw_collector.data.get_cpu_power());
             let gpu_name = hw_collector.data.get_gpu_name();
-            let cpu_name = get_cpu_name();
+            let cpu_name = read_cpu_model();
             let (ram_used, ram_total) = get_ram_info();
             let vram_used = hw_collector.data.get_vram_usage_gb();
             let vram_total = hw_collector.data.get_vram_total_gb();
