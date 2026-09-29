@@ -1097,8 +1097,6 @@ impl eframe::App for ArgusLassoApp {
                         &snapshot,
                         &throttled_pids,
                         &suspended_pids,
-                        &self.cmd_tx,
-                        &self.rule_engine,
                         gaming_active,
                         &proc_cpu_history,
                     );
