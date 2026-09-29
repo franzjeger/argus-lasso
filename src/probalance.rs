@@ -36,6 +36,9 @@ enum Applied {
 
 #[derive(Debug, Clone)]
 struct ProcEntry {
+    /// Start time of the process this entry describes, so a new process
+    /// that reuses the PID never inherits it.
+    start_ticks: u64,
     state: ProcState,
     consecutive_high: f32, // seconds spent above threshold
     consecutive_low: f32,  // seconds spent below restore threshold
@@ -47,6 +50,7 @@ struct ProcEntry {
 impl ProcEntry {
     fn new(original_nice: i32) -> Self {
         Self {
+            start_ticks: 0,
             state: ProcState::Normal,
             consecutive_high: 0.0,
             consecutive_low: 0.0,
@@ -87,6 +91,8 @@ pub struct ThrottleInfo {
 #[derive(Debug, Clone)]
 pub struct ProcSnapshot {
     pub pid: u32,
+    /// With `pid`, the process's identity: a PID can be reused.
+    pub start_ticks: u64,
     pub name: String,
     pub cpu_percent: f32,
     pub nice: i32,
@@ -457,13 +463,16 @@ impl ProBalance {
         let mut pending_logs: Vec<String> = Vec::new();
 
         // Clean up dead PIDs. A cgroup-throttled unit outlives its hog PID, so
-        // release the unit reference instead of just dropping the entry.
-        let alive: std::collections::HashSet<u32> = snapshot.iter().map(|p| p.pid).collect();
+        // release the unit reference instead of just dropping the entry. A PID
+        // now held by a different process (another start time) is dead too:
+        // restoring the old process's nice onto the new one would change a
+        // process ProBalance never touched.
+        let alive: HashMap<u32, u64> = snapshot.iter().map(|p| (p.pid, p.start_ticks)).collect();
         let dead: Vec<u32> = self
             .states
-            .keys()
-            .filter(|p| !alive.contains(p))
-            .copied()
+            .iter()
+            .filter(|(pid, entry)| alive.get(pid) != Some(&entry.start_ticks))
+            .map(|(&pid, _)| pid)
             .collect();
         for pid in dead {
             if let Some(entry) = self.states.remove(&pid) {
@@ -476,7 +485,7 @@ impl ProBalance {
                 }
             }
         }
-        self.cgroup_failed_pids.retain(|p| alive.contains(p));
+        self.cgroup_failed_pids.retain(|p| alive.contains_key(p));
 
         // Unit-level CPUWeight must never penalize a protected neighbor.
         let mut protected = protected_pids.clone();
@@ -520,10 +529,10 @@ impl ProBalance {
             // (Scoped so the entry borrow ends before the impure application —
             // apply_throttle/undo_applied need &mut self.)
             let decision = {
-                let entry = self
-                    .states
-                    .entry(proc.pid)
-                    .or_insert_with(|| ProcEntry::new(proc.nice));
+                let entry = self.states.entry(proc.pid).or_insert_with(|| ProcEntry {
+                    start_ticks: proc.start_ticks,
+                    ..ProcEntry::new(proc.nice)
+                });
                 decide(entry, proc, tick_seconds, &self.cfg, system_cpu)
             };
 
@@ -668,6 +677,7 @@ mod tests {
             name: "anything".into(),
             cpu_percent: 99.0,
             nice: 0,
+            start_ticks: 0,
         }];
         pb.tick(&snap, 1.0, Some(10.0), &Default::default());
         // Disabled → state map stays empty, no syscalls attempted.
@@ -686,6 +696,7 @@ mod tests {
             name: "kwin_wayland".into(),
             cpu_percent: 99.0,
             nice: 0,
+            start_ticks: 0,
         }];
         pb.tick(&snap, 10.0, Some(10.0), &Default::default());
         // Exempt processes are skipped entirely — no entry created in state map.
@@ -701,10 +712,38 @@ mod tests {
             name: "myapp".into(),
             cpu_percent: 10.0,
             nice: 0,
+            start_ticks: 0,
         }];
         pb.tick(&snap, 1.0, Some(10.0), &Default::default());
         assert_eq!(pb.tracked_pid_count(), 1);
         assert!(pb.throttled_pids().is_empty());
+    }
+
+    /// A PID reused by a new process between two ticks must not inherit the
+    /// old process's throttled entry — its restore would renice a process
+    /// ProBalance never touched.
+    #[test]
+    fn a_reused_pid_does_not_inherit_the_old_process_entry() {
+        let mut pb = ProBalance::new(ProBalanceConfig::default());
+        let mut old = ProcEntry::new(0);
+        old.start_ticks = 100;
+        old.state = ProcState::Throttled;
+        old.throttle_nice = Some(10);
+        pb.states.insert(4242, old);
+
+        let reused = ProcSnapshot {
+            pid: 4242,
+            start_ticks: 200,
+            name: "newcomer".into(),
+            cpu_percent: 1.0,
+            nice: 7,
+        };
+        pb.tick(&[reused], 1.0, Some(10.0), &Default::default());
+
+        assert!(pb.throttled_pids().is_empty());
+        let entry = &pb.states[&4242];
+        assert_eq!(entry.start_ticks, 200);
+        assert_eq!(entry.original_nice, Some(7));
     }
 
     #[test]
@@ -715,6 +754,7 @@ mod tests {
             name: "myapp".into(),
             cpu_percent: 10.0,
             nice: 0,
+            start_ticks: 0,
         }];
         pb.tick(&snap1, 1.0, Some(10.0), &Default::default());
         assert_eq!(pb.tracked_pid_count(), 1);
@@ -751,6 +791,7 @@ mod tests {
             name: "test".into(),
             cpu_percent: cpu,
             nice,
+            start_ticks: 0,
         }
     }
 
@@ -943,6 +984,7 @@ mod system_pressure_tests {
             name: "background".into(),
             cpu_percent,
             nice: 0,
+            start_ticks: 0,
         }
     }
 

@@ -954,6 +954,7 @@ fn run_loop(
                 .iter()
                 .map(|p| ProcSnapshot {
                     pid: p.pid,
+                    start_ticks: p.start_ticks,
                     name: p.name.to_string(),
                     cpu_percent: p.cpu_percent,
                     nice: p.nice,
@@ -1107,6 +1108,7 @@ fn run_loop(
                 .iter()
                 .map(|p| crate::probalance::ProcSnapshot {
                     pid: p.pid,
+                    start_ticks: p.start_ticks,
                     name: p.name.to_string(),
                     cpu_percent: p.cpu_percent,
                     nice: p.nice,

@@ -91,6 +91,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   Defaults were used and the next change wrote them over the file, deleting every
   rule and profile. The file is now kept as `config.toml.unreadable-<time>` and
   the reason is shown.
+- ProBalance tracks processes by PID and start time: a new process that reuses a
+  throttled process's PID no longer inherits its entry, or gets its priority
+  "restored" to the old process's value.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
