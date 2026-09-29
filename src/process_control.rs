@@ -7,10 +7,17 @@ pub struct ProcessHandle(OwnedFd);
 impl ProcessHandle {
     /// Open first, then validate against the displayed snapshot. A recycled PID
     /// cannot redirect subsequent signals because they use the descriptor.
+    /// Refuses this process: stopping or killing ourselves is never intended.
     pub fn open(pid: u32, start_ticks: u64) -> Result<Self, Errno> {
         if pid == std::process::id() {
             return Err(Errno::EPERM);
         }
+        Self::track(pid, start_ticks)
+    }
+    /// As `open`, but also for this process: for holding an identity while a
+    /// priority or affinity change is prepared, which is harmless to apply to
+    /// ourselves.
+    pub fn track(pid: u32, start_ticks: u64) -> Result<Self, Errno> {
         if pid == 0 || pid > i32::MAX as u32 {
             return Err(Errno::EINVAL);
         }

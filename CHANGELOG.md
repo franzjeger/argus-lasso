@@ -58,6 +58,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   instead of `vkDeviceWaitIdle`, outside the shared lock. New
   `vkDestroyDevice`/`vkDestroyInstance` hooks drop state for recycled handles,
   and the library stays mapped while its threads run.
+- Manual nice and I/O priority changes from the process table are protected from
+  rule enforcement and ProBalance for 30 seconds, as affinity changes already
+  were, instead of being undone on the next pass. The dialogs hold the process
+  by pidfd and refuse to apply a change once it has exited.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

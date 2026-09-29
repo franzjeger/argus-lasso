@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::gui::detail_window::DetailWindow;
-use crate::gui::dialog_manager::DialogManager;
+use crate::gui::dialog_manager::{DialogManager, DialogTarget};
 use crate::gui::dialogs::{AffinityDialog, IoNiceDialog, NiceDialog};
 use crate::gui::process_tab::PendingKill;
 use crate::gui::process_tab::TableAction;
@@ -104,14 +104,28 @@ impl ActionHandler {
                 }
             }
             TableAction::SetAffinity { pid, name, current } => {
-                dialog_manager.affinity_dialog = Some((pid, AffinityDialog::new(&current, &name)));
+                match DialogTarget::open(snapshot, pid) {
+                    Ok(target) => {
+                        dialog_manager.affinity_dialog =
+                            Some((target, AffinityDialog::new(&current, &name)))
+                    }
+                    Err(e) => notify_error(&format!("Cannot identify {name} ({pid}): {e}")),
+                }
             }
             TableAction::SetNice { pid, name, current } => {
-                dialog_manager.nice_dialog = Some((pid, NiceDialog::new(current, &name)));
+                match DialogTarget::open(snapshot, pid) {
+                    Ok(target) => {
+                        dialog_manager.nice_dialog = Some((target, NiceDialog::new(current, &name)))
+                    }
+                    Err(e) => notify_error(&format!("Cannot identify {name} ({pid}): {e}")),
+                }
             }
-            TableAction::SetIonice { pid, name } => {
-                dialog_manager.ionice_dialog = Some((pid, IoNiceDialog::new(&name)));
-            }
+            TableAction::SetIonice { pid, name } => match DialogTarget::open(snapshot, pid) {
+                Ok(target) => {
+                    dialog_manager.ionice_dialog = Some((target, IoNiceDialog::new(&name)))
+                }
+                Err(e) => notify_error(&format!("Cannot identify {name} ({pid}): {e}")),
+            },
             TableAction::AddRule { name } => {
                 let mut rule = crate::rules::Rule::new_empty();
                 rule.name = name.clone();
