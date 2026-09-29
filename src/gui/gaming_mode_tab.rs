@@ -31,9 +31,13 @@ pub(crate) struct LaunchedGame {
 }
 
 impl LaunchedGame {
-    /// None if the process is already gone.
-    fn open(pid: u32) -> Option<Self> {
+    /// None if the process is already gone, or started before `not_before`
+    /// (process start ticks): a game is never older than its own launch.
+    fn open(pid: u32, not_before: u64) -> Option<Self> {
         let start = crate::fast_proc::read_stat(pid, &mut [0; 1024])?.starttime;
+        if start < not_before {
+            return None;
+        }
         let handle = crate::process_control::ProcessHandle::open(pid, start).ok()?;
         Some(Self { pid, handle })
     }
@@ -93,6 +97,9 @@ pub struct GamingModeTab {
     pub auto_restore: bool,
     pub watch_phase: WatchPhase,
     pub(crate) launched: Option<LaunchedGame>,
+    /// Start ticks of the process the launcher spawned. The game is that
+    /// process or one started after it.
+    launch_start_ticks: u64,
     pub watch_status: String,
     launch_error: bool,
     pub last_poll: std::time::Instant,
@@ -164,6 +171,7 @@ impl GamingModeTab {
             auto_restore: true,
             watch_phase: WatchPhase::Idle,
             launched: None,
+            launch_start_ticks: 0,
             watch_status: String::new(),
             launch_error: false,
             last_poll: std::time::Instant::now(),
@@ -361,13 +369,14 @@ impl GamingModeTab {
         self.last_poll = std::time::Instant::now();
 
         let name = self.game_name.clone();
+        let not_before = self.launch_start_ticks;
         // The first candidate that is still alive by the time it is opened.
         let find_game = || -> Option<LaunchedGame> {
             std::fs::read_dir("/proc")
                 .ok()?
                 .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
                 .filter(|&pid| proc_name_matches(&name, pid))
-                .find_map(LaunchedGame::open)
+                .find_map(|pid| LaunchedGame::open(pid, not_before))
         };
 
         match self.watch_phase {
@@ -1027,6 +1036,9 @@ impl GamingModeTab {
             .spawn()
         {
             Ok(mut child) => {
+                // Read before the reaper below can free the PID.
+                self.launch_start_ticks = crate::fast_proc::read_stat(child.id(), &mut [0; 1024])
+                    .map_or(0, |s| s.starttime);
                 // Reap the launcher even when it exits before the actual game.
                 std::thread::spawn(move || {
                     let _ = child.wait();
@@ -1183,7 +1195,47 @@ fn core_map(
     }
 }
 
+/// Launch infrastructure that starts alongside a game and is never the game,
+/// although its name or command line often contains the game's: `sh` inside
+/// "Dishonored", or a reaper/Proton command line naming the game's path.
+/// Normalized, and truncated to 15 bytes as the kernel truncates `comm`.
+const LAUNCH_HELPERS: &[&str] = &[
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "env",
+    "python",
+    "python3",
+    "reaper",
+    "steam",
+    "steamwebhelper",
+    "pressurevessel",
+    "pvbwrap",
+    "srtbwrap",
+    "bwrap",
+    "wine",
+    "wine64",
+    "wineserver",
+    "winepreloader",
+    "wine64preloade",
+    "proton",
+    "umurun",
+    "gamescope",
+    "gamemoderun",
+    "mangohud",
+    "lutris",
+    "heroic",
+];
+
 fn proc_name_matches(game_name: &str, pid: u32) -> bool {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    is_game_process(game_name, &comm, &cmdline)
+}
+
+/// Whether a process with this `comm` and `cmdline` is the game `game_name`.
+fn is_game_process(game_name: &str, comm: &str, cmdline: &[u8]) -> bool {
     let norm = |s: &str| -> String {
         s.chars()
             .filter(|c| c.is_alphanumeric())
@@ -1191,23 +1243,18 @@ fn proc_name_matches(game_name: &str, pid: u32) -> bool {
             .collect()
     };
     let name_n = norm(game_name);
+    let comm_n = norm(comm.trim());
     // Every string contains "", so an empty side would match any process —
-    // including one that exited between the /proc listing and this read.
-    if name_n.is_empty() {
+    // including one that exited between the /proc listing and these reads.
+    if name_n.is_empty() || comm_n.is_empty() || LAUNCH_HELPERS.contains(&comm_n.as_str()) {
         return false;
     }
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-    let comm_n = norm(comm.trim());
-    if !comm_n.is_empty() && (name_n.contains(&comm_n) || comm_n.contains(&name_n)) {
+    // `comm` is truncated to 15 bytes, so a long title can contain it. A
+    // short one would be found inside almost any title.
+    if comm_n.contains(&name_n) || (comm_n.len() >= 4 && name_n.contains(&comm_n)) {
         return true;
     }
-    // Fallback: cmdline
-    if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
-        if norm(&cmdline).contains(&name_n) {
-            return true;
-        }
-    }
-    false
+    norm(&String::from_utf8_lossy(cmdline)).contains(&name_n)
 }
 
 fn parse_launch_command(command: &str) -> Result<Vec<String>, String> {
@@ -1221,7 +1268,26 @@ fn parse_launch_command(command: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod launcher_tests {
-    use super::parse_launch_command;
+    use super::{is_game_process, parse_launch_command};
+
+    #[test]
+    fn game_names_match_the_game_and_not_its_launch_helpers() {
+        let title = "Shadow of the Tomb Raider";
+        let exe = b"Z:\\games\\Shadow of the Tomb Raider\\SOTTR.exe\0";
+        assert!(is_game_process(title, "SOTTR.exe", exe));
+        // Short names are found inside almost any title.
+        assert!(!is_game_process(title, "sh", b"sh\0-c\0true\0"));
+        assert!(!is_game_process("Catan", "cat", b"cat\0notes.txt\0"));
+        // Wrappers name the game's path but are not the game.
+        assert!(!is_game_process(title, "reaper", exe));
+        assert!(!is_game_process(title, "pressure-vessel", exe));
+        // A vanished process reads back empty.
+        assert!(!is_game_process(title, "", b""));
+        // comm truncated to 15 bytes still matches the long executable name.
+        assert!(is_game_process("Cyberpunk 2077", "Cyberpunk2077.e", b""));
+        // A title that extends the executable's name.
+        assert!(is_game_process("Factorio Space Age", "factorio", b""));
+    }
     #[test]
     fn quoted_arguments_and_paths_are_preserved_without_shell_execution() {
         assert_eq!(

@@ -62,6 +62,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   rule enforcement and ProBalance for 30 seconds, as affinity changes already
   were, instead of being undone on the next pass. The dialogs hold the process
   by pidfd and refuse to apply a change once it has exited.
+- The launcher only accepts a game process started after its own launch, and
+  never shells or launch wrappers (sh, reaper, pressure-vessel, Wine, Proton):
+  a long-running `sh` no longer matches "Shadow of the Tomb Raider".
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
