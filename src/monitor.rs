@@ -553,28 +553,12 @@ fn logical_cpus(usages: &[f32]) -> Vec<argus_ipc::LogicalCpu> {
     cpus
 }
 
+/// (used, total) RAM in GiB.
 fn get_ram_info() -> (f32, f32) {
-    let mut mem_total = 0.0;
-    let mut mem_available = 0.0;
-    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
-        for line in content.lines() {
-            if line.starts_with("MemTotal:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 1 {
-                    mem_total = parts[1].parse::<f32>().unwrap_or(0.0) / (1024.0 * 1024.0);
-                    // GiB
-                }
-            } else if line.starts_with("MemAvailable:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 1 {
-                    mem_available = parts[1].parse::<f32>().unwrap_or(0.0) / (1024.0 * 1024.0);
-                    // GiB
-                }
-            }
-        }
-    }
-    let mem_used = mem_total - mem_available;
-    (mem_used.max(0.0), mem_total)
+    const GIB_IN_KIB: f32 = 1024.0 * 1024.0;
+    utils::read_meminfo().map_or((0.0, 0.0), |m| {
+        (m.used() as f32 / GIB_IN_KIB, m.total as f32 / GIB_IN_KIB)
+    })
 }
 
 fn run_loop(

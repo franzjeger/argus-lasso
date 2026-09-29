@@ -971,26 +971,16 @@ fn collect_load_avg() -> Option<GroupReading> {
 // ── /proc/meminfo ─────────────────────────────────────────────────────────────
 
 fn collect_meminfo() -> Option<GroupReading> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let mut map: HashMap<&str, u64> = HashMap::new();
-    for line in text.lines() {
-        let mut p = line.split_whitespace();
-        if let (Some(k), Some(v)) = (p.next(), p.next()) {
-            if let Ok(n) = v.parse::<u64>() {
-                map.insert(k.trim_end_matches(':'), n);
-            }
-        }
-    }
+    let m = crate::utils::read_meminfo()?;
+    let gib = |kib: u64| kib as f32 / (1024.0 * 1024.0);
 
-    let gib = |k: &str| map.get(k).copied().unwrap_or(0) as f32 / (1024.0 * 1024.0);
-
-    let total = gib("MemTotal");
-    let available = gib("MemAvailable");
-    let used = total - available;
-    let buffers = gib("Buffers");
-    let cached = gib("Cached");
-    let swap_total = gib("SwapTotal");
-    let swap_used = swap_total - gib("SwapFree");
+    let total = gib(m.total);
+    let available = gib(m.available);
+    let used = gib(m.used());
+    let buffers = gib(m.buffers);
+    let cached = gib(m.cached);
+    let swap_total = gib(m.swap_total);
+    let swap_used = gib(m.swap_total.saturating_sub(m.swap_free));
 
     let mut sensors: Vec<Reading> = vec![
         ("Total", "GiB", total),

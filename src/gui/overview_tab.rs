@@ -408,23 +408,9 @@ impl OverviewTab {
     }
 }
 
+/// (used, total) RAM in MiB.
 fn read_ram_mb() -> Option<(u64, u64)> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let mut total = 0u64;
-    let mut available = 0u64;
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("MemTotal:") {
-            total = v.split_whitespace().next()?.parse().ok()?;
-        } else if let Some(v) = line.strip_prefix("MemAvailable:") {
-            available = v.split_whitespace().next()?.parse().ok()?;
-        }
-    }
-    if total == 0 {
-        return None;
-    }
-    let used_mb = (total - available) / 1024;
-    let total_mb = total / 1024;
-    Some((used_mb, total_mb))
+    crate::utils::read_meminfo().map(|m| (m.used() / 1024, m.total / 1024))
 }
 
 fn read_load_avg() -> Option<(f32, f32, f32)> {

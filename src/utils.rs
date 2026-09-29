@@ -205,6 +205,54 @@ pub fn get_affinity_str(pid: u32) -> String {
 
 use nix::sched::CpuSet;
 
+// ── /proc/meminfo ─────────────────────────────────────────────────────────────
+
+/// The /proc/meminfo fields this app shows, in KiB.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct MemInfo {
+    pub total: u64,
+    pub available: u64,
+    pub buffers: u64,
+    pub cached: u64,
+    pub swap_total: u64,
+    pub swap_free: u64,
+}
+
+impl MemInfo {
+    pub fn used(&self) -> u64 {
+        self.total.saturating_sub(self.available)
+    }
+}
+
+/// The one /proc/meminfo parser. None if the file is unreadable or reports
+/// no memory.
+pub fn read_meminfo() -> Option<MemInfo> {
+    parse_meminfo(&fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+fn parse_meminfo(text: &str) -> Option<MemInfo> {
+    let mut info = MemInfo::default();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(key), Some(value)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Ok(kib) = value.parse() else {
+            continue;
+        };
+        match key {
+            "MemTotal:" => info.total = kib,
+            "MemAvailable:" => info.available = kib,
+            "Buffers:" => info.buffers = kib,
+            "Cached:" => info.cached = kib,
+            "SwapTotal:" => info.swap_total = kib,
+            "SwapFree:" => info.swap_free = kib,
+            _ => {}
+        }
+    }
+    (info.total > 0).then_some(info)
+}
+
 // ── Per-thread attributes ────────────────────────────────────────────────────
 
 /// Apply `set` to every thread of `pid`, main thread first.
@@ -760,6 +808,25 @@ mod tests {
         }
         set_nice(pid, target).unwrap();
         assert_eq!(get_nice(worker.tid), Some(target));
+    }
+
+    #[test]
+    fn meminfo_parses_the_fields_shown_and_rejects_an_empty_file() {
+        let text = "MemTotal:       48965732 kB\nMemFree:        30000000 kB\n\
+                    MemAvailable:   37000000 kB\nBuffers:           12000 kB\n\
+                    Cached:          5000000 kB\nSwapTotal:       8388604 kB\n\
+                    SwapFree:        8000000 kB\n";
+        let m = parse_meminfo(text).unwrap();
+        assert_eq!(
+            (m.total, m.available, m.used()),
+            (48965732, 37000000, 11965732)
+        );
+        assert_eq!((m.buffers, m.cached), (12000, 5000000));
+        assert_eq!((m.swap_total, m.swap_free), (8388604, 8000000));
+        assert!(parse_meminfo("").is_none());
+        // Available above total must not wrap around to an enormous "used".
+        let odd = parse_meminfo("MemTotal: 10 kB\nMemAvailable: 12 kB\n").unwrap();
+        assert_eq!(odd.used(), 0);
     }
 
     /// The UI used to guess "needs root?" for every failure; the setters now
