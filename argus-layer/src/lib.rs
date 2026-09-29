@@ -4,6 +4,10 @@
 //!        vkCreateDevice/vkDestroyDevice, vkGetDeviceQueue(2),
 //!        vkCreateSwapchainKHR/vkDestroySwapchainKHR, vkQueuePresentKHR.
 
+// Every unsafe block states why it is sound; CI treats a missing comment as
+// an error (clippy -D warnings).
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 mod activation;
 mod capture;
 pub mod font;
@@ -1425,6 +1429,7 @@ mod tests {
             pfn_get_device_proc_addr: None,
             pfn_get_physical_device_proc_addr: std::ptr::null(),
         };
+        // SAFETY: a valid, exclusively borrowed struct, as the loader passes.
         let res = unsafe { vkNegotiateLoaderLayerInterfaceVersion(&mut vs) };
         assert_eq!(res, vk::Result::SUCCESS);
         assert!(vs.pfn_get_instance_proc_addr.is_some());
@@ -1445,6 +1450,8 @@ mod tests {
             DEVICE_QUEUE_FAMILY.write_or_recover().insert(device, 0);
         }
 
+        // SAFETY: no DEVICE_MAP entry exists for this made-up handle, so no
+        // Vulkan object is destroyed; only the map entries are removed.
         unsafe { forget_device(gone) };
 
         assert!(!QUEUE_TO_DEVICE.read_or_recover().contains_key(&gone_q));

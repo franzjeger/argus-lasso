@@ -72,6 +72,8 @@ fn find_memory_type(
     type_filter: u32,
     properties: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
+    // SAFETY: callers pass a physical device enumerated from `instance`
+    // (OverlayState::new's contract), which the query requires.
     let mem_properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
     (0..mem_properties.memory_type_count).find(|&i| {
         (type_filter & (1 << i)) != 0
