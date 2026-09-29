@@ -715,6 +715,46 @@ fn home_or_err() -> std::io::Result<String> {
         .ok_or_else(|| std::io::Error::other("home directory unknown"))
 }
 
+/// `path` as one argument of a desktop entry's Exec key. The spec applies
+/// two escapings in order: quoting (reserved characters inside the quotes
+/// get a backslash) and then the general string escaping of every value
+/// (each backslash doubled), which readers undo first. `%` starts a field
+/// code and is doubled.
+fn desktop_exec_arg(path: &std::path::Path) -> String {
+    let mut out = String::from("\"");
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '"' | '`' | '$' => {
+                out.push_str("\\\\");
+                out.push(c);
+            }
+            '\\' => out.push_str("\\\\\\\\"),
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `path` as the command of a systemd ExecStart: quoted, with `\` and `"`
+/// escaped and `%` (a specifier) doubled.
+fn systemd_exec_arg(path: &std::path::Path) -> String {
+    let mut out = String::from("\"");
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn write_autostart() -> std::io::Result<String> {
     let home = home_or_err()?;
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("argus-lasso"));
@@ -726,36 +766,47 @@ fn write_autostart() -> std::io::Result<String> {
         "[Desktop Entry]\nType=Application\nName=Argus-Lasso\n\
          Exec={} --minimized\nIcon=argus-lasso\nHidden=false\n\
          X-GNOME-Autostart-enabled=true\n",
-        exe.display()
+        desktop_exec_arg(&exe)
     );
     std::fs::write(format!("{xdg_dir}/argus-lasso.desktop"), xdg_entry)?;
 
     // ── systemd user service (KDE / systemd-based desktops) ──────────────────
+    // An existing unit is the installer's or the user's, possibly customised
+    // (the installer keeps it across updates for that reason): enable it,
+    // never rewrite it.
     let systemd_dir = format!("{home}/.config/systemd/user");
-    let mut systemd_note = String::new();
-    if std::fs::create_dir_all(&systemd_dir).is_ok() {
-        let unit = format!(
-            "[Unit]\nDescription=Argus-Lasso Linux\nAfter=graphical-session.target\n\n\
-             [Service]\nExecStart={} --minimized\nRestart=on-failure\n\n\
-             [Install]\nWantedBy=graphical-session.target\n",
-            exe.display()
-        );
-        match std::fs::write(format!("{systemd_dir}/argus-lasso.service"), unit) {
-            Ok(()) => {
-                if std::process::Command::new("systemctl")
-                    .args(["--user", "enable", "argus-lasso.service"])
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false)
-                {
-                    systemd_note = " + systemd".into();
-                } else {
-                    systemd_note = " (systemd unit written but not enabled)".into();
-                }
+    let unit_path = format!("{systemd_dir}/argus-lasso.service");
+    let unit_ready = if std::path::Path::new(&unit_path).exists() {
+        Ok(())
+    } else {
+        std::fs::create_dir_all(&systemd_dir).and_then(|()| {
+            std::fs::write(
+                &unit_path,
+                format!(
+                    "[Unit]\nDescription=Argus-Lasso Linux\nAfter=graphical-session.target\n\
+                     PartOf=graphical-session.target\n\n\
+                     [Service]\nExecStart={} --minimized\nRestart=on-failure\nRestartSec=5\n\n\
+                     [Install]\nWantedBy=graphical-session.target\n",
+                    systemd_exec_arg(&exe)
+                ),
+            )
+        })
+    };
+    let systemd_note = match unit_ready {
+        Ok(()) => {
+            if std::process::Command::new("systemctl")
+                .args(["--user", "enable", "argus-lasso.service"])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                " + systemd".to_string()
+            } else {
+                " (systemd unit present but not enabled)".to_string()
             }
-            Err(e) => systemd_note = format!(" (systemd unit not written: {e})"),
         }
-    }
+        Err(e) => format!(" (systemd unit not written: {e})"),
+    };
 
     Ok(format!("Autostart enabled (XDG{systemd_note})"))
 }
@@ -784,7 +835,22 @@ fn disable_autostart() -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_sysfs_all_cpus_at;
+
+    #[test]
+    fn exec_paths_are_quoted_for_their_file_format() {
+        let path = std::path::Path::new("/home/a b/100%/\"x\"/$bin");
+        assert_eq!(
+            desktop_exec_arg(path),
+            r#""/home/a b/100%%/\\"x\\"/\\$bin""#
+        );
+        assert_eq!(
+            desktop_exec_arg(std::path::Path::new(r"/a\b")),
+            r#""/a\\\\b""#
+        );
+        assert_eq!(systemd_exec_arg(path), r#""/home/a b/100%%/\"x\"/$bin""#);
+    }
+
+    use super::{desktop_exec_arg, systemd_exec_arg, write_sysfs_all_cpus_at};
     use std::cell::Cell;
 
     fn fake_cpu_dir(root: &std::path::Path, writable_cpus: &[u32], cpu_count: u32) {

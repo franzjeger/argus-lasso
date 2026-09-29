@@ -94,6 +94,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - ProBalance tracks processes by PID and start time: a new process that reuses a
   throttled process's PID no longer inherits its entry, or gets its priority
   "restored" to the old process's value.
+- Settings → Startup no longer overwrites an existing `argus-lasso.service`, which
+  the installer keeps across updates for local customizations; it enables it.
+  Program paths with spaces or special characters are quoted correctly in the
+  autostart entry and the unit.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
