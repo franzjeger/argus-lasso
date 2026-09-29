@@ -177,33 +177,74 @@ pub fn get_affinity_str(pid: u32) -> String {
 
 use nix::sched::CpuSet;
 
+// ── Per-thread attributes ────────────────────────────────────────────────────
+
+/// Apply `set` to every thread of `pid`, main thread first.
+///
+/// Nice and I/O priority belong to each thread on Linux: `setpriority(2)` and
+/// `ioprio_set(2)` given a PID reach only the thread whose TID equals it, so a
+/// game's render and worker threads kept their old priority while the main
+/// thread — the only one read back — reported success. Affinity is applied
+/// the same way for the same reason.
+///
+/// Returns the main thread's result: that is the value `get_nice` and
+/// `get_ionice_raw` read back, so callers' dirty-checks agree with what they
+/// were told. The other threads are best effort — one exiting mid-walk is
+/// ordinary.
+fn set_every_thread(
+    pid: u32,
+    what: &str,
+    set: impl Fn(u32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let main = set(pid);
+    for tid in get_tids(pid) {
+        if tid != pid {
+            if let Err(e) = set(tid) {
+                log::debug!("{what} pid={pid} tid={tid}: {e}");
+            }
+        }
+    }
+    main
+}
+
 // ── nice ──────────────────────────────────────────────────────────────────────
 
-/// Set nice priority via `setpriority` syscall.
+/// Set the nice value of every thread of `pid` via the `setpriority` syscall.
 /// Negative values require root/CAP_SYS_NICE. Returns true on success.
 pub fn set_nice(pid: u32, nice: i32) -> bool {
     use nix::libc;
-    // Unlike getpriority(2), whose -1 is ambiguous with a legitimate return
-    // value of -1, setpriority(2) unambiguously returns 0 on success and -1
-    // (with errno set) on failure — no errno-clearing dance needed first.
-    //
-    // SAFETY: only plain integers cross the FFI boundary; no pointers or
-    // lifetimes are involved.
-    let res =
-        unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice as libc::c_int) };
-    if res == 0 {
-        log::debug!("setpriority pid={pid} nice={nice}: OK");
-        true
-    } else {
-        let err = std::io::Error::last_os_error();
-        log::warn!("setpriority pid={pid} nice={nice} failed: {err}");
-        false
+    let result = set_every_thread(pid, "setpriority", |tid| {
+        // Unlike getpriority(2), whose -1 is ambiguous with a legitimate
+        // return value of -1, setpriority(2) unambiguously returns 0 on
+        // success and -1 (with errno set) on failure — no errno-clearing
+        // dance needed first.
+        //
+        // SAFETY: only plain integers cross the FFI boundary; no pointers or
+        // lifetimes are involved.
+        let res = unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice as libc::c_int)
+        };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    });
+    match result {
+        Ok(()) => {
+            log::debug!("setpriority pid={pid} nice={nice}: OK");
+            true
+        }
+        Err(err) => {
+            log::warn!("setpriority pid={pid} nice={nice} failed: {err}");
+            false
+        }
     }
 }
 
 // ── ionice ───────────────────────────────────────────────────────────────────
 
-/// Set I/O priority via `ioprio_set` syscall.
+/// Set the I/O priority of every thread of `pid` via the `ioprio_set` syscall.
 /// class: 1=realtime, 2=best-effort, 3=idle. level: 0-7 (RT and BE only).
 pub fn set_ionice(pid: u32, class: i32, level: Option<i32>) -> bool {
     use nix::libc;
@@ -211,23 +252,32 @@ pub fn set_ionice(pid: u32, class: i32, level: Option<i32>) -> bool {
     let data_val = (level.unwrap_or(0) as u32) & 0x1fff;
     let prio = (class_val << 13) | data_val;
 
-    // SAFETY: only plain integers cross the FFI boundary; no pointers or
-    // lifetimes are involved.
-    let res = unsafe {
-        libc::syscall(
-            libc::SYS_ioprio_set,
-            1, // IOPRIO_WHO_PROCESS
-            pid as libc::c_int,
-            prio as libc::c_int,
-        )
-    };
-    if res == 0 {
-        log::debug!("ioprio_set pid={pid} class={class} level={level:?}: OK");
-        true
-    } else {
-        let err = std::io::Error::last_os_error();
-        log::warn!("ioprio_set pid={pid} class={class} failed: {err}");
-        false
+    let result = set_every_thread(pid, "ioprio_set", |tid| {
+        // SAFETY: only plain integers cross the FFI boundary; no pointers or
+        // lifetimes are involved.
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_ioprio_set,
+                1, // IOPRIO_WHO_PROCESS — which, despite the name, is one thread
+                tid as libc::c_int,
+                prio as libc::c_int,
+            )
+        };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    });
+    match result {
+        Ok(()) => {
+            log::debug!("ioprio_set pid={pid} class={class} level={level:?}: OK");
+            true
+        }
+        Err(err) => {
+            log::warn!("ioprio_set pid={pid} class={class} failed: {err}");
+            false
+        }
     }
 }
 
@@ -642,6 +692,68 @@ pub(crate) static PROCESS_NICE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mute
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker thread of this test process, parked until dropped, so its
+    /// per-thread nice and I/O priority can be read back through its TID.
+    struct Worker {
+        tid: u32,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Worker {
+        fn spawn() -> Self {
+            let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+            let (release, parked) = std::sync::mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                tid_tx.send(nix::unistd::gettid().as_raw() as u32).unwrap();
+                let _ = parked.recv();
+            });
+            let tid = tid_rx.recv().unwrap();
+            Self {
+                tid,
+                release: Some(release),
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// setpriority(PRIO_PROCESS, pid) moves only the main thread on Linux;
+    /// a rule or ProBalance throttle must reach the worker threads too.
+    #[test]
+    fn set_nice_reaches_worker_threads() {
+        let _guard = PROCESS_NICE_TEST_LOCK.lock().unwrap();
+        let pid = std::process::id();
+        let worker = Worker::spawn();
+        // Only ever raise nice: lowering it again is governed by RLIMIT_NICE
+        // and not guaranteed (see PROCESS_NICE_TEST_LOCK).
+        let target = get_nice(pid).unwrap().max(get_nice(worker.tid).unwrap()) + 1;
+        if target > 19 {
+            return;
+        }
+        assert!(set_nice(pid, target));
+        assert_eq!(get_nice(worker.tid), Some(target));
+    }
+
+    #[test]
+    fn set_ionice_reaches_worker_threads() {
+        let pid = std::process::id();
+        let worker = Worker::spawn();
+        let before = get_ionice_raw(pid).unwrap();
+        // Best-effort at the lowest level needs no privilege.
+        assert!(set_ionice(pid, 2, Some(7)));
+        assert_eq!(get_ionice_raw(worker.tid), Some((2, 7)));
+        let _ = set_ionice(pid, before.0, Some(before.1));
+    }
 
     #[test]
     fn wine_names_accept_windows_unix_and_bare_paths() {

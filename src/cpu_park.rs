@@ -40,7 +40,7 @@ pub const LEGACY_SUDOERS: &str = "/etc/sudoers.d/argus-lasso";
 
 /// Bumped whenever a helper script changes, so the app can tell an outdated
 /// install from a missing one. Substring-matched in the installed files.
-const HELPER_VERSION: &str = "argus-lasso-helper v4";
+const HELPER_VERSION: &str = "argus-lasso-helper v5";
 
 /// The three privileged operations, and the file each one lives in.
 const OP_PARK: &str = "cpu-park";
@@ -52,7 +52,7 @@ fn helper_path(op: &str) -> String {
 }
 
 const PARK_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v4 — CPU parking. Managed by argus-lasso; do not edit.
+# argus-lasso-helper v5 — CPU parking. Managed by argus-lasso; do not edit.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 case "${1-}" in
@@ -83,7 +83,7 @@ esac
 "#;
 
 const POWER_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v4 — CPU governor and energy preference.
+# argus-lasso-helper v5 — CPU governor and energy preference.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 case "${1-}" in
@@ -119,7 +119,7 @@ esac
 /// re-check and the renice call; Linux has no pidfd-based setpriority to
 /// close it entirely.
 const RENICE_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v4 — renice, restricted to the caller's own processes.
+# argus-lasso-helper v5 — renice, restricted to the caller's own processes.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 [[ "${1-}" =~ ^-?[0-9]+$ ]] || exit 2
@@ -149,6 +149,13 @@ if [ "$actual_start" != "$want_start" ]; then
     exit 1
 fi
 renice -n "$nice_val" -p "$pid" >/dev/null
+# Nice is per thread on Linux: `renice -p` moves only the thread whose TID is
+# given. The main thread above decides success; the rest are best effort,
+# since a thread may exit between the listing and its renice.
+for task in "/proc/$pid/task/"*; do
+    tid=${task##*/}
+    [ "$tid" = "$pid" ] || renice -n "$nice_val" -p "$tid" >/dev/null 2>&1 || true
+done
 "#;
 
 /// Three separate actions so an administrator can tighten one without losing

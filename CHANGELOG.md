@@ -45,6 +45,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Helper installation no longer trusts the user-writable staging directory: root
   installs only copies matching SHA-256 digests in its own command, so a file
   swapped while the polkit prompt is open is refused instead of installed.
+- Nice and I/O priority now reach every thread of a process, as affinity already
+  did. Rules, ProBalance and the Gaming Mode boost previously changed only the
+  main thread. The renice helper is updated (v5) and asks to be reinstalled.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
