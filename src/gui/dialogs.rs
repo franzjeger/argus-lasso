@@ -1540,7 +1540,9 @@ impl SteamGamePickerDialog {
 
 fn scan_steam_library() -> Vec<(String, String)> {
     use std::path::PathBuf;
-    let home = std::env::var("HOME").unwrap_or_default();
+    let Some(home) = crate::config::home_dir() else {
+        return Vec::new();
+    };
     let roots = vec![
         PathBuf::from(&home).join(".steam/steam"),
         PathBuf::from(&home).join(".local/share/Steam"),
@@ -1741,8 +1743,10 @@ impl LutrisGamePickerDialog {
 }
 
 fn scan_lutris_library() -> (Vec<(String, String)>, String) {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let db = format!("{home}/.local/share/lutris/pga.db");
+    let Some(home) = crate::config::home_dir() else {
+        return (vec![], "Home directory unknown.".into());
+    };
+    let db = format!("{}/.local/share/lutris/pga.db", home.display());
     if !std::path::Path::new(&db).exists() {
         return (vec![], "Lutris database not found.".into());
     }

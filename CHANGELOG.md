@@ -71,6 +71,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Updates remove the staged apps and layer directories nothing refers to any more,
   keeping only the live layer and what one-step rollback restores. Previously
   every update, including a rejected one, left its files behind permanently.
+- Without `$HOME`, the configuration no longer falls back to the shared `/tmp`,
+  where another user could create it first; the home directory comes from the
+  password database instead. Autostart and library scans no longer treat an
+  empty `$HOME` as the current directory. The single-instance lock never uses
+  the shared temp directory, and a lock that cannot be created is reported as
+  such rather than as "already running".
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

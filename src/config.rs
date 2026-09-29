@@ -281,11 +281,19 @@ impl Default for Config {
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
+/// The user's home: $HOME, else the password database.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::home_dir().filter(|home| home.is_absolute())
+}
+
 pub fn config_dir() -> PathBuf {
-    let base = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"));
-    base.join(".config").join("argus-lasso")
+    // Never a shared directory such as /tmp, where another user could create
+    // this path first and plant or read the configuration — or stage the root
+    // helpers. Without any home, loading and saving fail visibly instead.
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"))
+        .join(".config")
+        .join("argus-lasso")
 }
 
 pub fn config_path() -> PathBuf {

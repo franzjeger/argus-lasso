@@ -693,9 +693,9 @@ fn set_epp(epp: &str) -> Result<(), String> {
 
 fn check_autostart_enabled() -> bool {
     // Check XDG autostart first (works on GNOME and KDE).
-    let home = std::env::var("HOME").unwrap_or_default();
-    let xdg = format!("{home}/.config/autostart/argus-lasso.desktop");
-    if std::path::Path::new(&xdg).exists() {
+    if crate::config::home_dir()
+        .is_some_and(|home| home.join(".config/autostart/argus-lasso.desktop").exists())
+    {
         return true;
     }
     // Fall back to systemd user service check.
@@ -707,8 +707,16 @@ fn check_autostart_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Without a home, an empty $HOME would turn every path below into one
+/// relative to wherever the app happened to be started.
+fn home_or_err() -> std::io::Result<String> {
+    crate::config::home_dir()
+        .map(|home| home.to_string_lossy().into_owned())
+        .ok_or_else(|| std::io::Error::other("home directory unknown"))
+}
+
 fn write_autostart() -> std::io::Result<String> {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_or_err()?;
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("argus-lasso"));
 
     // ── XDG autostart (works on GNOME, KDE, XFCE, and most other DEs) ────────
@@ -753,7 +761,7 @@ fn write_autostart() -> std::io::Result<String> {
 }
 
 fn disable_autostart() -> std::io::Result<String> {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = home_or_err()?;
 
     // Remove XDG autostart entry (best-effort: it may not exist).
     let xdg = format!("{home}/.config/autostart/argus-lasso.desktop");

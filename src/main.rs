@@ -189,20 +189,32 @@ struct Args {
 /// app menu. Without a guard, two instances each hold their own copy of the
 /// config and race to write `config.toml`, so one instance silently reverts
 /// the other's changes (e.g. a deleted rule reappears). The returned lock is
-/// held for the process lifetime; `None` means another instance already owns it.
-fn acquire_single_instance_lock() -> Option<nix::fcntl::Flock<std::fs::File>> {
-    use nix::fcntl::{Flock, FlockArg};
-    let path = std::env::var_os("XDG_RUNTIME_DIR")
+/// held for the process lifetime; `Ok(None)` means another instance owns it.
+fn acquire_single_instance_lock() -> std::io::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+    // Both candidates are private to this user. A fixed name in the shared
+    // temp directory could be created first by another user, and every
+    // start would then report "already running".
+    let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("argus-lasso.lock");
+        .unwrap_or_else(config::config_dir);
+    lock_instance_in(&dir)
+}
+
+fn lock_instance_in(
+    dir: &std::path::Path,
+) -> std::io::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+    use nix::fcntl::{Flock, FlockArg};
+    std::fs::create_dir_all(dir)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(path)
-        .ok()?;
-    Flock::lock(file, FlockArg::LockExclusiveNonblock).ok()
+        .open(dir.join("argus-lasso.lock"))?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(Some(lock)),
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
+        Err((_, errno)) => Err(errno.into()),
+    }
 }
 
 fn main() {
@@ -222,9 +234,16 @@ fn main() {
                 return;
             }
             Cmd::RollbackUpdate => {
-                let Some(_lock) = acquire_single_instance_lock() else {
-                    eprintln!("Close Argus before rollback.");
-                    std::process::exit(1);
+                let _lock = match acquire_single_instance_lock() {
+                    Ok(Some(lock)) => lock,
+                    Ok(None) => {
+                        eprintln!("Close Argus before rollback.");
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("Cannot confirm Argus is closed ({e}); rollback cancelled.");
+                        std::process::exit(1);
+                    }
                 };
                 match updater::rollback_update() {
                     Ok(true) => {
@@ -348,10 +367,19 @@ fn main() {
         None
     } else {
         match acquire_single_instance_lock() {
-            Some(lock) => Some(lock),
-            None => {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
                 eprintln!("Argus-Lasso is already running; exiting this instance.");
                 return;
+            }
+            // Not being able to create the lock is not evidence of another
+            // instance; say what is unprotected and carry on.
+            Err(e) => {
+                eprintln!(
+                    "Warning: no single-instance lock ({e}); a second instance \
+                     could overwrite this one's settings."
+                );
+                None
             }
         }
     };
@@ -494,5 +522,31 @@ fn main() {
     // image mid-restore.
     if !monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2)) {
         log::warn!("daemon thread did not finish within 2s of exit; it may be stuck mid-restore");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lock_instance_in;
+
+    #[test]
+    fn a_second_lock_reports_another_instance() {
+        let dir = std::env::temp_dir().join(format!("argus-lock-{}", uuid::Uuid::new_v4()));
+        let first = lock_instance_in(&dir).unwrap();
+        assert!(first.is_some());
+        assert!(lock_instance_in(&dir).unwrap().is_none());
+        drop(first);
+        assert!(lock_instance_in(&dir).unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Failing to create the lock is not evidence of another instance, and
+    /// must not be reported as one.
+    #[test]
+    fn an_unusable_directory_is_an_error_not_another_instance() {
+        let file = std::env::temp_dir().join(format!("argus-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&file, b"").unwrap();
+        assert!(lock_instance_in(&file.join("sub")).is_err());
+        std::fs::remove_file(file).unwrap();
     }
 }
