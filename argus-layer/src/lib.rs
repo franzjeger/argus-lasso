@@ -152,10 +152,9 @@ struct TelemetryState {
 }
 impl TelemetryState {
     fn status(&self) -> &'static str {
-        if !self.connected || self.frame.is_none() {
-            return "Telemetri frakoblet";
-        }
-        let frame = self.frame.as_ref().unwrap();
+        let Some(frame) = self.frame.as_ref().filter(|_| self.connected) else {
+            return "Telemetry disconnected";
+        };
         let max_age = (frame.sample_interval_ms * 3).max(6000);
         let wall_age = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -166,7 +165,7 @@ impl TelemetryState {
             .is_none_or(|t| t.elapsed().as_millis() as u64 > max_age)
             || wall_age.saturating_sub(frame.sample_unix_ms) > max_age
         {
-            "Data foreldet"
+            "Telemetry stale"
         } else {
             ""
         }

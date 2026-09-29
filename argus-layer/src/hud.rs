@@ -753,7 +753,7 @@ mod tests {
     fn zero_background_and_text_alpha_are_independent() {
         let mut r = Rasterizer::default();
         let mut c = OverlayConfig::default();
-        let img = r.rasterize(None, "Telemetri frakoblet", &c, &FrameStats::default());
+        let img = r.rasterize(None, "Telemetry disconnected", &c, &FrameStats::default());
         assert_eq!(img.pixels[0], 0);
         assert!(img.pixels.iter().any(|p| p >> 24 > 0));
         c.text_color.3 = 0;

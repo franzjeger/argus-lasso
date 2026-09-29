@@ -98,6 +98,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
   the installer keeps across updates for local customizations; it enables it.
   Program paths with spaces or special characters are quoted correctly in the
   autostart entry and the unit.
+- The HUD's connection states read "Telemetry disconnected" and "Telemetry stale"
+  like the rest of the English interface, instead of Norwegian.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
