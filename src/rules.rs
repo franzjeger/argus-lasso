@@ -1,12 +1,12 @@
 //! Rule dataclass and RuleEngine for matching and applying per-process rules.
 //!
 //! Mirrors Python rules.py exactly:
-//!   - match_type: "contains" (case-insensitive), "exact", "regex"
+//!   - match_type: contains (case-insensitive), exact, regex
 //!   - apply_to_process applies ALL matching rules (not first-match-stop)
 
 use regex::Regex;
 
-use crate::config::RuleConfig;
+use crate::config::{MatchType, RuleConfig};
 use crate::utils;
 
 /// Pure explanation of requested policy; never performs a syscall.
@@ -52,14 +52,13 @@ pub struct Rule {
     pub rule_id: String,
     pub name: String,
     pub pattern: String,
-    /// "contains" | "exact" | "regex"
-    pub match_type: String,
+    pub match_type: MatchType,
     pub affinity: Option<String>,
     pub nice: Option<i32>,
     pub ionice_class: Option<i32>,
     pub ionice_level: Option<i32>,
     pub enabled: bool,
-    /// Compiled regex, populated lazily if match_type == "regex"
+    /// Compiled regex, populated lazily for MatchType::Regex
     cached_regex: Option<Result<Regex, String>>,
     /// The `pattern` that `cached_regex` was compiled from. Lets
     /// `refresh_pattern_caches` skip re-compiling when the pattern is unchanged — the
@@ -72,7 +71,7 @@ pub struct Rule {
 
 impl Rule {
     pub fn from_config(c: &RuleConfig) -> Self {
-        let cached_regex = if c.match_type == "regex" {
+        let cached_regex = if c.match_type == MatchType::Regex {
             Some(Regex::new(&c.pattern).map_err(|e| e.to_string()))
         } else {
             None
@@ -81,7 +80,7 @@ impl Rule {
             rule_id: c.rule_id.clone(),
             name: c.name.clone(),
             pattern: c.pattern.clone(),
-            match_type: c.match_type.clone(),
+            match_type: c.match_type,
             affinity: c.affinity.clone(),
             nice: c.nice,
             ionice_class: c.ionice_class,
@@ -98,7 +97,7 @@ impl Rule {
             rule_id: self.rule_id.clone(),
             name: self.name.clone(),
             pattern: self.pattern.clone(),
-            match_type: self.match_type.clone(),
+            match_type: self.match_type,
             affinity: self.affinity.clone(),
             nice: self.nice,
             ionice_class: self.ionice_class,
@@ -112,7 +111,7 @@ impl Rule {
             rule_id: uuid::Uuid::new_v4().to_string(),
             name: String::new(),
             pattern: String::new(),
-            match_type: "contains".into(),
+            match_type: MatchType::Contains,
             affinity: None,
             nice: None,
             ionice_class: None,
@@ -129,9 +128,9 @@ impl Rule {
         if !self.enabled || self.pattern.is_empty() {
             return false;
         }
-        match self.match_type.as_str() {
-            "exact" => proc_name == self.pattern,
-            "regex" => match &self.cached_regex {
+        match self.match_type {
+            MatchType::Exact => proc_name == self.pattern,
+            MatchType::Regex => match &self.cached_regex {
                 Some(Ok(re)) => re.is_match(proc_name),
                 // A pattern that failed to compile stays cached as the
                 // failure (from_config / refresh_pattern_caches) — retrying
@@ -145,10 +144,7 @@ impl Rule {
                     .map(|re| re.is_match(proc_name))
                     .unwrap_or(false),
             },
-            _ => {
-                // "contains" — case-insensitive substring
-                proc_name_lower.contains(&self.pattern_lower)
-            }
+            MatchType::Contains => proc_name_lower.contains(&self.pattern_lower),
         }
     }
 
@@ -165,7 +161,7 @@ impl Rule {
             self.pattern_lower = self.pattern.to_lowercase();
         }
 
-        if self.match_type != "regex" {
+        if self.match_type != MatchType::Regex {
             if self.cached_regex.is_some() {
                 self.cached_regex = None;
                 self.regex_pattern = String::new();
@@ -326,20 +322,20 @@ pub fn apply_rules(
         if let Some(nice) = rule.nice {
             let fail_key = (rule.rule_id.clone(), pid);
             if current_nice != Some(nice) && !nice_failed.contains(&fail_key) {
-                if utils::set_nice(pid, nice) {
-                    current_nice = Some(nice);
+                if let Err(e) = utils::set_nice(pid, nice) {
+                    // Don't retry every tick: a permission failure would spawn
+                    // a renice subprocess and a log line every 500 ms forever.
+                    nice_failed.insert(fail_key);
                     let msg = format!(
-                        "[Rule:{}] Set nice={} on {}({})",
+                        "[Rule:{}] nice={} FAILED for {}({}): {e} — giving up for this process",
                         rule.name, nice, proc_name, pid
                     );
                     log(msg.clone());
                     actions.push(msg);
                 } else {
-                    // Don't retry every tick: a permission failure would spawn
-                    // a renice subprocess and a log line every 500 ms forever.
-                    nice_failed.insert(fail_key);
+                    current_nice = Some(nice);
                     let msg = format!(
-                        "[Rule:{}] nice={} FAILED (root needed?) for {}({}) — giving up for this process",
+                        "[Rule:{}] Set nice={} on {}({})",
                         rule.name, nice, proc_name, pid
                     );
                     log(msg.clone());
@@ -352,7 +348,7 @@ pub fn apply_rules(
         if let Some(class) = rule.ionice_class {
             let target_level = rule.ionice_level.unwrap_or(0);
             if current_ionice != Some((class, target_level))
-                && utils::set_ionice(pid, class, rule.ionice_level)
+                && utils::set_ionice(pid, class, rule.ionice_level).is_ok()
             {
                 current_ionice = Some((class, target_level));
                 let msg = format!(
@@ -380,7 +376,7 @@ mod tests {
     fn preview_reports_field_precedence_and_ignores_disabled_rules() {
         let mut first = Rule::new_empty();
         first.pattern = "game".into();
-        first.match_type = "exact".into();
+        first.match_type = MatchType::Exact;
         first.enabled = true;
         first.affinity = Some("0-3".into());
         first.nice = Some(5);
@@ -399,17 +395,17 @@ mod tests {
         assert!(preview_effect(&rules, "other").matches.is_empty());
     }
 
-    fn rule_with(pattern: &str, match_type: &str) -> Rule {
+    fn rule_with(pattern: &str, match_type: MatchType) -> Rule {
         let mut r = Rule::new_empty();
         r.pattern = pattern.into();
-        r.match_type = match_type.into();
+        r.match_type = match_type;
         r.refresh_pattern_caches();
         r
     }
 
     #[test]
     fn match_contains_is_case_insensitive() {
-        let r = rule_with("Chrome", "contains");
+        let r = rule_with("Chrome", MatchType::Contains);
         assert!(r.matches("google-chrome", &"google-chrome".to_lowercase()));
         assert!(r.matches("CHROME.exe", &"CHROME.exe".to_lowercase()));
         assert!(r.matches(
@@ -421,7 +417,7 @@ mod tests {
 
     #[test]
     fn match_exact_is_case_sensitive_and_full_string() {
-        let r = rule_with("steam", "exact");
+        let r = rule_with("steam", MatchType::Exact);
         assert!(r.matches("steam", &"steam".to_lowercase()));
         assert!(!r.matches("Steam", &"Steam".to_lowercase()));
         assert!(!r.matches("steamwebhelper", &"steamwebhelper".to_lowercase()));
@@ -430,7 +426,7 @@ mod tests {
 
     #[test]
     fn match_regex_anchored_or_not() {
-        let r = rule_with(r"^node(\.exe)?$", "regex");
+        let r = rule_with(r"^node(\.exe)?$", MatchType::Regex);
         assert!(r.matches("node", &"node".to_lowercase()));
         assert!(r.matches("node.exe", &"node.exe".to_lowercase()));
         assert!(!r.matches("nodejs", &"nodejs".to_lowercase()));
@@ -440,26 +436,26 @@ mod tests {
     #[test]
     fn match_regex_invalid_pattern_returns_false() {
         // Invalid regex should fail safe (no match) rather than panic.
-        let r = rule_with("[unclosed", "regex");
+        let r = rule_with("[unclosed", MatchType::Regex);
         assert!(!r.matches("anything", &"anything".to_lowercase()));
     }
 
     #[test]
     fn empty_pattern_never_matches() {
-        let r = rule_with("", "contains");
+        let r = rule_with("", MatchType::Contains);
         assert!(!r.matches("anything", &"anything".to_lowercase()));
     }
 
     #[test]
     fn disabled_rule_never_matches() {
-        let mut r = rule_with("chrome", "contains");
+        let mut r = rule_with("chrome", MatchType::Contains);
         r.enabled = false;
         assert!(!r.matches("chrome", &"chrome".to_lowercase()));
     }
 
     #[test]
     fn refresh_pattern_caches_recompiles_on_pattern_change() {
-        let mut r = rule_with("foo", "regex");
+        let mut r = rule_with("foo", MatchType::Regex);
         assert!(r.matches("foo", &"foo".to_lowercase()));
         r.pattern = "bar".into();
         r.refresh_pattern_caches();
@@ -471,7 +467,7 @@ mod tests {
     fn refresh_pattern_caches_keeps_cache_when_pattern_unchanged() {
         // The rule dialog calls this every frame; it must be a no-op (and keep
         // matching) when the pattern hasn't changed.
-        let mut r = rule_with("foo", "regex");
+        let mut r = rule_with("foo", MatchType::Regex);
         assert!(r.matches("foo", &"foo".to_lowercase()));
         r.refresh_pattern_caches();
         r.refresh_pattern_caches();
@@ -481,13 +477,13 @@ mod tests {
 
     #[test]
     fn refresh_pattern_caches_clears_cache_when_leaving_regex() {
-        let mut r = rule_with("foo", "regex");
+        let mut r = rule_with("foo", MatchType::Regex);
         assert!(r.cached_regex.is_some());
-        r.match_type = "contains".into();
+        r.match_type = MatchType::Contains;
         r.refresh_pattern_caches();
         assert!(r.cached_regex.is_none());
         // And back to regex recompiles from the current pattern.
-        r.match_type = "regex".into();
+        r.match_type = MatchType::Regex;
         r.refresh_pattern_caches();
         assert!(r.cached_regex.is_some());
         assert!(r.matches("foo", &"foo".to_lowercase()));
@@ -501,7 +497,7 @@ mod tests {
             rule_id: "1".into(),
             name: "test".into(),
             pattern: "chrome".into(),
-            match_type: "contains".into(),
+            match_type: MatchType::Contains,
             affinity: None,
             nice: None,
             ionice_class: None,
@@ -520,7 +516,7 @@ mod tests {
             rule_id: "abc-123".into(),
             name: "Browser".into(),
             pattern: "chrome".into(),
-            match_type: "contains".into(),
+            match_type: MatchType::Contains,
             affinity: Some("0-3".into()),
             nice: Some(5),
             ionice_class: Some(2),
@@ -545,7 +541,7 @@ mod tests {
             rule_id: "id".into(),
             name: "Game".into(),
             pattern: r"^game\.exe$".into(),
-            match_type: "regex".into(),
+            match_type: MatchType::Regex,
             affinity: Some("0,2,4".into()),
             nice: Some(-5),
             ionice_class: None,
@@ -591,10 +587,10 @@ mod tests {
         let starting = utils::get_nice(pid).unwrap_or(0);
         let target = starting + 1;
 
-        let mut rule1 = rule_with("apply-rules-staleness-test", "contains");
+        let mut rule1 = rule_with("apply-rules-staleness-test", MatchType::Contains);
         rule1.rule_id = "r1".into();
         rule1.nice = Some(target);
-        let mut rule2 = rule_with("apply-rules-staleness-test", "contains");
+        let mut rule2 = rule_with("apply-rules-staleness-test", MatchType::Contains);
         rule2.rule_id = "r2".into();
         rule2.nice = Some(target);
 

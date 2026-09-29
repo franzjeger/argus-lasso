@@ -7,10 +7,17 @@ pub struct ProcessHandle(OwnedFd);
 impl ProcessHandle {
     /// Open first, then validate against the displayed snapshot. A recycled PID
     /// cannot redirect subsequent signals because they use the descriptor.
+    /// Refuses this process: stopping or killing ourselves is never intended.
     pub fn open(pid: u32, start_ticks: u64) -> Result<Self, Errno> {
         if pid == std::process::id() {
             return Err(Errno::EPERM);
         }
+        Self::track(pid, start_ticks)
+    }
+    /// As `open`, but also for this process: for holding an identity while a
+    /// priority or affinity change is prepared, which is harmless to apply to
+    /// ourselves.
+    pub fn track(pid: u32, start_ticks: u64) -> Result<Self, Errno> {
         if pid == 0 || pid > i32::MAX as u32 {
             return Err(Errno::EINVAL);
         }
@@ -27,6 +34,18 @@ impl ProcessHandle {
             return Err(Errno::ESRCH);
         }
         Ok(handle)
+    }
+    /// True once the process has exited, reaped or not. A pidfd polls
+    /// readable from that moment, so this never blocks.
+    pub fn has_exited(&self) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd that lives across the call; a zero timeout
+        // returns immediately.
+        unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
     }
     pub fn signal(&self, signal: Signal) -> Result<(), Errno> {
         // SAFETY: the descriptor remains owned; null siginfo requests a standard signal.
@@ -77,8 +96,10 @@ mod tests {
             Err(Errno::ESRCH)
         ));
         let handle = ProcessHandle::open(pid, ticks).unwrap();
+        assert!(!handle.has_exited());
         handle.signal(Signal::SIGTERM).unwrap();
         child.wait().unwrap();
+        assert!(handle.has_exited());
         assert_eq!(handle.signal(Signal::SIGKILL), Err(Errno::ESRCH));
     }
 }

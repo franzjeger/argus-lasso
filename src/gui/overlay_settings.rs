@@ -51,8 +51,11 @@ fn color_picker(
 pub fn show(ui: &mut Ui, config: &mut OverlayConfig, open: &mut bool, _cpu_count: u32) -> bool {
     let mut changed = false;
     ui.horizontal(|ui| {
+        // A checkbox like "Automatically show…" below it: a toggle_value
+        // renders as borderless text while off, with nothing to show it can
+        // be clicked.
         if ui
-            .toggle_value(&mut config.show_overlay, "Enable in-game overlay")
+            .checkbox(&mut config.show_overlay, "Enable in-game overlay")
             .changed()
         {
             changed = true;

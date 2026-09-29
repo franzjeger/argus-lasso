@@ -379,12 +379,14 @@ impl ProcessTab {
         // Filter row + view toggles
         ui.horizontal_wrapped(|ui| {
             ui.label("🔍");
+            // The hint must fit the field; the rest goes in the tooltip.
             ui.add(
                 egui::TextEdit::singleline(&mut self.filter)
                     .id(filter_id)
-                    .hint_text("name / PID / cmdline — press /")
+                    .hint_text("Name, PID or command")
                     .desired_width(240.0),
-            );
+            )
+            .on_hover_text("Filters by name, PID or command line. Press / to jump here.");
             if !self.filter.is_empty() && ui.small_button("✕").clicked() {
                 self.filter.clear();
             }

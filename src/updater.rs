@@ -450,7 +450,7 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(bytes);

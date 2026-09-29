@@ -132,56 +132,93 @@ pub struct HwMonitorData {
     pub groups: Vec<SensorGroup>,
 }
 
+/// Sensor labels the HUD reads. Labels this module assigns are defined once
+/// here and used by both the collectors and the getters below, so renaming
+/// one cannot silently blank a HUD value. The rest are the kernel drivers'
+/// own labels, as their hwmon `*_label` files spell them.
+pub mod label {
+    // Assigned by collect_nvidia_nvml and amdgpu_device_readings.
+    pub const TEMPERATURE: &str = "Temperature";
+    pub const GPU_LOAD: &str = "GPU Load";
+    pub const MEMORY_USAGE: &str = "Memory Usage";
+    pub const POWER_DRAW: &str = "Power Draw";
+    pub const GPU_CLOCK: &str = "GPU Clock";
+    pub const MEMORY_CLOCK: &str = "Memory Clock";
+    pub const VRAM_USED: &str = "VRAM Used";
+    pub const VRAM_TOTAL: &str = "VRAM Total";
+    pub const FAN_SPEED: &str = "Fan Speed";
+    /// Group name of the RAPL package power readings.
+    pub const RAPL_GROUP: &str = "CPU Package Power [RAPL]";
+
+    // Kernel driver labels.
+    /// k10temp's control temperature (Zen); zenpower and older k10temp use Tdie.
+    pub const K10TEMP_CONTROL: &str = "Tctl";
+    pub const K10TEMP_DIE: &str = "Tdie";
+    /// coretemp's package sensor (Intel).
+    pub const CORETEMP_PACKAGE: &str = "Package id 0";
+    /// amdgpu's GPU edge temperature, and its shader and memory clocks.
+    pub const AMDGPU_EDGE: &str = "edge";
+    pub const AMDGPU_SCLK: &str = "sclk";
+    pub const AMDGPU_MCLK: &str = "mclk";
+}
+
+impl SensorGroup {
+    /// The current value of the first sensor with one of `labels`.
+    fn reading(&self, labels: &[&str]) -> Option<&Sensor> {
+        labels.iter().find_map(|&wanted| {
+            self.sensors
+                .iter()
+                .find(|s| s.label == wanted && s.value.is_finite())
+        })
+    }
+}
+
 impl HwMonitorData {
+    /// The GPU the HUD reports: the one with the most video memory — the
+    /// discrete card when an integrated one is present too — or the first
+    /// when none reports it. Every GPU value comes from this one group, so
+    /// readings from two GPUs are never mixed.
+    fn primary_gpu(&self) -> Option<&SensorGroup> {
+        let vram = |g: &SensorGroup| g.reading(&[label::VRAM_TOTAL]).map_or(0.0, |s| s.value);
+        self.groups.iter().filter(|g| g.category == "GPU").fold(
+            None,
+            |best: Option<&SensorGroup>, g| match best {
+                Some(b) if vram(b) >= vram(g) => Some(b),
+                _ => Some(g),
+            },
+        )
+    }
+
+    fn gpu_reading(&self, labels: &[&str]) -> Option<f32> {
+        Some(self.primary_gpu()?.reading(labels)?.value)
+    }
+
     pub fn get_gpu_usage(&self) -> Option<u8> {
-        for group in &self.groups {
-            if group.category == "GPU" {
-                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
-                    if sensor.label == "Usage" || sensor.label == "GPU Load" {
-                        return Some(sensor.value as u8);
-                    }
-                }
-            }
-        }
-        None
+        self.gpu_reading(&[label::GPU_LOAD]).map(|v| v as u8)
     }
 
     pub fn get_gpu_temp(&self) -> Option<u8> {
-        for group in &self.groups {
-            if group.category == "GPU" {
-                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
-                    if sensor.label == "Temperature"
-                        || sensor.label == "Core Temp"
-                        || sensor.label == "Temp"
-                    {
-                        return Some(sensor.value as u8);
-                    }
-                }
-            }
-        }
-        None
+        self.gpu_reading(&[label::TEMPERATURE, label::AMDGPU_EDGE])
+            .map(|v| v as u8)
     }
 
     pub fn get_cpu_temp(&self) -> Option<u8> {
-        for group in &self.groups {
-            if group.category == "CPU" {
-                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
-                    if sensor.label == "Temperature"
-                        || sensor.label == "Package Temp"
-                        || sensor.label == "Tctl"
-                        || sensor.label == "Tdie"
-                    {
-                        return Some(sensor.value as u8);
-                    }
-                }
-            }
-        }
-        None
+        self.groups
+            .iter()
+            .filter(|g| g.category == "CPU")
+            .find_map(|g| {
+                g.reading(&[
+                    label::K10TEMP_CONTROL,
+                    label::K10TEMP_DIE,
+                    label::CORETEMP_PACKAGE,
+                ])
+            })
+            .map(|s| s.value as u8)
     }
 
     pub fn get_cpu_power(&self) -> Option<f32> {
         for group in &self.groups {
-            if group.category == "CPU" && group.name == "CPU Package Power [RAPL]" {
+            if group.category == "CPU" && group.name == label::RAPL_GROUP {
                 for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
                     if sensor.label.contains("Package")
                         || sensor.label.contains("CPU")
@@ -196,55 +233,27 @@ impl HwMonitorData {
     }
 
     pub fn get_gpu_power(&self) -> Option<f32> {
-        for group in &self.groups {
-            if group.category == "GPU" {
-                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
-                    if sensor.label.contains("Power") || sensor.unit == "W" {
-                        return Some(sensor.value);
-                    }
-                }
-            }
-        }
-        None
+        // NVML's Power Draw, or amdgpu's PPT / average power: any watts.
+        self.primary_gpu()?
+            .sensors
+            .iter()
+            .find(|s| s.value.is_finite() && s.unit == "W")
+            .map(|s| s.value)
     }
 
     pub fn get_gpu_core_clock(&self) -> Option<u32> {
-        for group in &self.groups {
-            if group.category == "GPU" {
-                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
-                    if sensor.label == "GPU Clock" {
-                        return Some(sensor.value as u32);
-                    }
-                }
-            }
-        }
-        None
+        self.gpu_reading(&[label::GPU_CLOCK, label::AMDGPU_SCLK])
+            .map(|v| v as u32)
     }
 
     pub fn get_gpu_mem_clock(&self) -> Option<u32> {
-        for group in &self.groups {
-            if group.category == "GPU" {
-                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
-                    if sensor.label == "Memory Clock" {
-                        return Some(sensor.value as u32);
-                    }
-                }
-            }
-        }
-        None
+        self.gpu_reading(&[label::MEMORY_CLOCK, label::AMDGPU_MCLK])
+            .map(|v| v as u32)
     }
 
     pub fn get_gpu_fan_speed(&self) -> Option<u8> {
-        for group in &self.groups {
-            if group.category == "GPU" {
-                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
-                    if sensor.label == "Fan Speed" {
-                        return Some(sensor.value as u8);
-                    }
-                }
-            }
-        }
-        None
+        // A percentage; amdgpu reports its fan in RPM, which does not fit.
+        self.gpu_reading(&[label::FAN_SPEED]).map(|v| v as u8)
     }
 
     pub fn get_cpu_freq(&self) -> Option<u32> {
@@ -256,47 +265,17 @@ impl HwMonitorData {
     }
 
     pub fn get_gpu_name(&self) -> String {
-        for group in &self.groups {
-            if group.category == "GPU" {
-                return group.name.clone();
-            }
-        }
-        "Unknown GPU".to_string()
+        self.primary_gpu()
+            .map_or_else(|| "Unknown GPU".to_string(), |g| g.name.clone())
     }
 
+    /// Both collectors report VRAM in GiB.
     pub fn get_vram_usage_gb(&self) -> Option<f32> {
-        for group in &self.groups {
-            if group.category == "GPU" {
-                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
-                    if sensor.label.contains("VRAM Used") || sensor.label.contains("Memory Used") {
-                        if sensor.unit == "MiB" {
-                            return Some(sensor.value / 1024.0);
-                        } else if sensor.unit == "GiB" {
-                            return Some(sensor.value);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        self.gpu_reading(&[label::VRAM_USED])
     }
 
     pub fn get_vram_total_gb(&self) -> Option<f32> {
-        for group in &self.groups {
-            if group.category == "GPU" {
-                for sensor in group.sensors.iter().filter(|s| s.value.is_finite()) {
-                    if sensor.label.contains("VRAM Total") || sensor.label.contains("Memory Total")
-                    {
-                        if sensor.unit == "MiB" {
-                            return Some(sensor.value / 1024.0);
-                        } else if sensor.unit == "GiB" {
-                            return Some(sensor.value);
-                        }
-                    }
-                }
-            }
-        }
-        None
+        self.gpu_reading(&[label::VRAM_TOTAL])
     }
 }
 
@@ -610,6 +589,10 @@ where
             }
         }
 
+        if hw_name == "amdgpu" {
+            sensors.extend(amdgpu_device_readings(&path.join("device")));
+        }
+
         if !sensors.is_empty() {
             let (cat, name) = namer(&path, &hw_name);
             groups.push((cat, name, sensors));
@@ -617,6 +600,23 @@ where
     }
 
     groups
+}
+
+/// Load and video memory of an amdgpu device, which its hwmon directory does
+/// not carry: they live in the PCI device directory, `dev`.
+fn amdgpu_device_readings(dev: &Path) -> Vec<Reading> {
+    const GIB: f32 = 1024.0 * 1024.0 * 1024.0;
+    let mut out = Vec::new();
+    if let Some(busy) = read_u64(&dev.join("gpu_busy_percent")) {
+        out.push((label::GPU_LOAD, "%", busy as f32));
+    }
+    if let Some(used) = read_u64(&dev.join("mem_info_vram_used")) {
+        out.push((label::VRAM_USED, "GiB", used as f32 / GIB));
+    }
+    if let Some(total) = read_u64(&dev.join("mem_info_vram_total")) {
+        out.push((label::VRAM_TOTAL, "GiB", total as f32 / GIB));
+    }
+    out
 }
 
 // ── NVIDIA GPU via NVML ──────────────────────────────────────────────────────
@@ -744,15 +744,15 @@ fn collect_nvidia_nvml() -> Vec<GroupReading> {
         let fan_speed = dev.fan_speed(0).map(|v| v as f32).unwrap_or(f32::NAN);
 
         let sensors: Vec<Reading> = vec![
-            ("Temperature", "°C", temp),
-            ("GPU Load", "%", g_util),
-            ("Memory Usage", "%", m_util),
-            ("Power Draw", "W", power),
-            ("GPU Clock", "MHz", g_clk),
-            ("Memory Clock", "MHz", m_clk),
-            ("VRAM Used", "GiB", m_used),
-            ("VRAM Total", "GiB", m_total),
-            ("Fan Speed", "%", fan_speed),
+            (label::TEMPERATURE, "°C", temp),
+            (label::GPU_LOAD, "%", g_util),
+            (label::MEMORY_USAGE, "%", m_util),
+            (label::POWER_DRAW, "W", power),
+            (label::GPU_CLOCK, "MHz", g_clk),
+            (label::MEMORY_CLOCK, "MHz", m_clk),
+            (label::VRAM_USED, "GiB", m_used),
+            (label::VRAM_TOTAL, "GiB", m_total),
+            (label::FAN_SPEED, "%", fan_speed),
         ];
 
         groups.push(("GPU", intern(&gpu_name).to_string(), sensors));
@@ -808,7 +808,7 @@ fn collect_rapl_power(extended: Option<&crate::sensor_data::ExtendedSensors>) ->
     if let Some(watts) = extended.and_then(|s| s.cpu_power_w) {
         return vec![(
             "CPU",
-            "CPU Package Power [RAPL]".into(),
+            label::RAPL_GROUP.into(),
             vec![("Package total", "W", watts)],
         )];
     }
@@ -892,7 +892,7 @@ fn collect_rapl_power(extended: Option<&crate::sensor_data::ExtendedSensors>) ->
     if sensors.is_empty() {
         return Vec::new();
     }
-    vec![("CPU", "CPU Package Power [RAPL]".into(), sensors)]
+    vec![("CPU", label::RAPL_GROUP.into(), sensors)]
 }
 
 fn pretty_rapl_label(raw: &str) -> String {
@@ -971,26 +971,16 @@ fn collect_load_avg() -> Option<GroupReading> {
 // ── /proc/meminfo ─────────────────────────────────────────────────────────────
 
 fn collect_meminfo() -> Option<GroupReading> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let mut map: HashMap<&str, u64> = HashMap::new();
-    for line in text.lines() {
-        let mut p = line.split_whitespace();
-        if let (Some(k), Some(v)) = (p.next(), p.next()) {
-            if let Ok(n) = v.parse::<u64>() {
-                map.insert(k.trim_end_matches(':'), n);
-            }
-        }
-    }
+    let m = crate::utils::read_meminfo()?;
+    let gib = |kib: u64| kib as f32 / (1024.0 * 1024.0);
 
-    let gib = |k: &str| map.get(k).copied().unwrap_or(0) as f32 / (1024.0 * 1024.0);
-
-    let total = gib("MemTotal");
-    let available = gib("MemAvailable");
-    let used = total - available;
-    let buffers = gib("Buffers");
-    let cached = gib("Cached");
-    let swap_total = gib("SwapTotal");
-    let swap_used = swap_total - gib("SwapFree");
+    let total = gib(m.total);
+    let available = gib(m.available);
+    let used = gib(m.used());
+    let buffers = gib(m.buffers);
+    let cached = gib(m.cached);
+    let swap_total = gib(m.swap_total);
+    let swap_used = gib(m.swap_total.saturating_sub(m.swap_free));
 
     let mut sensors: Vec<Reading> = vec![
         ("Total", "GiB", total),
@@ -1262,6 +1252,115 @@ fn build_core_id_to_cpu_map() -> HashMap<u32, u32> {
 
 #[cfg(test)]
 mod tests {
+
+    fn group(
+        category: &'static str,
+        name: &str,
+        readings: &[(&'static str, &'static str, f32)],
+    ) -> SensorGroup {
+        SensorGroup {
+            category,
+            name: name.into(),
+            sensors: readings
+                .iter()
+                .map(|&(label, unit, value)| {
+                    let mut s = Sensor::new(label, unit);
+                    s.push(value);
+                    s
+                })
+                .collect(),
+        }
+    }
+
+    /// amdgpu names its readings edge/junction/sclk/mclk; the HUD looked
+    /// for other words and showed nothing for AMD graphics cards.
+    #[test]
+    fn hud_readings_come_from_real_amdgpu_labels() {
+        let data = HwMonitorData {
+            groups: vec![group(
+                "GPU",
+                "amdgpu GPU",
+                &[
+                    ("edge", "°C", 61.0),
+                    ("junction", "°C", 75.0),
+                    ("sclk", "MHz", 2500.0),
+                    ("mclk", "MHz", 1250.0),
+                    ("PPT", "W", 210.0),
+                    (label::GPU_LOAD, "%", 97.0),
+                    (label::VRAM_USED, "GiB", 9.5),
+                    (label::VRAM_TOTAL, "GiB", 16.0),
+                ],
+            )],
+        };
+        assert_eq!(data.get_gpu_temp(), Some(61));
+        assert_eq!(data.get_gpu_core_clock(), Some(2500));
+        assert_eq!(data.get_gpu_mem_clock(), Some(1250));
+        assert_eq!(data.get_gpu_power(), Some(210.0));
+        assert_eq!(data.get_gpu_usage(), Some(97));
+        assert_eq!(data.get_vram_usage_gb(), Some(9.5));
+    }
+
+    /// With an integrated GPU listed first, every value must still come
+    /// from the discrete card, never a mix of the two.
+    #[test]
+    fn hud_reads_one_gpu_the_one_with_most_video_memory() {
+        let data = HwMonitorData {
+            groups: vec![
+                group(
+                    "GPU",
+                    "amdgpu GPU",
+                    &[("edge", "°C", 45.0), (label::VRAM_TOTAL, "GiB", 0.5)],
+                ),
+                group(
+                    "GPU",
+                    "NVIDIA GeForce RTX 5090",
+                    &[
+                        (label::TEMPERATURE, "°C", 70.0),
+                        (label::GPU_LOAD, "%", 99.0),
+                        (label::VRAM_TOTAL, "GiB", 32.0),
+                    ],
+                ),
+            ],
+        };
+        assert_eq!(data.get_gpu_name(), "NVIDIA GeForce RTX 5090");
+        assert_eq!(data.get_gpu_temp(), Some(70));
+        assert_eq!(data.get_gpu_usage(), Some(99));
+    }
+
+    /// coretemp calls its package sensor "Package id 0"; the HUD looked for
+    /// "Package Temp" and showed no CPU temperature on Intel.
+    #[test]
+    fn hud_cpu_temperature_from_intel_and_amd_labels() {
+        for (driver_label, value) in [("Package id 0", 58.0), ("Tctl", 66.0), ("Tdie", 64.0)] {
+            let data = HwMonitorData {
+                groups: vec![group(
+                    "CPU",
+                    "CPU",
+                    &[("CPU 0", "°C", 40.0), (driver_label, "°C", value)],
+                )],
+            };
+            assert_eq!(data.get_cpu_temp(), Some(value as u8), "{driver_label}");
+        }
+    }
+
+    #[test]
+    fn amdgpu_load_and_video_memory_are_read_from_the_device() {
+        let dev = std::env::temp_dir().join(format!("argus-amdgpu-{}", std::process::id()));
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("gpu_busy_percent"), "42\n").unwrap();
+        std::fs::write(dev.join("mem_info_vram_used"), (3u64 << 30).to_string()).unwrap();
+        std::fs::write(dev.join("mem_info_vram_total"), (16u64 << 30).to_string()).unwrap();
+        assert_eq!(
+            amdgpu_device_readings(&dev),
+            vec![
+                (label::GPU_LOAD, "%", 42.0),
+                (label::VRAM_USED, "GiB", 3.0),
+                (label::VRAM_TOTAL, "GiB", 16.0),
+            ]
+        );
+        std::fs::remove_dir_all(&dev).ok();
+    }
+
     use super::*;
 
     #[test]
@@ -1301,7 +1400,7 @@ mod tests {
                 collect_rapl_power(Some(&extended)),
                 vec![(
                     "CPU",
-                    "CPU Package Power [RAPL]".into(),
+                    label::RAPL_GROUP.into(),
                     vec![("Package total", "W", watts)],
                 )]
             );

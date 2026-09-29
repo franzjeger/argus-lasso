@@ -4,7 +4,7 @@
 //! DEFAULT_CONFIG via a deep-merge at the serde level (Option defaults).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -215,14 +215,39 @@ pub struct GamingModeConfig {
 
 // ── Rule (stored inline in config) ───────────────────────────────────────────
 
+/// How a rule's pattern is compared with a process name. Stored as the same
+/// lowercase words the field always held; anything else is now a parse error
+/// instead of silently meaning "contains".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchType {
+    /// Case-insensitive substring.
+    #[default]
+    Contains,
+    /// The whole name, case-sensitive.
+    Exact,
+    Regex,
+}
+
+impl MatchType {
+    pub const ALL: [MatchType; 3] = [MatchType::Contains, MatchType::Exact, MatchType::Regex];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MatchType::Contains => "contains",
+            MatchType::Exact => "exact",
+            MatchType::Regex => "regex",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RuleConfig {
     pub rule_id: String,
     pub name: String,
     pub pattern: String,
-    /// "contains" | "exact" | "regex"
-    pub match_type: String,
+    pub match_type: MatchType,
     pub affinity: Option<String>,
     pub nice: Option<i32>,
     pub ionice_class: Option<i32>,
@@ -236,7 +261,7 @@ impl Default for RuleConfig {
             rule_id: uuid::Uuid::new_v4().to_string(),
             name: String::new(),
             pattern: String::new(),
-            match_type: "contains".into(),
+            match_type: MatchType::Contains,
             affinity: None,
             nice: None,
             ionice_class: None,
@@ -281,11 +306,19 @@ impl Default for Config {
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
+/// The user's home: $HOME, else the password database.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::home_dir().filter(|home| home.is_absolute())
+}
+
 pub fn config_dir() -> PathBuf {
-    let base = std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"));
-    base.join(".config").join("argus-lasso")
+    // Never a shared directory such as /tmp, where another user could create
+    // this path first and plant or read the configuration — or stage the root
+    // helpers. Without any home, loading and saving fail visibly instead.
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("/nonexistent"))
+        .join(".config")
+        .join("argus-lasso")
 }
 
 pub fn config_path() -> PathBuf {
@@ -320,27 +353,57 @@ fn migrate_old_config() {
 }
 
 /// Load config from disk, filling missing keys with defaults via serde.
-pub fn load() -> Config {
+///
+/// A file that exists but cannot be read or parsed yields the defaults and
+/// the error. The caller must not let the next save replace that file before
+/// `preserve_unreadable` has moved it aside: saving the defaults over it
+/// would silently delete every rule and profile it held.
+pub fn load() -> (Config, Option<String>) {
     migrate_old_config();
-    let path = config_path();
-    if path.exists() {
-        match fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str::<Config>(&text) {
-                Ok(mut cfg) => {
-                    cfg.probalance.normalize();
-                    log::info!("Loaded config from {}", path.display());
-                    return cfg;
-                }
-                Err(e) => {
-                    log::warn!("Config parse error (using defaults): {e}");
-                }
-            },
-            Err(e) => {
-                log::warn!("Config read error (using defaults): {e}");
-            }
-        }
+    load_from(&config_path())
+}
+
+fn load_from(path: &Path) -> (Config, Option<String>) {
+    if !path.exists() {
+        return (Config::default(), None);
     }
-    Config::default()
+    let error = match fs::read_to_string(path) {
+        Ok(text) => match toml::from_str::<Config>(&text) {
+            Ok(mut cfg) => {
+                cfg.probalance.normalize();
+                log::info!("Loaded config from {}", path.display());
+                return (cfg, None);
+            }
+            Err(e) => format!("could not be parsed: {e}"),
+        },
+        Err(e) => format!("could not be read: {e}"),
+    };
+    log::warn!("Config {} {error} — using defaults", path.display());
+    (Config::default(), Some(error))
+}
+
+/// Move an unreadable config file aside, so that saving the defaults cannot
+/// overwrite it. Returns a message for the user naming where it went.
+pub fn preserve_unreadable(error: &str) -> String {
+    preserve_unreadable_at(&config_path(), error)
+}
+
+fn preserve_unreadable_at(path: &Path, error: &str) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let kept = path.with_extension(format!("toml.unreadable-{stamp}"));
+    match fs::rename(path, &kept) {
+        Ok(()) => format!(
+            "Settings {error}. Defaults are in use; the previous file was kept as {}.",
+            kept.display()
+        ),
+        Err(e) => format!(
+            "Settings {error}, and could not be set aside ({e}). Defaults are in use; \
+             changing a setting will overwrite {}.",
+            path.display()
+        ),
+    }
 }
 
 /// Atomically save config to disk (write to .tmp, then rename).
@@ -386,6 +449,65 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Res
 
 #[cfg(test)]
 mod tests {
+    /// The words older versions wrote still parse, and are written back
+    /// unchanged, so rolling back to an older version keeps its rules.
+    #[test]
+    fn match_types_keep_their_stored_words() {
+        for (word, kind) in [
+            ("contains", MatchType::Contains),
+            ("exact", MatchType::Exact),
+            ("regex", MatchType::Regex),
+        ] {
+            let text = format!("pattern = \"game\"\nmatch_type = \"{word}\"\n");
+            let rule: RuleConfig = toml::from_str(&text).unwrap();
+            assert_eq!(rule.match_type, kind);
+            assert!(toml::to_string(&rule)
+                .unwrap()
+                .contains(&format!("match_type = \"{word}\"")));
+        }
+    }
+
+    /// An unknown match type used to fall through to "contains" without a
+    /// word; a rule meant as a regex then matched as a substring.
+    #[test]
+    fn an_unknown_match_type_is_an_error() {
+        let err = toml::from_str::<RuleConfig>("match_type = \"regx\"\n").unwrap_err();
+        assert!(err.to_string().contains("regx"), "{err}");
+    }
+
+    /// One unparseable value used to mean defaults in memory and, on the
+    /// next save, every rule and profile gone from disk.
+    #[test]
+    fn an_unreadable_config_is_reported_and_set_aside() {
+        let dir = std::env::temp_dir().join(format!("argus-config-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let broken = "[[rules]]\nname = \"game\"\nenabled = \"sometimes\"\n";
+        fs::write(&path, broken).unwrap();
+
+        let (cfg, error) = load_from(&path);
+        assert!(cfg.rules.is_empty());
+        let error = error.expect("a parse error must be reported");
+
+        let notice = preserve_unreadable_at(&path, &error);
+        assert!(
+            !path.exists(),
+            "the next save must not find it to overwrite"
+        );
+        let kept: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read_to_string(kept[0].path()).unwrap(), broken);
+        assert!(notice.contains(&kept[0].path().display().to_string()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_config_is_not_an_error() {
+        let path =
+            std::env::temp_dir().join(format!("argus-missing-{}.toml", uuid::Uuid::new_v4()));
+        assert!(load_from(&path).1.is_none());
+    }
+
     use super::*;
 
     #[test]
@@ -427,7 +549,7 @@ mod tests {
         cfg.rules = vec![RuleConfig {
             name: "Steam → V-Cache".into(),
             pattern: "steam".into(),
-            match_type: "contains".into(),
+            match_type: MatchType::Contains,
             affinity: Some("0-7".into()),
             nice: Some(-5),
             ..Default::default()

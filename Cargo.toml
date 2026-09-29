@@ -104,6 +104,4 @@ codegen-units = 1
 strip         = true
 
 [workspace]
-members = ["argus-ipc",
-    "argus-layer"
-, "test_nvml"]
+members = ["argus-ipc", "argus-layer"]

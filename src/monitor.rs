@@ -24,19 +24,37 @@ use crate::utils;
 
 // ── Commands from GUI → daemon ────────────────────────────────────────────────
 
+/// CPU parking requested along with Gaming Mode activation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Parking {
+    /// Leave CPUs as they are (e.g. adopting CPUs already parked at start).
+    Keep,
+    /// Park the topology's non-preferred CPUs.
+    NonPreferred,
+    /// Park exactly these CPUs, bringing any others back online.
+    Exactly(HashSet<u32>),
+}
+
 #[derive(Debug)]
 pub enum DaemonCmd {
-    UpdateConfig(Box<Config>),
+    /// `AppState::config` changed. It is the one authoritative copy: writers
+    /// change it under the lock and send this, and this thread re-reads it
+    /// instead of trusting a copy that may already be stale.
+    ConfigChanged,
     /// Persist the latest shared configuration on the monitor thread.
     SaveConfig,
     GameLaunched {
         pid: u32,
         profile: String,
     },
+    /// Gaming Mode is owned here: every requester (the Gaming tab, the tray)
+    /// asks, and this thread parks, restores and publishes the outcome.
     SetGamingMode {
         active: bool,
         elevate_nice: bool,
-        park: bool,
+        /// What to park on activation. Deactivation always brings every CPU
+        /// back online.
+        parking: Parking,
     },
     SetManualOverride {
         pid: u32,
@@ -125,6 +143,10 @@ pub struct AppState {
     pub quit_requested: bool,
     /// Is Gaming Mode currently active?
     pub gaming_active: bool,
+    /// Incremented each time a Gaming Mode request or automatic change has
+    /// been handled, whatever its outcome, so a requester can tell "done"
+    /// from "still pending".
+    pub gaming_changes: u64,
     /// Hardware sensor data (updated every display_refresh_interval)
     pub hw_monitor: HwMonitorData,
     /// System-wide average CPU % (used by tray tooltip)
@@ -168,16 +190,23 @@ fn persist_config_with(
     }
 }
 
+/// The CPU model named in /proc/cpuinfo, read once: it cannot change while
+/// we run, and the file is tens of kilobytes on a many-core machine.
 pub fn read_cpu_model() -> String {
-    std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split_once(':').map(|x| x.1))
-                .map(|s| s.trim().to_string())
+    static MODEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODEL
+        .get_or_init(|| {
+            std::fs::read_to_string("/proc/cpuinfo")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("model name"))
+                        .and_then(|l| l.split_once(':').map(|x| x.1))
+                        .map(|s| s.trim().to_string())
+                })
+                .unwrap_or_else(|| "Unknown CPU".to_string())
         })
-        .unwrap_or_else(|| "Unknown CPU".to_string())
+        .clone()
 }
 
 impl AppState {
@@ -449,19 +478,6 @@ pub fn join_daemon(handle: std::thread::JoinHandle<()>, timeout: Duration) -> bo
     rx.recv_timeout(timeout).is_ok()
 }
 
-fn get_cpu_name() -> String {
-    if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
-        for line in content.lines() {
-            if line.starts_with("model name") {
-                if let Some(name) = line.split(':').nth(1) {
-                    return name.trim().to_string();
-                }
-            }
-        }
-    }
-    "Unknown CPU".to_string()
-}
-
 fn get_ram_speed_mts() -> Option<u32> {
     use std::sync::OnceLock;
     static RAM_SPEED: OnceLock<Option<u32>> = OnceLock::new();
@@ -537,28 +553,12 @@ fn logical_cpus(usages: &[f32]) -> Vec<argus_ipc::LogicalCpu> {
     cpus
 }
 
+/// (used, total) RAM in GiB.
 fn get_ram_info() -> (f32, f32) {
-    let mut mem_total = 0.0;
-    let mut mem_available = 0.0;
-    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
-        for line in content.lines() {
-            if line.starts_with("MemTotal:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 1 {
-                    mem_total = parts[1].parse::<f32>().unwrap_or(0.0) / (1024.0 * 1024.0);
-                    // GiB
-                }
-            } else if line.starts_with("MemAvailable:") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 1 {
-                    mem_available = parts[1].parse::<f32>().unwrap_or(0.0) / (1024.0 * 1024.0);
-                    // GiB
-                }
-            }
-        }
-    }
-    let mem_used = mem_total - mem_available;
-    (mem_used.max(0.0), mem_total)
+    const GIB_IN_KIB: f32 = 1024.0 * 1024.0;
+    utils::read_meminfo().map_or((0.0, 0.0), |m| {
+        (m.used() as f32 / GIB_IN_KIB, m.total as f32 / GIB_IN_KIB)
+    })
 }
 
 fn run_loop(
@@ -659,9 +659,9 @@ fn run_loop(
             ));
             // Merge just the field this toggle actually changed into shared
             // state, not the whole Config: `config` here is this loop's own
-            // mirror, refreshed only by DaemonCmd::UpdateConfig, so it can't
+            // mirror, refreshed only by DaemonCmd::ConfigChanged, so it can't
             // see GUI-only fields (column widths, rules, opacity/theme) the
-            // GUI thread writes directly into s.config between UpdateConfig
+            // GUI thread writes directly into s.config between ConfigChanged
             // calls. Overwriting the whole struct raced those writes and
             // could silently discard them — including, in the rules case, a
             // user's just-edited rule definitions on the next config save.
@@ -689,8 +689,10 @@ fn run_loop(
                         });
                     }
                 }
-                DaemonCmd::UpdateConfig(cfg) => {
-                    let cfg = state.lock().map(|s| s.config.clone()).unwrap_or(*cfg);
+                DaemonCmd::ConfigChanged => {
+                    let Ok(cfg) = state.lock().map(|s| s.config.clone()) else {
+                        continue;
+                    };
                     probalance.update_config(cfg.probalance.clone());
                     config = cfg.clone();
                     ipc.broadcast(&argus_ipc::IpcMessage::Config(
@@ -713,8 +715,11 @@ fn run_loop(
                 DaemonCmd::SetGamingMode {
                     active,
                     elevate_nice,
-                    park,
+                    parking,
                 } => {
+                    // A requested activation whose parking fails stays off
+                    // rather than half-applied.
+                    let active = apply_gaming_parking(active, &parking, &log_cb) && active;
                     gaming_mode = active;
                     gaming_elevate_nice = elevate_nice;
                     // A manual toggle takes ownership: the auto-detector must
@@ -724,34 +729,7 @@ fn run_loop(
                     if !active && !gaming_niced.is_empty() {
                         restore_gaming_nices(&mut gaming_niced, &log_cb);
                     }
-                    if let Ok(mut s) = state.lock() {
-                        s.gaming_active = active;
-                    }
-                    if park {
-                        if active {
-                            let topo = cpu_park::detect_topology();
-                            if topo.has_asymmetry() && cpu_park::is_helper_installed() {
-                                let to_park: HashSet<u32> =
-                                    topo.non_preferred.iter().copied().collect();
-                                log_cb(format!("[Gaming Mode] Parking CPUs {:?}…", {
-                                    let mut v: Vec<_> = to_park.iter().copied().collect();
-                                    v.sort_unstable();
-                                    v
-                                }));
-                                if cpu_park::park_cpus(&to_park, &log_cb) {
-                                    log_cb(
-                                        "[Gaming Mode] ACTIVE — non-preferred CPUs offline.".into(),
-                                    );
-                                } else {
-                                    log_cb("[Gaming Mode] Parking failed — check log.".into());
-                                }
-                            }
-                        } else {
-                            log_cb("[Gaming Mode] Unparking all CPUs…".into());
-                            cpu_park::unpark_all(&log_cb);
-                            log_cb("[Gaming Mode] Disabled — all CPUs online.".into());
-                        }
-                    }
+                    publish_gaming_state(&state, active);
                 }
                 DaemonCmd::SetManualOverride { pid, duration_secs } => {
                     manual_overrides
@@ -893,12 +871,12 @@ fn run_loop(
                             "[Gaming Mode] Auto-enabled — game detected: {} ({})",
                             game.name, game.pid
                         ));
-                        if let Ok(mut s) = state.lock() {
-                            s.gaming_active = true;
-                        }
+                        // Detection turns Gaming Mode on even if parking fails:
+                        // the priority boost still applies.
                         if config.gaming_mode.auto_park {
-                            park_non_preferred(&log_cb);
+                            apply_gaming_parking(true, &Parking::NonPreferred, &log_cb);
                         }
+                        publish_gaming_state(&state, true);
                     }
                 } else if auto_gaming && gaming_mode {
                     // Require a couple of game-free snapshots before restoring,
@@ -912,12 +890,10 @@ fn run_loop(
                         if !gaming_niced.is_empty() {
                             restore_gaming_nices(&mut gaming_niced, &log_cb);
                         }
-                        if let Ok(mut s) = state.lock() {
-                            s.gaming_active = false;
-                        }
                         if config.gaming_mode.auto_park {
-                            cpu_park::unpark_all(&log_cb);
+                            apply_gaming_parking(false, &Parking::Keep, &log_cb);
                         }
+                        publish_gaming_state(&state, false);
                     }
                 }
             }
@@ -962,6 +938,7 @@ fn run_loop(
                 .iter()
                 .map(|p| ProcSnapshot {
                     pid: p.pid,
+                    start_ticks: p.start_ticks,
                     name: p.name.to_string(),
                     cpu_percent: p.cpu_percent,
                     nice: p.nice,
@@ -1047,7 +1024,7 @@ fn run_loop(
                 .and_then(|s| s.cpu_power_w)
                 .or_else(|| hw_collector.data.get_cpu_power());
             let gpu_name = hw_collector.data.get_gpu_name();
-            let cpu_name = get_cpu_name();
+            let cpu_name = read_cpu_model();
             let (ram_used, ram_total) = get_ram_info();
             let vram_used = hw_collector.data.get_vram_usage_gb();
             let vram_total = hw_collector.data.get_vram_total_gb();
@@ -1115,6 +1092,7 @@ fn run_loop(
                 .iter()
                 .map(|p| crate::probalance::ProcSnapshot {
                     pid: p.pid,
+                    start_ticks: p.start_ticks,
                     name: p.name.to_string(),
                     cpu_percent: p.cpu_percent,
                     nice: p.nice,
@@ -1262,17 +1240,51 @@ fn protected_processes(
     protected
 }
 
-/// Park the non-preferred CPUs (used by both manual SetGamingMode and
-/// auto-detection). No-op without an asymmetric topology or the helper.
-fn park_non_preferred(log_cb: &impl Fn(String)) {
-    let topo = cpu_park::detect_topology();
-    if topo.has_asymmetry() && cpu_park::is_helper_installed() {
-        let to_park: HashSet<u32> = topo.non_preferred.iter().copied().collect();
-        if cpu_park::park_cpus(&to_park, log_cb) {
-            log_cb("[Gaming Mode] Non-preferred CPUs parked.".into());
-        } else {
-            log_cb("[Gaming Mode] Parking failed — check log.".into());
+/// Bring CPU parking in line with Gaming Mode: activation parks what
+/// `parking` asks for, deactivation brings every CPU back online. The only
+/// place Gaming Mode parks or unparks, and it runs on this thread, never the
+/// GUI's.
+///
+/// Returns false when activation's parking failed. Every CPU is then brought
+/// back online, so nothing is left half-parked.
+fn apply_gaming_parking(active: bool, parking: &Parking, log_cb: &impl Fn(String)) -> bool {
+    if !active {
+        if !utils::get_offline_cpus().is_empty() {
+            log_cb("[Gaming Mode] Unparking all CPUs…".into());
+            cpu_park::unpark_all(log_cb);
         }
+        log_cb("[Gaming Mode] Disabled — all CPUs online.".into());
+        return true;
+    }
+    let target: HashSet<u32> = match parking {
+        Parking::Keep => return true,
+        Parking::NonPreferred => {
+            let topo = cpu_park::detect_topology();
+            if !topo.has_asymmetry() {
+                return true;
+            }
+            topo.non_preferred.iter().copied().collect()
+        }
+        Parking::Exactly(cpus) => cpus.clone(),
+    };
+    if !cpu_park::is_helper_installed() {
+        log_cb("[Gaming Mode] CPU control is not set up — no CPUs parked.".into());
+        return true;
+    }
+    if cpu_park::set_parked_cpus(&target, log_cb) {
+        log_cb("[Gaming Mode] ACTIVE — selected CPUs parked.".into());
+        true
+    } else {
+        log_cb("[Gaming Mode] Parking failed — all CPUs brought back online.".into());
+        cpu_park::unpark_all(log_cb);
+        false
+    }
+}
+
+fn publish_gaming_state(state: &Arc<Mutex<AppState>>, active: bool) {
+    if let Ok(mut s) = state.lock() {
+        s.gaming_active = active;
+        s.gaming_changes += 1;
     }
 }
 

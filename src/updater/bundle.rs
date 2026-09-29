@@ -175,6 +175,101 @@ fn install_pair(
     let _guard = crate::gui::overlay_install::MANIFEST_LOCK
         .lock()
         .map_err(|_| "Overlay update lock failed")?;
+    let result = install_pair_locked(target, manifest_path, layers, app, layer, metadata, verify);
+    prune_stale_updates(target, manifest_path, layers);
+    result
+}
+
+/// Remove update directories nothing refers to any more.
+///
+/// Each install leaves a transaction directory next to the app (holding the
+/// previous app for rollback) and a layer directory. The next install
+/// replaces the only rollback record, and a failed one never records its
+/// directories at all, so without this every update left files behind for
+/// good. Kept: the live manifest's layer, and the app and layer the rollback
+/// record would restore. Anything that cannot be read with certainty is kept.
+fn prune_stale_updates(target: &Path, manifest_path: &Path, layers: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(journal) = journal_path(target) else {
+        return;
+    };
+    let record: Option<Rollback> = match read_optional(&journal) {
+        Ok(None) => None,
+        Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
+            Ok(record) => Some(record),
+            Err(_) => return,
+        },
+        Err(_) => return,
+    };
+    let manifest = match read_optional(manifest_path) {
+        Ok(manifest) => manifest,
+        Err(_) => return,
+    };
+    let layer_dir_of = |manifest: &[u8]| -> Option<PathBuf> {
+        let value: serde_json::Value = serde_json::from_slice(manifest).ok()?;
+        Some(
+            Path::new(value["layer"]["library_path"].as_str()?)
+                .parent()?
+                .into(),
+        )
+    };
+    if manifest.is_some() && manifest.as_deref().and_then(layer_dir_of).is_none() {
+        return;
+    }
+    // Compared by inode, not by spelling: a symlinked HOME must not make a
+    // live directory look unreferenced.
+    let keep: Vec<(u64, u64)> = [
+        manifest.as_deref().and_then(layer_dir_of),
+        record
+            .as_ref()
+            .and_then(|r| r.binary.parent().map(Path::to_path_buf)),
+        record
+            .as_ref()
+            .and_then(|r| r.manifest.as_deref())
+            .and_then(layer_dir_of),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|dir| std::fs::metadata(dir).ok())
+    .map(|m| (m.dev(), m.ino()))
+    .collect();
+    let prune = |dir: &Path, prefix: &str| {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let ours = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(prefix));
+            // file_type() does not follow symlinks: only real directories.
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if ours && is_dir && !keep.contains(&(meta.dev(), meta.ino())) {
+                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                    log::warn!("Could not remove stale {}: {e}", entry.path().display());
+                }
+            }
+        }
+    };
+    if let Some(bin_dir) = target.parent() {
+        prune(bin_dir, ".argus-update-");
+    }
+    prune(layers, "update-");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_pair_locked(
+    target: &Path,
+    manifest_path: &Path,
+    layers: &Path,
+    app: &[u8],
+    layer: &[u8],
+    metadata: &Metadata,
+    verify: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
     // Finish recovery before replacing the only rollback record.
     rollback(target, true)?;
     let transaction = target
@@ -303,6 +398,58 @@ mod tests {
         assert_eq!(std::fs::read(&manifest).unwrap(), old);
         std::fs::remove_dir_all(root).unwrap();
     }
+    fn entries_with_prefix(dir: &Path, prefix: &str) -> usize {
+        std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Each install replaces the only rollback record. What it no longer
+    /// references must go, or every update leaves an app and a layer behind.
+    #[test]
+    fn repeated_updates_keep_only_what_rollback_needs() {
+        let root = std::env::temp_dir().join(format!("argus-pair-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let app = root.join("app");
+        let manifest = root.join("manifest.json");
+        let layers = root.join("layers");
+        std::fs::write(&app, b"app 0").unwrap();
+        for n in 1..=3 {
+            let (new_app, new_layer) = (format!("app {n}"), format!("layer {n}"));
+            let mut meta = metadata();
+            meta.app_sha256 = sha256_hex(new_app.as_bytes());
+            meta.layer_sha256 = sha256_hex(new_layer.as_bytes());
+            install_pair(
+                &app,
+                &manifest,
+                &layers,
+                new_app.as_bytes(),
+                new_layer.as_bytes(),
+                &meta,
+                |_| Ok(()),
+            )
+            .unwrap();
+        }
+        // The previous app for rollback, and the live plus previous layer.
+        assert_eq!(entries_with_prefix(&root, ".argus-update-"), 1);
+        assert_eq!(entries_with_prefix(&layers, "update-"), 2);
+
+        assert!(rollback(&app, false).unwrap());
+        assert_eq!(std::fs::read(&app).unwrap(), b"app 2");
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read(value["layer"]["library_path"].as_str().unwrap()).unwrap(),
+            b"layer 2",
+            "the layer rollback restores must survive pruning"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn failed_verification_leaves_live_files_untouched() {
         let root = std::env::temp_dir().join(format!("argus-pair-{}", uuid::Uuid::new_v4()));
@@ -322,6 +469,11 @@ mod tests {
         .is_err());
         assert_eq!(std::fs::read(&app).unwrap(), b"old app");
         assert!(!manifest.exists());
+        assert_eq!(
+            entries_with_prefix(&root, ".argus-update-"),
+            0,
+            "a rejected update must not leave its staged app behind"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

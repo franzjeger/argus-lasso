@@ -42,6 +42,71 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- Helper installation no longer trusts the user-writable staging directory: root
+  installs only copies matching SHA-256 digests in its own command, so a file
+  swapped while the polkit prompt is open is refused instead of installed.
+- Nice and I/O priority now reach every thread of a process, as affinity already
+  did. Rules, ProBalance and the Gaming Mode boost previously changed only the
+  main thread. The renice helper is updated (v5) and asks to be reinstalled.
+- The launcher tracks the game through a pidfd, so "Force quit game" cannot signal
+  a process that reused the game's PID. An unreadable process name no longer
+  matches every game name.
+- The Vulkan layer passes the game's call through whenever its own bookkeeping is
+  missing, presents the frame unchanged when the HUD submission fails, and never
+  presents twice after a panic. Loader negotiation no longer reads NULL outputs as
+  function pointers. Swapchain teardown waits only for the layer's own GPU work
+  instead of `vkDeviceWaitIdle`, outside the shared lock. New
+  `vkDestroyDevice`/`vkDestroyInstance` hooks drop state for recycled handles,
+  and the library stays mapped while its threads run.
+- Manual nice and I/O priority changes from the process table are protected from
+  rule enforcement and ProBalance for 30 seconds, as affinity changes already
+  were, instead of being undone on the next pass. The dialogs hold the process
+  by pidfd and refuse to apply a change once it has exited.
+- The launcher only accepts a game process started after its own launch, and
+  never shells or launch wrappers (sh, reaper, pressure-vessel, Wine, Proton):
+  a long-running `sh` no longer matches "Shadow of the Tomb Raider".
+- HUD setup that fails part-way (for example out of video memory on a resize)
+  frees what it created instead of leaking it on every attempt. A game that has
+  run out of threads gets a blank HUD instead of a panic.
+- Updates remove the staged apps and layer directories nothing refers to any more,
+  keeping only the live layer and what one-step rollback restores. Previously
+  every update, including a rejected one, left its files behind permanently.
+- Without `$HOME`, the configuration no longer falls back to the shared `/tmp`,
+  where another user could create it first; the home directory comes from the
+  password database instead. Autostart and library scans no longer treat an
+  empty `$HOME` as the current directory. The single-instance lock never uses
+  the shared temp directory, and a lock that cannot be created is reported as
+  such rather than as "already running".
+- Affinity, nice and I/O priority reach threads that a single `/proc` thread
+  listing skips while a program starts or ends other threads.
+- Recording files are read only if they are regular files, opened without
+  blocking: a FIFO left in their place by a game no longer hangs the recordings
+  list for good. The recording control file is read with a size cap.
+- Gaming Mode has one owner, the background service: the Gaming page and the tray
+  ask it, and the page shows its state. Enabling from the tray no longer leaves
+  the page reporting "off" while CPUs are parked, parking no longer freezes the
+  window, and it takes one authorization instead of one per CPU. Activation whose
+  parking fails brings every CPU back online and stays off.
+- A settings file that cannot be read no longer loses everything on the next save.
+  Defaults were used and the next change wrote them over the file, deleting every
+  rule and profile. The file is now kept as `config.toml.unreadable-<time>` and
+  the reason is shown.
+- ProBalance tracks processes by PID and start time: a new process that reuses a
+  throttled process's PID no longer inherits its entry, or gets its priority
+  "restored" to the old process's value.
+- Settings → Startup no longer overwrites an existing `argus-lasso.service`, which
+  the installer keeps across updates for local customizations; it enables it.
+  Program paths with spaces or special characters are quoted correctly in the
+  autostart entry and the unit.
+- The HUD's connection states read "Telemetry disconnected" and "Telemetry stale"
+  like the rest of the English interface, instead of Norwegian.
+- Failed priority and affinity changes report the system's reason (for example
+  "Operation not permitted") in the notification, the rule log and the CLI,
+  instead of guessing "needs root?".
+- The HUD shows CPU temperature on Intel (coretemp's "Package id 0"), and AMD
+  graphics temperature, clocks, load and video memory, which it looked up under
+  labels those drivers never use. With an integrated and a discrete GPU, every
+  GPU value comes from the card with the most video memory instead of a mix.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
@@ -97,6 +162,14 @@ current source, release and verification status, see [docs/status.md](docs/statu
   without changing exemptions or priority settings.
 
 ### Changed
+
+- "Enable in-game overlay" is a checkbox like the setting below it; while off it
+  used to look like plain text. The process filter's hint fits its field, with
+  the details in its tooltip.
+
+- A rule's match type is a closed set (contains, exact, regex) stored as the same
+  words as before. An unknown value is reported instead of silently matching as
+  "contains"; an imported rule file with one names it in the error.
 
 - Documentation reconciled with current source: release/source distinction,
   updater signing and restart behavior, cgroup defaults/restoration limits,

@@ -6,21 +6,50 @@ use std::collections::{HashMap, HashSet};
 use crate::config::{Config, GamingProfile};
 use crate::cpu_park::{
     self, detect_topology, get_smt_siblings_of, is_helper_authorized, is_helper_current,
-    is_helper_installed, park_cpus, unpark_all, CpuTopology,
+    is_helper_installed, CpuTopology,
 };
+use crate::monitor::Parking;
 use crate::utils::{get_offline_cpus, get_online_cpus};
 
 // ── Events emitted from this tab ──────────────────────────────────────────────
 
 pub enum GamingEvent {
-    GamingModeChanged { active: bool, elevate_nice: bool },
+    GamingModeChanged {
+        active: bool,
+        elevate_nice: bool,
+        parking: Parking,
+    },
     ResetAll,
-    GameLaunched { pid: u32, profile: String },
+    GameLaunched {
+        pid: u32,
+        profile: String,
+    },
     LogMessage(String),
     ConfigChanged(Box<Config>),
 }
 
 // ── Launcher watch phase ──────────────────────────────────────────────────────
+
+/// The game process the launcher is watching, held through a pidfd: a PID
+/// recycled after the game exits can never be mistaken for it, or be sent
+/// its "Force quit".
+pub(crate) struct LaunchedGame {
+    pub pid: u32,
+    handle: crate::process_control::ProcessHandle,
+}
+
+impl LaunchedGame {
+    /// None if the process is already gone, or started before `not_before`
+    /// (process start ticks): a game is never older than its own launch.
+    fn open(pid: u32, not_before: u64) -> Option<Self> {
+        let start = crate::fast_proc::read_stat(pid, &mut [0; 1024])?.starttime;
+        if start < not_before {
+            return None;
+        }
+        let handle = crate::process_control::ProcessHandle::open(pid, start).ok()?;
+        Some(Self { pid, handle })
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum WatchPhase {
@@ -47,8 +76,12 @@ pub struct GamingModeTab {
     pub config: Config,
     pub topo: Option<CpuTopology>,
     pub topo_description: String,
+    /// Mirrors the daemon, which owns Gaming Mode (see `sync_gaming_state`).
     pub parked: bool,
-    pub parking_in_progress: bool,
+    /// The state asked of the daemon, until it reports the request handled.
+    gaming_request: Option<bool>,
+    /// The daemon's change counter as last seen.
+    seen_gaming_changes: u64,
 
     // Preferred CCD checkbox grid: cpu_num → checked
     pub preferred_checks: HashMap<u32, bool>,
@@ -75,7 +108,10 @@ pub struct GamingModeTab {
     pub command: String,
     pub auto_restore: bool,
     pub watch_phase: WatchPhase,
-    pub launched_pid: Option<u32>,
+    pub(crate) launched: Option<LaunchedGame>,
+    /// Start ticks of the process the launcher spawned. The game is that
+    /// process or one started after it.
+    launch_start_ticks: u64,
     pub watch_status: String,
     launch_error: bool,
     pub last_poll: std::time::Instant,
@@ -96,8 +132,6 @@ pub struct GamingModeTab {
     steam_picker: Option<crate::gui::dialogs::SteamGamePickerDialog>,
     lutris_picker: Option<crate::gui::dialogs::LutrisGamePickerDialog>,
 
-    // Pending re-enable after unpark (profile switch)
-    pending_enable_after_unpark: bool,
     /// Expansion state of the two panels behind the footer buttons.
     overlay_settings_open: bool,
     sensor_access: crate::sensor_access::SensorAccess,
@@ -132,7 +166,8 @@ impl GamingModeTab {
             topo: Some(topo),
             topo_description,
             parked,
-            parking_in_progress: false,
+            gaming_request: None,
+            seen_gaming_changes: 0,
             preferred_checks,
             smt_siblings,
             helper_status_text: String::new(),
@@ -146,7 +181,8 @@ impl GamingModeTab {
             command: String::new(),
             auto_restore: true,
             watch_phase: WatchPhase::Idle,
-            launched_pid: None,
+            launched: None,
+            launch_start_ticks: 0,
             watch_status: String::new(),
             launch_error: false,
             last_poll: std::time::Instant::now(),
@@ -157,7 +193,6 @@ impl GamingModeTab {
             install_result_rx: None,
             steam_picker: None,
             lutris_picker: None,
-            pending_enable_after_unpark: false,
             section: GamingSection::default(),
             overlay_install_status: String::new(),
             overlay_settings_open: false,
@@ -169,11 +204,10 @@ impl GamingModeTab {
         tab.refresh_cpu_status();
         tab.refresh_power_status();
 
+        // CPUs already parked at start (e.g. after a crash) are adopted as
+        // they are.
         if parked {
-            tab.events.push(GamingEvent::GamingModeChanged {
-                active: true,
-                elevate_nice: tab.elevate_nice,
-            });
+            tab.request_gaming(true, Parking::Keep);
         }
 
         tab
@@ -226,89 +260,80 @@ impl GamingModeTab {
         }
     }
 
-    fn enable_gaming_mode(&mut self) {
-        if let Some(ref topo) = self.topo.clone() {
-            if !topo.has_asymmetry() {
-                return;
-            }
-            if !is_helper_installed() {
-                self.append_log("[Gaming Mode] Helper missing — install first.".into());
-                return;
-            }
-            let unchecked: HashSet<u32> = self
-                .preferred_checks
-                .iter()
-                .filter(|(_, &checked)| !checked)
-                .map(|(&cpu, _)| cpu)
-                .collect();
-            let to_park: HashSet<u32> = topo
-                .non_preferred
+    /// Ask the daemon, which owns Gaming Mode, for a change. It parks on its
+    /// own thread; `sync_gaming_state` picks up the outcome.
+    fn request_gaming(&mut self, active: bool, parking: Parking) {
+        self.gaming_request = Some(active);
+        self.events.push(GamingEvent::GamingModeChanged {
+            active,
+            elevate_nice: active && self.elevate_nice,
+            parking,
+        });
+    }
+
+    /// Mirror the daemon's Gaming Mode state, called every frame.
+    pub fn sync_gaming_state(&mut self, active: bool, changes: u64) {
+        if changes == self.seen_gaming_changes {
+            return;
+        }
+        self.seen_gaming_changes = changes;
+        let requested = self.gaming_request.take();
+        let was_active = std::mem::replace(&mut self.parked, active);
+        if requested == Some(true) && !active {
+            self.append_log("[Gaming Mode] Could not be enabled — see the log.".into());
+        } else if was_active != active {
+            self.append_log(format!(
+                "[Gaming Mode] {}",
+                if active { "Enabled" } else { "Disabled" }
+            ));
+        }
+        self.refresh_cpu_status();
+        if !active {
+            // Re-detect topology now all CPUs are back online
+            let topo = detect_topology();
+            self.topo_description = topo.description.clone();
+            self.rebuild_preferred_checks(&topo);
+            self.topo = Some(topo);
+        }
+    }
+
+    /// The CPUs Gaming Mode parks: the non-preferred ones plus any preferred
+    /// ones the user unchecked.
+    fn cpus_to_park(&self) -> Option<HashSet<u32>> {
+        let topo = self.topo.as_ref().filter(|t| t.has_asymmetry())?;
+        let unchecked = self
+            .preferred_checks
+            .iter()
+            .filter(|(_, &checked)| !checked)
+            .map(|(&cpu, _)| cpu);
+        Some(
+            topo.non_preferred
                 .iter()
                 .copied()
                 .chain(unchecked)
-                .collect();
-            self.append_log(format!("[Gaming Mode] Parking CPUs {:?}…", {
-                let mut v: Vec<_> = to_park.iter().copied().collect();
-                v.sort_unstable();
-                v
-            }));
-            self.parking_in_progress = true;
+                .collect(),
+        )
+    }
 
-            // Park synchronously (blocking — parking is fast, sub-second)
-            let log_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-            let ll = log_lines.clone();
-            let ok = park_cpus(&to_park, move |msg| {
-                ll.lock().unwrap().push(msg);
-            });
-            for msg in log_lines.lock().unwrap().drain(..) {
-                self.append_log(msg);
-            }
-            self.parking_in_progress = false;
-            self.parked = ok;
-            self.refresh_cpu_status();
-            if ok {
-                self.append_log("[Gaming Mode] ACTIVE — non-preferred CPUs offline.".into());
-                self.events.push(GamingEvent::GamingModeChanged {
-                    active: true,
-                    elevate_nice: self.elevate_nice,
-                });
-                self.events
-                    .push(GamingEvent::LogMessage("[Gaming Mode] enabled".into()));
-            } else {
-                self.append_log("[Gaming Mode] Parking failed — check log.".into());
-            }
+    /// Returns whether a request was sent.
+    fn enable_gaming_mode(&mut self) -> bool {
+        let Some(to_park) = self.cpus_to_park() else {
+            return false;
+        };
+        if !is_helper_installed() {
+            self.append_log("[Gaming Mode] Helper missing — install first.".into());
+            return false;
         }
+        let mut sorted: Vec<_> = to_park.iter().copied().collect();
+        sorted.sort_unstable();
+        self.append_log(format!("[Gaming Mode] Parking CPUs {sorted:?}…"));
+        self.request_gaming(true, Parking::Exactly(to_park));
+        true
     }
 
     fn disable_gaming_mode(&mut self) {
         self.append_log("[Gaming Mode] Unparking all CPUs…".into());
-        let log_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let ll = log_lines.clone();
-        let _ok = unpark_all(move |msg| {
-            ll.lock().unwrap().push(msg);
-        });
-        for msg in log_lines.lock().unwrap().drain(..) {
-            self.append_log(msg);
-        }
-        self.parked = false;
-        self.refresh_cpu_status();
-        // Re-detect topology now all CPUs are back online
-        let topo = detect_topology();
-        self.topo_description = topo.description.clone();
-        self.rebuild_preferred_checks(&topo);
-        self.topo = Some(topo);
-        self.append_log("[Gaming Mode] Disabled — all CPUs online.".into());
-        self.events.push(GamingEvent::GamingModeChanged {
-            active: false,
-            elevate_nice: false,
-        });
-        self.events
-            .push(GamingEvent::LogMessage("[Gaming Mode] disabled".into()));
-
-        if self.pending_enable_after_unpark {
-            self.pending_enable_after_unpark = false;
-            self.enable_gaming_mode();
-        }
+        self.request_gaming(false, Parking::Keep);
     }
 
     fn rebuild_preferred_checks(&mut self, topo: &CpuTopology) {
@@ -343,23 +368,23 @@ impl GamingModeTab {
         }
         self.last_poll = std::time::Instant::now();
 
-        let pids: Vec<u32> = std::fs::read_dir("/proc")
-            .ok()
-            .map(|d| {
-                d.filter_map(|e| {
-                    e.ok()
-                        .and_then(|e| e.file_name().to_str().and_then(|s| s.parse().ok()))
-                })
-                .collect()
-            })
-            .unwrap_or_default();
-
         let name = self.game_name.clone();
+        let not_before = self.launch_start_ticks;
+        // The first candidate that is still alive by the time it is opened.
+        let find_game = || -> Option<LaunchedGame> {
+            std::fs::read_dir("/proc")
+                .ok()?
+                .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+                .filter(|&pid| proc_name_matches(&name, pid))
+                .find_map(|pid| LaunchedGame::open(pid, not_before))
+        };
 
-        if self.watch_phase == WatchPhase::Waiting {
-            for &pid in &pids {
-                if proc_name_matches(&name, pid) {
-                    self.launched_pid = Some(pid);
+        match self.watch_phase {
+            WatchPhase::Idle => {}
+            WatchPhase::Waiting => {
+                if let Some(game) = find_game() {
+                    let pid = game.pid;
+                    self.launched = Some(game);
                     self.events.push(GamingEvent::GameLaunched {
                         pid,
                         profile: self.selected_profile.clone(),
@@ -367,31 +392,34 @@ impl GamingModeTab {
                     self.watch_phase = WatchPhase::Running;
                     self.watch_status = format!("Game running (PID {pid})");
                     self.append_log(format!("[Launcher] Game process found: PID {pid}"));
-                    return;
                 }
             }
-        } else if self.watch_phase == WatchPhase::Running {
-            if let Some(pid) = self.launched_pid {
-                if !pids.contains(&pid) {
-                    // Check for replacement
-                    if let Some(new_pid) =
-                        pids.iter().find(|&&p| proc_name_matches(&name, p)).copied()
-                    {
-                        self.launched_pid = Some(new_pid);
-                        self.events.push(GamingEvent::GameLaunched {
-                            pid: new_pid,
-                            profile: self.selected_profile.clone(),
-                        });
-                        self.append_log(format!("[Launcher] Game PID changed → {new_pid}"));
-                    } else {
-                        self.append_log(format!("[Launcher] Game (PID {pid}) exited."));
-                        if self.auto_restore && self.parked {
-                            self.disable_gaming_mode();
-                        }
-                        self.watch_phase = WatchPhase::Idle;
-                        self.launched_pid = None;
-                        self.watch_status = String::new();
+            WatchPhase::Running => {
+                let Some(old_pid) = self
+                    .launched
+                    .as_ref()
+                    .filter(|g| g.handle.has_exited())
+                    .map(|g| g.pid)
+                else {
+                    return;
+                };
+                // Check for replacement
+                if let Some(game) = find_game() {
+                    let pid = game.pid;
+                    self.launched = Some(game);
+                    self.events.push(GamingEvent::GameLaunched {
+                        pid,
+                        profile: self.selected_profile.clone(),
+                    });
+                    self.append_log(format!("[Launcher] Game PID changed → {pid}"));
+                } else {
+                    self.append_log(format!("[Launcher] Game (PID {old_pid}) exited."));
+                    if self.auto_restore && self.parked {
+                        self.disable_gaming_mode();
                     }
+                    self.watch_phase = WatchPhase::Idle;
+                    self.launched = None;
+                    self.watch_status = String::new();
                 }
             }
         }
@@ -504,7 +532,8 @@ impl GamingModeTab {
                             );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let enabled = has_asym && self.helper_ok && !self.parking_in_progress;
+                            let enabled =
+                                has_asym && self.helper_ok && self.gaming_request.is_none();
                             let label = if self.parked {
                                 "Disable Gaming Mode"
                             } else {
@@ -750,13 +779,14 @@ impl GamingModeTab {
                             .add_enabled(can_kill, egui::Button::new("Force quit game"))
                             .clicked()
                         {
-                            if let Some(pid) = self.launched_pid {
-                                match nix::sys::signal::kill(
-                                    nix::unistd::Pid::from_raw(pid as i32),
-                                    nix::sys::signal::Signal::SIGTERM,
-                                ) {
+                            if let Some(game) = self.launched.take() {
+                                let pid = game.pid;
+                                match game.handle.signal(nix::sys::signal::Signal::SIGTERM) {
                                     Ok(()) => self.append_log(format!(
                                         "[Launcher] Sent SIGTERM to PID {pid}"
+                                    )),
+                                    Err(nix::errno::Errno::ESRCH) => self.append_log(format!(
+                                        "[Launcher] Game (PID {pid}) had already exited"
                                     )),
                                     Err(e) => self.append_log(format!(
                                         "[Launcher] SIGTERM to PID {pid} failed: {e}"
@@ -767,7 +797,6 @@ impl GamingModeTab {
                                 self.disable_gaming_mode();
                             }
                             self.watch_phase = WatchPhase::Idle;
-                            self.launched_pid = None;
                             self.watch_status = String::new();
                         }
                         ui.checkbox(&mut self.auto_restore, "Disable Gaming Mode when the game exits");
@@ -827,26 +856,11 @@ impl GamingModeTab {
             }
 
             if reset_clicked {
-                if self.parked {
-                    self.events.push(GamingEvent::GamingModeChanged {
-                        active: false,
-                        elevate_nice: false,
-                    });
-                    self.parked = false;
-                }
-                if !get_offline_cpus().is_empty() {
+                // Turning Gaming Mode off also brings every parked CPU back
+                // online, including ones parked outside Gaming Mode.
+                if self.parked || !get_offline_cpus().is_empty() {
                     self.append_log("[Reset] Unparking CPUs…".into());
-                    let ll = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-                    let l2 = ll.clone();
-                    unpark_all(move |m| l2.lock().unwrap().push(m));
-                    for m in ll.lock().unwrap().drain(..) {
-                        self.append_log(m);
-                    }
-                    self.refresh_cpu_status();
-                    let topo = detect_topology();
-                    self.rebuild_preferred_checks(&topo);
-                    self.topo_description = topo.description.clone();
-                    self.topo = Some(topo);
+                    self.request_gaming(false, Parking::Keep);
                 }
                 self.events.push(GamingEvent::ResetAll);
             }
@@ -950,8 +964,7 @@ impl GamingModeTab {
             self.append_log(format!("[Profile] Loaded '{name}' — {}", profile.command));
             if self.parked {
                 self.append_log(format!("[Profile] Re-applying CPU parking for '{name}'…"));
-                self.disable_gaming_mode();
-                self.pending_enable_after_unpark = true;
+                self.enable_gaming_mode();
             }
         }
     }
@@ -998,16 +1011,16 @@ impl GamingModeTab {
                 return;
             }
         };
-        let was_parked = self.parked;
-        if !was_parked {
-            self.enable_gaming_mode();
-        }
+        let enabled_for_launch = !self.parked && self.enable_gaming_mode();
         match std::process::Command::new(&parts[0])
             .args(&parts[1..])
             .env("ARGUS_LASSO_HUD", "1")
             .spawn()
         {
             Ok(mut child) => {
+                // Read before the reaper below can free the PID.
+                self.launch_start_ticks = crate::fast_proc::read_stat(child.id(), &mut [0; 1024])
+                    .map_or(0, |s| s.starttime);
                 // Reap the launcher even when it exits before the actual game.
                 std::thread::spawn(move || {
                     let _ = child.wait();
@@ -1021,7 +1034,7 @@ impl GamingModeTab {
                 self.last_poll = std::time::Instant::now();
             }
             Err(error) => {
-                if !was_parked && self.parked {
+                if enabled_for_launch {
                     self.disable_gaming_mode();
                 }
                 self.launch_error = true;
@@ -1164,7 +1177,47 @@ fn core_map(
     }
 }
 
+/// Launch infrastructure that starts alongside a game and is never the game,
+/// although its name or command line often contains the game's: `sh` inside
+/// "Dishonored", or a reaper/Proton command line naming the game's path.
+/// Normalized, and truncated to 15 bytes as the kernel truncates `comm`.
+const LAUNCH_HELPERS: &[&str] = &[
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "env",
+    "python",
+    "python3",
+    "reaper",
+    "steam",
+    "steamwebhelper",
+    "pressurevessel",
+    "pvbwrap",
+    "srtbwrap",
+    "bwrap",
+    "wine",
+    "wine64",
+    "wineserver",
+    "winepreloader",
+    "wine64preloade",
+    "proton",
+    "umurun",
+    "gamescope",
+    "gamemoderun",
+    "mangohud",
+    "lutris",
+    "heroic",
+];
+
 fn proc_name_matches(game_name: &str, pid: u32) -> bool {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    is_game_process(game_name, &comm, &cmdline)
+}
+
+/// Whether a process with this `comm` and `cmdline` is the game `game_name`.
+fn is_game_process(game_name: &str, comm: &str, cmdline: &[u8]) -> bool {
     let norm = |s: &str| -> String {
         s.chars()
             .filter(|c| c.is_alphanumeric())
@@ -1172,18 +1225,18 @@ fn proc_name_matches(game_name: &str, pid: u32) -> bool {
             .collect()
     };
     let name_n = norm(game_name);
-    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
     let comm_n = norm(comm.trim());
-    if name_n.contains(&comm_n) || comm_n.contains(&name_n) {
+    // Every string contains "", so an empty side would match any process —
+    // including one that exited between the /proc listing and these reads.
+    if name_n.is_empty() || comm_n.is_empty() || LAUNCH_HELPERS.contains(&comm_n.as_str()) {
+        return false;
+    }
+    // `comm` is truncated to 15 bytes, so a long title can contain it. A
+    // short one would be found inside almost any title.
+    if comm_n.contains(&name_n) || (comm_n.len() >= 4 && name_n.contains(&comm_n)) {
         return true;
     }
-    // Fallback: cmdline
-    if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
-        if norm(&cmdline).contains(&name_n) {
-            return true;
-        }
-    }
-    false
+    norm(&String::from_utf8_lossy(cmdline)).contains(&name_n)
 }
 
 fn parse_launch_command(command: &str) -> Result<Vec<String>, String> {
@@ -1197,7 +1250,26 @@ fn parse_launch_command(command: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod launcher_tests {
-    use super::parse_launch_command;
+    use super::{is_game_process, parse_launch_command};
+
+    #[test]
+    fn game_names_match_the_game_and_not_its_launch_helpers() {
+        let title = "Shadow of the Tomb Raider";
+        let exe = b"Z:\\games\\Shadow of the Tomb Raider\\SOTTR.exe\0";
+        assert!(is_game_process(title, "SOTTR.exe", exe));
+        // Short names are found inside almost any title.
+        assert!(!is_game_process(title, "sh", b"sh\0-c\0true\0"));
+        assert!(!is_game_process("Catan", "cat", b"cat\0notes.txt\0"));
+        // Wrappers name the game's path but are not the game.
+        assert!(!is_game_process(title, "reaper", exe));
+        assert!(!is_game_process(title, "pressure-vessel", exe));
+        // A vanished process reads back empty.
+        assert!(!is_game_process(title, "", b""));
+        // comm truncated to 15 bytes still matches the long executable name.
+        assert!(is_game_process("Cyberpunk 2077", "Cyberpunk2077.e", b""));
+        // A title that extends the executable's name.
+        assert!(is_game_process("Factorio Space Age", "factorio", b""));
+    }
     #[test]
     fn quoted_arguments_and_paths_are_preserved_without_shell_execution() {
         assert_eq!(

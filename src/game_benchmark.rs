@@ -441,15 +441,10 @@ async fn shortcut_loop(
 const MAX_ERROR_FILE_BYTES: u64 = 64 * 1024;
 
 fn read_bounded_text(path: &std::path::Path) -> String {
-    use std::io::Read;
-    let Ok(f) = std::fs::File::open(path) else {
-        return String::new();
-    };
-    let mut buf = Vec::new();
-    if f.take(MAX_ERROR_FILE_BYTES).read_to_end(&mut buf).is_err() {
-        return String::new();
+    match capture::read_regular_capped(path, MAX_ERROR_FILE_BYTES) {
+        Ok(Some(buf)) => String::from_utf8_lossy(&buf).into_owned(),
+        _ => String::new(),
     }
-    String::from_utf8_lossy(&buf).into_owned()
 }
 
 struct RecordingScan {
@@ -523,8 +518,8 @@ fn read_graph(summary: &std::path::Path, duration: f64) -> Result<Vec<(f64, f64)
         .and_then(|p| p.strip_suffix(".summary.json"))
         .ok_or("Invalid recording filename")?;
     let path = summary.with_file_name(format!("{name}.csv"));
-    let file = std::fs::File::open(&path)
-        .or_else(|_| std::fs::File::open(path.with_extension("csv.partial")))
+    let file = capture::open_regular(&path)
+        .or_else(|_| capture::open_regular(&path.with_extension("csv.partial")))
         .map_err(|e| format!("Could not read frametimes: {e}"))?;
     const LIMIT: u64 = 128 * 1024 * 1024;
     if file.metadata().map_err(|e| e.to_string())?.len() > LIMIT {

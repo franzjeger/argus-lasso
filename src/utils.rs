@@ -95,25 +95,49 @@ pub fn get_tids(pid: u32) -> Vec<u32> {
     }
 }
 
+/// Listings `for_each_thread` makes at most before settling for what it has.
+const MAX_THREAD_WALKS: usize = 4;
+
+/// Call `f` once for every thread of `pid`.
+///
+/// A single /proc/<pid>/task listing can skip threads while others start or
+/// exit — the kernel resumes the directory walk by position — and a thread
+/// started mid-walk may copy the old setting from a creator not yet visited.
+/// Listing again until nothing new turns up catches both.
+pub fn for_each_thread(pid: u32, mut f: impl FnMut(u32)) {
+    let mut seen = HashSet::new();
+    for _ in 0..MAX_THREAD_WALKS {
+        let mut fresh = false;
+        for tid in get_tids(pid) {
+            if seen.insert(tid) {
+                fresh = true;
+                f(tid);
+            }
+        }
+        if !fresh {
+            break;
+        }
+    }
+}
+
 // ── sched_setaffinity ────────────────────────────────────────────────────────
 
 /// Apply CPU affinity to a process AND all its threads via sched_setaffinity(2).
-/// Returns true if at least one thread was set successfully.
-pub fn set_affinity(pid: u32, cpulist: &str) -> bool {
-    apply_affinity(pid, cpulist, false)
+/// Succeeds if at least one thread was set; otherwise the first error.
+pub fn set_affinity(pid: u32, cpulist: &str) -> std::io::Result<()> {
+    apply_affinity(pid, cpulist, false).map(|_| ())
 }
 
-fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> bool {
+/// Ok(true) if a thread was changed, Ok(false) if none needed changing.
+fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> std::io::Result<bool> {
+    let invalid = |msg: String| {
+        log::warn!("set_affinity pid {pid}: {msg}");
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
+    };
     let cpuset = match cpulist_to_set(cpulist) {
         Ok(s) if !s.is_empty() => s,
-        Ok(_) => {
-            log::warn!("set_affinity: empty cpulist for pid {pid}");
-            return false;
-        }
-        Err(e) => {
-            log::warn!("set_affinity: bad cpulist {cpulist:?} for pid {pid}: {e}");
-            return false;
-        }
+        Ok(_) => return Err(invalid("empty CPU list".into())),
+        Err(e) => return Err(invalid(format!("bad CPU list {cpulist:?}: {e}"))),
     };
 
     // Build nix CpuSet
@@ -127,34 +151,38 @@ fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> bool {
         }
     }
 
-    let tids = get_tids(pid);
     let mut any_ok = false;
-    for tid in tids {
-        // Affinity belongs to each thread, not to the process as a whole.
+    let mut first_err = None;
+    // Affinity belongs to each thread, not to the process as a whole.
+    for_each_thread(pid, |tid| {
         if only_changed
             && sched_getaffinity(Pid::from_raw(tid as i32)).is_ok_and(|current| current == cpu_set)
         {
-            continue;
+            return;
         }
         match sched_setaffinity(Pid::from_raw(tid as i32), &cpu_set) {
-            Ok(_) => {
-                any_ok = true;
-            }
+            Ok(_) => any_ok = true,
             Err(e) => {
                 log::debug!("sched_setaffinity tid={tid}: {e}");
+                first_err.get_or_insert(e);
             }
         }
+    });
+    match first_err {
+        Some(e) if !any_ok => Err(e.into()),
+        _ => {
+            if any_ok {
+                log::debug!("affinity pid={pid} cpulist={cpulist}: applied");
+            }
+            Ok(any_ok)
+        }
     }
-    if any_ok {
-        log::debug!("affinity pid={pid} cpulist={cpulist}: applied");
-    }
-    any_ok
 }
 
 /// Apply affinity to every thread whose CPU mask differs from `cpulist`.
 /// Returns true if at least one differing thread was updated successfully.
 pub fn set_affinity_if_changed(pid: u32, cpulist: &str) -> bool {
-    apply_affinity(pid, cpulist, true)
+    apply_affinity(pid, cpulist, true).unwrap_or(false)
 }
 
 /// Read current affinity of the main thread as a cpulist string.
@@ -177,58 +205,146 @@ pub fn get_affinity_str(pid: u32) -> String {
 
 use nix::sched::CpuSet;
 
+// ── /proc/meminfo ─────────────────────────────────────────────────────────────
+
+/// The /proc/meminfo fields this app shows, in KiB.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct MemInfo {
+    pub total: u64,
+    pub available: u64,
+    pub buffers: u64,
+    pub cached: u64,
+    pub swap_total: u64,
+    pub swap_free: u64,
+}
+
+impl MemInfo {
+    pub fn used(&self) -> u64 {
+        self.total.saturating_sub(self.available)
+    }
+}
+
+/// The one /proc/meminfo parser. None if the file is unreadable or reports
+/// no memory.
+pub fn read_meminfo() -> Option<MemInfo> {
+    parse_meminfo(&fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+fn parse_meminfo(text: &str) -> Option<MemInfo> {
+    let mut info = MemInfo::default();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(key), Some(value)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let Ok(kib) = value.parse() else {
+            continue;
+        };
+        match key {
+            "MemTotal:" => info.total = kib,
+            "MemAvailable:" => info.available = kib,
+            "Buffers:" => info.buffers = kib,
+            "Cached:" => info.cached = kib,
+            "SwapTotal:" => info.swap_total = kib,
+            "SwapFree:" => info.swap_free = kib,
+            _ => {}
+        }
+    }
+    (info.total > 0).then_some(info)
+}
+
+// ── Per-thread attributes ────────────────────────────────────────────────────
+
+/// Apply `set` to every thread of `pid`, main thread first.
+///
+/// Nice and I/O priority belong to each thread on Linux: `setpriority(2)` and
+/// `ioprio_set(2)` given a PID reach only the thread whose TID equals it, so a
+/// game's render and worker threads kept their old priority while the main
+/// thread — the only one read back — reported success. Affinity is applied
+/// the same way for the same reason.
+///
+/// Returns the main thread's result: that is the value `get_nice` and
+/// `get_ionice_raw` read back, so callers' dirty-checks agree with what they
+/// were told. The other threads are best effort — one exiting mid-walk is
+/// ordinary.
+fn set_every_thread(
+    pid: u32,
+    what: &str,
+    set: impl Fn(u32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let main = set(pid);
+    for_each_thread(pid, |tid| {
+        if tid != pid {
+            if let Err(e) = set(tid) {
+                log::debug!("{what} pid={pid} tid={tid}: {e}");
+            }
+        }
+    });
+    main
+}
+
 // ── nice ──────────────────────────────────────────────────────────────────────
 
-/// Set nice priority via `setpriority` syscall.
-/// Negative values require root/CAP_SYS_NICE. Returns true on success.
-pub fn set_nice(pid: u32, nice: i32) -> bool {
+/// Set the nice value of every thread of `pid` via the `setpriority` syscall.
+/// Lowering it (raising priority) is limited by RLIMIT_NICE / CAP_SYS_NICE.
+pub fn set_nice(pid: u32, nice: i32) -> std::io::Result<()> {
     use nix::libc;
-    // Unlike getpriority(2), whose -1 is ambiguous with a legitimate return
-    // value of -1, setpriority(2) unambiguously returns 0 on success and -1
-    // (with errno set) on failure — no errno-clearing dance needed first.
-    //
-    // SAFETY: only plain integers cross the FFI boundary; no pointers or
-    // lifetimes are involved.
-    let res =
-        unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice as libc::c_int) };
-    if res == 0 {
-        log::debug!("setpriority pid={pid} nice={nice}: OK");
-        true
-    } else {
-        let err = std::io::Error::last_os_error();
-        log::warn!("setpriority pid={pid} nice={nice} failed: {err}");
-        false
+    let result = set_every_thread(pid, "setpriority", |tid| {
+        // Unlike getpriority(2), whose -1 is ambiguous with a legitimate
+        // return value of -1, setpriority(2) unambiguously returns 0 on
+        // success and -1 (with errno set) on failure — no errno-clearing
+        // dance needed first.
+        //
+        // SAFETY: only plain integers cross the FFI boundary; no pointers or
+        // lifetimes are involved.
+        let res = unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice as libc::c_int)
+        };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    });
+    match &result {
+        Ok(()) => log::debug!("setpriority pid={pid} nice={nice}: OK"),
+        Err(err) => log::warn!("setpriority pid={pid} nice={nice} failed: {err}"),
     }
+    result
 }
 
 // ── ionice ───────────────────────────────────────────────────────────────────
 
-/// Set I/O priority via `ioprio_set` syscall.
+/// Set the I/O priority of every thread of `pid` via the `ioprio_set` syscall.
 /// class: 1=realtime, 2=best-effort, 3=idle. level: 0-7 (RT and BE only).
-pub fn set_ionice(pid: u32, class: i32, level: Option<i32>) -> bool {
+pub fn set_ionice(pid: u32, class: i32, level: Option<i32>) -> std::io::Result<()> {
     use nix::libc;
     let class_val = (class as u32) & 0x7;
     let data_val = (level.unwrap_or(0) as u32) & 0x1fff;
     let prio = (class_val << 13) | data_val;
 
-    // SAFETY: only plain integers cross the FFI boundary; no pointers or
-    // lifetimes are involved.
-    let res = unsafe {
-        libc::syscall(
-            libc::SYS_ioprio_set,
-            1, // IOPRIO_WHO_PROCESS
-            pid as libc::c_int,
-            prio as libc::c_int,
-        )
-    };
-    if res == 0 {
-        log::debug!("ioprio_set pid={pid} class={class} level={level:?}: OK");
-        true
-    } else {
-        let err = std::io::Error::last_os_error();
-        log::warn!("ioprio_set pid={pid} class={class} failed: {err}");
-        false
+    let result = set_every_thread(pid, "ioprio_set", |tid| {
+        // SAFETY: only plain integers cross the FFI boundary; no pointers or
+        // lifetimes are involved.
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_ioprio_set,
+                1, // IOPRIO_WHO_PROCESS — which, despite the name, is one thread
+                tid as libc::c_int,
+                prio as libc::c_int,
+            )
+        };
+        if res == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    });
+    match &result {
+        Ok(()) => log::debug!("ioprio_set pid={pid} class={class} level={level:?}: OK"),
+        Err(err) => log::warn!("ioprio_set pid={pid} class={class} failed: {err}"),
     }
+    result
 }
 
 // ── Dirty-check reads (avoid redundant syscalls) ─────────────────────────────
@@ -642,6 +758,101 @@ pub(crate) static PROCESS_NICE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mute
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker thread of this test process, parked until dropped, so its
+    /// per-thread nice and I/O priority can be read back through its TID.
+    struct Worker {
+        tid: u32,
+        release: Option<std::sync::mpsc::Sender<()>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Worker {
+        fn spawn() -> Self {
+            let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+            let (release, parked) = std::sync::mpsc::channel::<()>();
+            let handle = std::thread::spawn(move || {
+                tid_tx.send(nix::unistd::gettid().as_raw() as u32).unwrap();
+                let _ = parked.recv();
+            });
+            let tid = tid_rx.recv().unwrap();
+            Self {
+                tid,
+                release: Some(release),
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            drop(self.release.take());
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// setpriority(PRIO_PROCESS, pid) moves only the main thread on Linux;
+    /// a rule or ProBalance throttle must reach the worker threads too.
+    #[test]
+    fn set_nice_reaches_worker_threads() {
+        let _guard = PROCESS_NICE_TEST_LOCK.lock().unwrap();
+        let pid = std::process::id();
+        let worker = Worker::spawn();
+        // Only ever raise nice: lowering it again is governed by RLIMIT_NICE
+        // and not guaranteed (see PROCESS_NICE_TEST_LOCK).
+        let target = get_nice(pid).unwrap().max(get_nice(worker.tid).unwrap()) + 1;
+        if target > 19 {
+            return;
+        }
+        set_nice(pid, target).unwrap();
+        assert_eq!(get_nice(worker.tid), Some(target));
+    }
+
+    #[test]
+    fn meminfo_parses_the_fields_shown_and_rejects_an_empty_file() {
+        let text = "MemTotal:       48965732 kB\nMemFree:        30000000 kB\n\
+                    MemAvailable:   37000000 kB\nBuffers:           12000 kB\n\
+                    Cached:          5000000 kB\nSwapTotal:       8388604 kB\n\
+                    SwapFree:        8000000 kB\n";
+        let m = parse_meminfo(text).unwrap();
+        assert_eq!(
+            (m.total, m.available, m.used()),
+            (48965732, 37000000, 11965732)
+        );
+        assert_eq!((m.buffers, m.cached), (12000, 5000000));
+        assert_eq!((m.swap_total, m.swap_free), (8388604, 8000000));
+        assert!(parse_meminfo("").is_none());
+        // Available above total must not wrap around to an enormous "used".
+        let odd = parse_meminfo("MemTotal: 10 kB\nMemAvailable: 12 kB\n").unwrap();
+        assert_eq!(odd.used(), 0);
+    }
+
+    /// The UI used to guess "needs root?" for every failure; the setters now
+    /// hand back what actually went wrong.
+    #[test]
+    fn setters_report_the_actual_error() {
+        let bad = set_affinity(std::process::id(), "not-a-list").unwrap_err();
+        assert_eq!(bad.kind(), std::io::ErrorKind::InvalidInput);
+        // SAFETY: getuid(2) cannot fail and takes no arguments.
+        if unsafe { nix::libc::getuid() } != 0 {
+            // PID 1 belongs to root: changing it is refused, not "root needed?".
+            let denied = set_nice(1, 19).unwrap_err();
+            assert_eq!(denied.raw_os_error(), Some(nix::libc::EPERM));
+        }
+    }
+
+    #[test]
+    fn set_ionice_reaches_worker_threads() {
+        let pid = std::process::id();
+        let worker = Worker::spawn();
+        let before = get_ionice_raw(pid).unwrap();
+        // Best-effort at the lowest level needs no privilege.
+        set_ionice(pid, 2, Some(7)).unwrap();
+        assert_eq!(get_ionice_raw(worker.tid), Some((2, 7)));
+        let _ = set_ionice(pid, before.0, Some(before.1));
+    }
 
     #[test]
     fn wine_names_accept_windows_unix_and_bare_paths() {

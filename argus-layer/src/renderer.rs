@@ -8,6 +8,8 @@ pub const MAX_HUD_H: u32 = 1024;
 
 pub struct OverlayState {
     pub swapchain: vk::SwapchainKHR,
+    /// The device every resource below belongs to.
+    pub device: vk::Device,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
 
@@ -42,6 +44,9 @@ pub struct OverlayState {
     pub draw_queue: Option<vk::Queue>,
     pub complete: Vec<vk::Semaphore>,
     pub disabled: bool,
+    /// A fence that was reset but never submitted, so it will never signal.
+    /// Set together with `disabled`, after which nothing more is submitted.
+    pub abandoned_fence: Option<usize>,
     last_config: Option<OverlayConfig>,
     initialized: bool,
     last_update: Option<std::time::Instant>,
@@ -54,12 +59,21 @@ pub struct OverlayState {
     last_graph: Option<std::time::Instant>,
 }
 
+unsafe fn create_shader_module(device: &ash::Device, spv: &[u8]) -> Option<vk::ShaderModule> {
+    let code = ash::util::read_spv(&mut std::io::Cursor::new(spv)).ok()?;
+    device
+        .create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+        .ok()
+}
+
 fn find_memory_type(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
     type_filter: u32,
     properties: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
+    // SAFETY: callers pass a physical device enumerated from `instance`
+    // (OverlayState::new's contract), which the query requires.
     let mem_properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
     (0..mem_properties.memory_type_count).find(|&i| {
         (type_filter & (1 << i)) != 0
@@ -82,21 +96,78 @@ impl OverlayState {
         extent: vk::Extent2D,
         _transform: vk::SurfaceTransformFlagsKHR,
     ) -> Option<Self> {
-        let image_count = images.len();
-        if image_count == 0 {
+        if images.is_empty() {
             return None;
         }
+        let mut state = Self {
+            swapchain: vk::SwapchainKHR::null(),
+            device: device.handle(),
+            format,
+            extent,
+            command_pool: vk::CommandPool::null(),
+            command_buffers: Vec::new(),
+            fences: Vec::new(),
+            staging_buffers: Vec::new(),
+            staging_memories: Vec::new(),
+            staging_size: (MAX_HUD_W * (MAX_HUD_H + 40) * 4) as u64,
+            texture_image: vk::Image::null(),
+            texture_memory: vk::DeviceMemory::null(),
+            texture_view: vk::ImageView::null(),
+            sampler: vk::Sampler::null(),
+            render_pass: vk::RenderPass::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_set: vk::DescriptorSet::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            image_views: Vec::new(),
+            framebuffers: Vec::new(),
+            queue_family: queue_family_index,
+            draw_queue: None,
+            complete: Vec::new(),
+            disabled: false,
+            abandoned_fence: None,
+            last_config: None,
+            initialized: false,
+            last_update: None,
+            stats: FrameStats::default(),
+            worker: HudWorker::new(),
+            uploaded: None,
+            hud_width: 1,
+            hud_height: 1,
+            graph_pixels: Vec::new(),
+            last_graph: None,
+        };
+        if state
+            .create_resources(instance, physical_device, device, images)
+            .is_none()
+        {
+            // Every handle is either created or still null, and destroying a
+            // null handle is a no-op: exactly what was made gets freed. This
+            // repeats on every resize under memory pressure, so it must not leak.
+            state.destroy(device);
+            return None;
+        }
+        Some(state)
+    }
 
-        let staging_size = (MAX_HUD_W * (MAX_HUD_H + 40) * 4) as u64;
-        let mut staging_buffers = vec![];
-        let mut staging_memories = vec![];
+    /// Create the GPU resources, recording each handle the moment it exists.
+    unsafe fn create_resources(
+        &mut self,
+        instance: &ash::Instance,
+        physical_device: vk::PhysicalDevice,
+        device: &ash::Device,
+        images: &[vk::Image],
+    ) -> Option<()> {
+        let image_count = images.len();
 
         for _ in 0..image_count {
             let buf_info = vk::BufferCreateInfo::default()
-                .size(staging_size)
+                .size(self.staging_size)
                 .usage(vk::BufferUsageFlags::TRANSFER_SRC)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let staging_buffer = device.create_buffer(&buf_info, None).ok()?;
+            self.staging_buffers.push(staging_buffer);
             let mem_reqs = device.get_buffer_memory_requirements(staging_buffer);
             let mem_type = find_memory_type(
                 instance,
@@ -108,11 +179,10 @@ impl OverlayState {
                 .allocation_size(mem_reqs.size)
                 .memory_type_index(mem_type);
             let staging_memory = device.allocate_memory(&alloc_info, None).ok()?;
+            self.staging_memories.push(staging_memory);
             device
                 .bind_buffer_memory(staging_buffer, staging_memory, 0)
                 .ok()?;
-            staging_buffers.push(staging_buffer);
-            staging_memories.push(staging_memory);
         }
 
         // Texture
@@ -131,8 +201,8 @@ impl OverlayState {
             .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .samples(vk::SampleCountFlags::TYPE_1);
-        let texture_image = device.create_image(&img_info, None).ok()?;
-        let mem_reqs = device.get_image_memory_requirements(texture_image);
+        self.texture_image = device.create_image(&img_info, None).ok()?;
+        let mem_reqs = device.get_image_memory_requirements(self.texture_image);
         let mem_type = find_memory_type(
             instance,
             physical_device,
@@ -142,13 +212,13 @@ impl OverlayState {
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_reqs.size)
             .memory_type_index(mem_type);
-        let texture_memory = device.allocate_memory(&alloc_info, None).ok()?;
+        self.texture_memory = device.allocate_memory(&alloc_info, None).ok()?;
         device
-            .bind_image_memory(texture_image, texture_memory, 0)
+            .bind_image_memory(self.texture_image, self.texture_memory, 0)
             .ok()?;
 
         let view_info = vk::ImageViewCreateInfo::default()
-            .image(texture_image)
+            .image(self.texture_image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(vk::Format::R8G8B8A8_UNORM)
             .subresource_range(
@@ -157,7 +227,7 @@ impl OverlayState {
                     .level_count(1)
                     .layer_count(1),
             );
-        let texture_view = device.create_image_view(&view_info, None).ok()?;
+        self.texture_view = device.create_image_view(&view_info, None).ok()?;
 
         let sampler_info = vk::SamplerCreateInfo::default()
             .mag_filter(vk::Filter::NEAREST)
@@ -166,11 +236,11 @@ impl OverlayState {
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        let sampler = device.create_sampler(&sampler_info, None).ok()?;
+        self.sampler = device.create_sampler(&sampler_info, None).ok()?;
 
         // RenderPass
         let attachment = vk::AttachmentDescription::default()
-            .format(format)
+            .format(self.format)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::LOAD) // Preserve game!
             .store_op(vk::AttachmentStoreOp::STORE)
@@ -200,7 +270,7 @@ impl OverlayState {
             .attachments(std::slice::from_ref(&attachment))
             .subpasses(std::slice::from_ref(&subpass))
             .dependencies(std::slice::from_ref(&dependency));
-        let render_pass = device.create_render_pass(&render_pass_info, None).ok()?;
+        self.render_pass = device.create_render_pass(&render_pass_info, None).ok()?;
 
         // Descriptor Layout
         let binding = vk::DescriptorSetLayoutBinding::default()
@@ -210,7 +280,7 @@ impl OverlayState {
             .stage_flags(vk::ShaderStageFlags::FRAGMENT);
         let layout_info =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(std::slice::from_ref(&binding));
-        let descriptor_set_layout = device
+        self.descriptor_set_layout = device
             .create_descriptor_set_layout(&layout_info, None)
             .ok()?;
 
@@ -220,30 +290,127 @@ impl OverlayState {
             .offset(0)
             .size(16); // 2 floats (offset x, y), 2 floats (scale x, y)
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&descriptor_set_layout))
+            .set_layouts(std::slice::from_ref(&self.descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&push_constant));
-        let pipeline_layout = device
+        self.pipeline_layout = device
             .create_pipeline_layout(&pipeline_layout_info, None)
             .ok()?;
 
-        // Pipeline
+        // Pipeline. The shader modules are needed only while it is created,
+        // and are destroyed whether or not that succeeds.
         let vert_code = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.vert.spv"));
         let frag_code = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.frag.spv"));
-        let vert_module = device
-            .create_shader_module(
-                &vk::ShaderModuleCreateInfo::default()
-                    .code(&ash::util::read_spv(&mut std::io::Cursor::new(vert_code)).ok()?),
-                None,
-            )
-            .ok()?;
-        let frag_module = device
-            .create_shader_module(
-                &vk::ShaderModuleCreateInfo::default()
-                    .code(&ash::util::read_spv(&mut std::io::Cursor::new(frag_code)).ok()?),
-                None,
-            )
-            .ok()?;
+        let vert_module = create_shader_module(device, vert_code);
+        let frag_module = create_shader_module(device, frag_code);
+        let pipeline = match (vert_module, frag_module) {
+            (Some(vert), Some(frag)) => self.create_pipeline(device, vert, frag),
+            _ => None,
+        };
+        for module in [vert_module, frag_module].into_iter().flatten() {
+            device.destroy_shader_module(module, None);
+        }
+        self.pipeline = pipeline?;
 
+        // Framebuffers
+        for img in images {
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(*img)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(self.format)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            let iv = device.create_image_view(&view_info, None).ok()?;
+            self.image_views.push(iv);
+            let fb_info = vk::FramebufferCreateInfo::default()
+                .render_pass(self.render_pass)
+                .attachments(std::slice::from_ref(&iv))
+                .width(self.extent.width)
+                .height(self.extent.height)
+                .layers(1);
+            self.framebuffers
+                .push(device.create_framebuffer(&fb_info, None).ok()?);
+        }
+
+        // Descriptor Pool & Set (the set is freed with its pool)
+        let pool_size = vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1);
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(std::slice::from_ref(&pool_size))
+            .max_sets(1);
+        self.descriptor_pool = device.create_descriptor_pool(&pool_info, None).ok()?;
+
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
+        self.descriptor_set = *device.allocate_descriptor_sets(&alloc_info).ok()?.first()?;
+
+        let img_info = vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(self.texture_view)
+            .sampler(self.sampler);
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.descriptor_set)
+            .dst_binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(std::slice::from_ref(&img_info));
+        device.update_descriptor_sets(std::slice::from_ref(&write), &[]);
+
+        // Commands
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(self.queue_family);
+        self.command_pool = device.create_command_pool(&pool_info, None).ok()?;
+        let cb_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(image_count as u32);
+        self.command_buffers = device.allocate_command_buffers(&cb_alloc).ok()?;
+        if let Some(callback) = crate::LOADER_DATA
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&device.handle())
+            .copied()
+        {
+            use ash::vk::Handle;
+            for cb in &self.command_buffers {
+                if callback(device.handle(), cb.as_raw() as *mut std::ffi::c_void)
+                    != vk::Result::SUCCESS
+                {
+                    return None;
+                }
+            }
+        }
+        for _ in 0..image_count {
+            self.fences.push(
+                device
+                    .create_fence(
+                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                        None,
+                    )
+                    .ok()?,
+            );
+        }
+        for _ in 0..image_count {
+            self.complete.push(
+                device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .ok()?,
+            );
+        }
+        Some(())
+    }
+
+    unsafe fn create_pipeline(
+        &self,
+        device: &ash::Device,
+        vert_module: vk::ShaderModule,
+        frag_module: vk::ShaderModule,
+    ) -> Option<vk::Pipeline> {
         let shader_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -297,159 +464,38 @@ impl OverlayState {
             .multisample_state(&multisampling)
             .color_blend_state(&color_blending)
             .dynamic_state(&dynamic_state)
-            .layout(pipeline_layout)
-            .render_pass(render_pass)
+            .layout(self.pipeline_layout)
+            .render_pass(self.render_pass)
             .subpass(0);
 
         // .first() rather than [0]: a nonconformant ICD returning VK_SUCCESS
         // with fewer entries than requested would otherwise index-panic
         // instead of failing gracefully like every other fallible step here.
-        let pipeline = *device
+        device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
                 std::slice::from_ref(&pipeline_info),
                 None,
             )
             .ok()?
-            .first()?;
-        device.destroy_shader_module(vert_module, None);
-        device.destroy_shader_module(frag_module, None);
-
-        // Framebuffers
-        let mut image_views = vec![];
-        let mut framebuffers = vec![];
-        for img in images {
-            let view_info = vk::ImageViewCreateInfo::default()
-                .image(*img)
-                .view_type(vk::ImageViewType::TYPE_2D)
-                .format(format)
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .level_count(1)
-                        .layer_count(1),
-                );
-            let iv = device.create_image_view(&view_info, None).ok()?;
-            image_views.push(iv);
-            let fb_info = vk::FramebufferCreateInfo::default()
-                .render_pass(render_pass)
-                .attachments(std::slice::from_ref(&iv))
-                .width(extent.width)
-                .height(extent.height)
-                .layers(1);
-            framebuffers.push(device.create_framebuffer(&fb_info, None).ok()?);
-        }
-
-        // Descriptor Pool & Set
-        let pool_size = vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1);
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .pool_sizes(std::slice::from_ref(&pool_size))
-            .max_sets(1);
-        let descriptor_pool = device.create_descriptor_pool(&pool_info, None).ok()?;
-
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(std::slice::from_ref(&descriptor_set_layout));
-        let descriptor_set = *device.allocate_descriptor_sets(&alloc_info).ok()?.first()?;
-
-        let img_info = vk::DescriptorImageInfo::default()
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image_view(texture_view)
-            .sampler(sampler);
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(std::slice::from_ref(&img_info));
-        device.update_descriptor_sets(std::slice::from_ref(&write), &[]);
-
-        // Commands
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-            .queue_family_index(queue_family_index);
-        let command_pool = device.create_command_pool(&pool_info, None).ok()?;
-        let cb_alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(image_count as u32);
-        let command_buffers = device.allocate_command_buffers(&cb_alloc).ok()?;
-        if let Some(callback) = crate::LOADER_DATA
-            .read()
-            .unwrap()
-            .get(&device.handle())
+            .first()
             .copied()
-        {
-            use ash::vk::Handle;
-            for cb in &command_buffers {
-                if callback(device.handle(), cb.as_raw() as *mut std::ffi::c_void)
-                    != vk::Result::SUCCESS
-                {
-                    return None;
-                }
-            }
-        }
-        let mut fences = vec![];
-        for _ in 0..image_count {
-            fences.push(
-                device
-                    .create_fence(
-                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                        None,
-                    )
-                    .ok()?,
-            );
-        }
-
-        let complete = (0..image_count)
-            .map(|_| device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?;
-        Some(Self {
-            swapchain: vk::SwapchainKHR::null(),
-            format,
-            extent,
-            command_pool,
-            command_buffers,
-            fences,
-            staging_buffers,
-            staging_memories,
-            staging_size,
-            texture_image,
-            texture_memory,
-            texture_view,
-            sampler,
-            render_pass,
-            descriptor_set_layout,
-            descriptor_pool,
-            descriptor_set,
-            pipeline_layout,
-            pipeline,
-            image_views,
-            framebuffers,
-            queue_family: queue_family_index,
-            draw_queue: None,
-            complete,
-            disabled: false,
-            last_config: None,
-            initialized: false,
-            last_update: None,
-            stats: FrameStats::default(),
-            worker: HudWorker::new(),
-            uploaded: None,
-            hud_width: 1,
-            hud_height: 1,
-            graph_pixels: Vec::new(),
-            last_graph: None,
-        })
     }
 
     /// # Safety
-    /// All uses of these resources must have completed on the GPU. Call exactly
-    /// once, with the device that created this state, before destroying that device.
+    /// Call exactly once, with the device that created this state, before
+    /// destroying that device.
     pub unsafe fn destroy(&self, device: &ash::Device) {
-        let _ = device.device_wait_idle();
+        // Wait for our own submissions only. vkDeviceWaitIdle would need every
+        // queue of the device externally synchronized, and the game (DXVK and
+        // vkd3d-proton submit from their own threads) never promised us that.
+        let pending: Vec<vk::Fence> = (0..self.fences.len())
+            .filter(|&i| self.abandoned_fence != Some(i))
+            .map(|i| self.fences[i])
+            .collect();
+        if !pending.is_empty() {
+            let _ = device.wait_for_fences(&pending, true, u64::MAX);
+        }
         for &s in &self.complete {
             device.destroy_semaphore(s, None);
         }
@@ -477,7 +523,9 @@ impl OverlayState {
         for &mem in &self.staging_memories {
             device.free_memory(mem, None);
         }
-        device.free_command_buffers(self.command_pool, &self.command_buffers);
+        if !self.command_buffers.is_empty() {
+            device.free_command_buffers(self.command_pool, &self.command_buffers);
+        }
         device.destroy_command_pool(self.command_pool, None);
     }
 }
