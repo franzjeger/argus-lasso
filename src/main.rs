@@ -402,7 +402,14 @@ fn main() {
     let icon_rgba = make_icon_rgba();
 
     // Load config
-    let cfg = config::load();
+    let (cfg, load_error) = config::load();
+    // Set the unreadable file aside before anything can save over it — but
+    // never from the read-only tour, which must not write configuration.
+    let load_notice = match load_error {
+        Some(error) if args.ui_tour.is_none() => Some(config::preserve_unreadable(&error)),
+        Some(error) => Some(format!("Settings {error}. Defaults are in use.")),
+        None => None,
+    };
 
     // Build shared state
     let state = Arc::new(Mutex::new(monitor::AppState::default()));
@@ -410,6 +417,10 @@ fn main() {
         if let Ok(mut s) = state.lock() {
             s.config = cfg.clone();
             s.cpu_model = monitor::read_cpu_model();
+            if let Some(notice) = load_notice {
+                s.append_log(notice.clone());
+                s.operation_error = Some(notice);
+            }
         }
     }
 

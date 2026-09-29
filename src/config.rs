@@ -4,7 +4,7 @@
 //! DEFAULT_CONFIG via a deep-merge at the serde level (Option defaults).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -328,27 +328,57 @@ fn migrate_old_config() {
 }
 
 /// Load config from disk, filling missing keys with defaults via serde.
-pub fn load() -> Config {
+///
+/// A file that exists but cannot be read or parsed yields the defaults and
+/// the error. The caller must not let the next save replace that file before
+/// `preserve_unreadable` has moved it aside: saving the defaults over it
+/// would silently delete every rule and profile it held.
+pub fn load() -> (Config, Option<String>) {
     migrate_old_config();
-    let path = config_path();
-    if path.exists() {
-        match fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str::<Config>(&text) {
-                Ok(mut cfg) => {
-                    cfg.probalance.normalize();
-                    log::info!("Loaded config from {}", path.display());
-                    return cfg;
-                }
-                Err(e) => {
-                    log::warn!("Config parse error (using defaults): {e}");
-                }
-            },
-            Err(e) => {
-                log::warn!("Config read error (using defaults): {e}");
-            }
-        }
+    load_from(&config_path())
+}
+
+fn load_from(path: &Path) -> (Config, Option<String>) {
+    if !path.exists() {
+        return (Config::default(), None);
     }
-    Config::default()
+    let error = match fs::read_to_string(path) {
+        Ok(text) => match toml::from_str::<Config>(&text) {
+            Ok(mut cfg) => {
+                cfg.probalance.normalize();
+                log::info!("Loaded config from {}", path.display());
+                return (cfg, None);
+            }
+            Err(e) => format!("could not be parsed: {e}"),
+        },
+        Err(e) => format!("could not be read: {e}"),
+    };
+    log::warn!("Config {} {error} — using defaults", path.display());
+    (Config::default(), Some(error))
+}
+
+/// Move an unreadable config file aside, so that saving the defaults cannot
+/// overwrite it. Returns a message for the user naming where it went.
+pub fn preserve_unreadable(error: &str) -> String {
+    preserve_unreadable_at(&config_path(), error)
+}
+
+fn preserve_unreadable_at(path: &Path, error: &str) -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let kept = path.with_extension(format!("toml.unreadable-{stamp}"));
+    match fs::rename(path, &kept) {
+        Ok(()) => format!(
+            "Settings {error}. Defaults are in use; the previous file was kept as {}.",
+            kept.display()
+        ),
+        Err(e) => format!(
+            "Settings {error}, and could not be set aside ({e}). Defaults are in use; \
+             changing a setting will overwrite {}.",
+            path.display()
+        ),
+    }
 }
 
 /// Atomically save config to disk (write to .tmp, then rename).
@@ -394,6 +424,39 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Res
 
 #[cfg(test)]
 mod tests {
+    /// One unparseable value used to mean defaults in memory and, on the
+    /// next save, every rule and profile gone from disk.
+    #[test]
+    fn an_unreadable_config_is_reported_and_set_aside() {
+        let dir = std::env::temp_dir().join(format!("argus-config-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let broken = "[[rules]]\nname = \"game\"\nenabled = \"sometimes\"\n";
+        fs::write(&path, broken).unwrap();
+
+        let (cfg, error) = load_from(&path);
+        assert!(cfg.rules.is_empty());
+        let error = error.expect("a parse error must be reported");
+
+        let notice = preserve_unreadable_at(&path, &error);
+        assert!(
+            !path.exists(),
+            "the next save must not find it to overwrite"
+        );
+        let kept: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read_to_string(kept[0].path()).unwrap(), broken);
+        assert!(notice.contains(&kept[0].path().display().to_string()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_config_is_not_an_error() {
+        let path =
+            std::env::temp_dir().join(format!("argus-missing-{}.toml", uuid::Uuid::new_v4()));
+        assert!(load_from(&path).1.is_none());
+    }
+
     use super::*;
 
     #[test]

@@ -87,6 +87,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   the page reporting "off" while CPUs are parked, parking no longer freezes the
   window, and it takes one authorization instead of one per CPU. Activation whose
   parking fails brings every CPU back online and stays off.
+- A settings file that cannot be read no longer loses everything on the next save.
+  Defaults were used and the next change wrote them over the file, deleting every
+  rule and profile. The file is now kept as `config.toml.unreadable-<time>` and
+  the reason is shown.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
