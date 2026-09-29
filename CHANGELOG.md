@@ -77,6 +77,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
   empty `$HOME` as the current directory. The single-instance lock never uses
   the shared temp directory, and a lock that cannot be created is reported as
   such rather than as "already running".
+- Affinity, nice and I/O priority reach threads that a single `/proc` thread
+  listing skips while a program starts or ends other threads.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

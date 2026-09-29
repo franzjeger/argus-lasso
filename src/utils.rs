@@ -95,6 +95,31 @@ pub fn get_tids(pid: u32) -> Vec<u32> {
     }
 }
 
+/// Listings `for_each_thread` makes at most before settling for what it has.
+const MAX_THREAD_WALKS: usize = 4;
+
+/// Call `f` once for every thread of `pid`.
+///
+/// A single /proc/<pid>/task listing can skip threads while others start or
+/// exit — the kernel resumes the directory walk by position — and a thread
+/// started mid-walk may copy the old setting from a creator not yet visited.
+/// Listing again until nothing new turns up catches both.
+pub fn for_each_thread(pid: u32, mut f: impl FnMut(u32)) {
+    let mut seen = HashSet::new();
+    for _ in 0..MAX_THREAD_WALKS {
+        let mut fresh = false;
+        for tid in get_tids(pid) {
+            if seen.insert(tid) {
+                fresh = true;
+                f(tid);
+            }
+        }
+        if !fresh {
+            break;
+        }
+    }
+}
+
 // ── sched_setaffinity ────────────────────────────────────────────────────────
 
 /// Apply CPU affinity to a process AND all its threads via sched_setaffinity(2).
@@ -127,24 +152,19 @@ fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> bool {
         }
     }
 
-    let tids = get_tids(pid);
     let mut any_ok = false;
-    for tid in tids {
-        // Affinity belongs to each thread, not to the process as a whole.
+    // Affinity belongs to each thread, not to the process as a whole.
+    for_each_thread(pid, |tid| {
         if only_changed
             && sched_getaffinity(Pid::from_raw(tid as i32)).is_ok_and(|current| current == cpu_set)
         {
-            continue;
+            return;
         }
         match sched_setaffinity(Pid::from_raw(tid as i32), &cpu_set) {
-            Ok(_) => {
-                any_ok = true;
-            }
-            Err(e) => {
-                log::debug!("sched_setaffinity tid={tid}: {e}");
-            }
+            Ok(_) => any_ok = true,
+            Err(e) => log::debug!("sched_setaffinity tid={tid}: {e}"),
         }
-    }
+    });
     if any_ok {
         log::debug!("affinity pid={pid} cpulist={cpulist}: applied");
     }
@@ -197,13 +217,13 @@ fn set_every_thread(
     set: impl Fn(u32) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let main = set(pid);
-    for tid in get_tids(pid) {
+    for_each_thread(pid, |tid| {
         if tid != pid {
             if let Err(e) = set(tid) {
                 log::debug!("{what} pid={pid} tid={tid}: {e}");
             }
         }
-    }
+    });
     main
 }
 
