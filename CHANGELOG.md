@@ -42,6 +42,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- Helper installation no longer trusts the user-writable staging directory: root
+  installs only copies matching SHA-256 digests in its own command, so a file
+  swapped while the polkit prompt is open is refused instead of installed.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
