@@ -567,584 +567,681 @@ fn run_loop(
     initial_config: Config,
     rule_engine: Arc<Mutex<RuleEngine>>,
 ) {
-    let mut config = initial_config;
-    let ipc = ipc_server::Broadcaster::start();
-    ipc.broadcast(&argus_ipc::IpcMessage::Config(
-        config.gaming_mode.overlay.clone(),
-    ));
+    Daemon::start(state, initial_config, rule_engine).run(&cmd_rx);
+}
 
-    // Build closures that push log messages into shared state
-    let state_log = state.clone();
-    let log_cb = move |msg: String| {
-        if let Ok(mut s) = state_log.lock() {
+/// A log sink that appends to the shared state's log.
+fn logger(state: &Arc<Mutex<AppState>>) -> impl Fn(String) + Send + Clone + 'static {
+    let state = state.clone();
+    move |msg: String| {
+        if let Ok(mut s) = state.lock() {
             s.append_log(msg);
         }
-    };
+    }
+}
 
-    let mut probalance = ProBalance::new(config.probalance.clone());
-    let mut hw_collector = HwCollector::new();
-    let mut last_sensors = Instant::now() - Duration::from_secs(1);
-    let mut cpu_percents = Vec::new();
-    let mut cpu_sampler = CpuSampler::default();
-    let mut avg = 0.0;
+/// Gaming Mode as the monitor thread tracks it.
+#[derive(Default)]
+struct GamingState {
+    active: bool,
+    elevate_nice: bool,
+    /// Did WE auto-enable Gaming Mode? (never auto-disable a manual activation)
+    auto: bool,
+    /// Consecutive snapshots without a detected game before auto-disabling
+    absent_snapshots: u32,
+    /// pid → (start_ticks, original nice before we elevated). start_ticks pins
+    /// this to the specific process instance, not just the pid number — see
+    /// `Daemon::prune_dead` and restore_gaming_nices.
+    niced: HashMap<u32, (u64, i32)>,
+    launch_profiles: Vec<argus_ipc::LaunchProfile>,
+}
 
-    let log_cb2 = log_cb.clone();
-    probalance.set_log_callback(log_cb2);
+/// Everything the monitor thread keeps between passes. Each phase of a pass
+/// is a method, run in the order `run` lists them.
+struct Daemon {
+    state: Arc<Mutex<AppState>>,
+    rule_engine: Arc<Mutex<RuleEngine>>,
+    config: Config,
+    ipc: ipc_server::Broadcaster,
+    log: Box<dyn Fn(String) + Send>,
+    probalance: ProBalance,
+    hw_collector: HwCollector,
+    cpu_sampler: CpuSampler,
+    cpu_percents: Vec<f32>,
+    avg: f32,
 
-    {
-        let log_cb3 = log_cb.clone();
+    /// Cached snapshot — rebuilt only on enforce/display cadence
+    raw_snapshot: Vec<ProcInfo>,
+    /// Per-PID caches: immutable metadata, display-only fields, I/O counters.
+    caches: SnapshotCaches,
+    /// Previous jiffies per process, for CPU percentage deltas
+    prev_cpu_times: HashMap<u32, u64>,
+    prev_sys_total: u64,
+    known_pids: HashSet<u32>,
+    first_snapshot: bool,
+    /// pid → original affinity set before we changed it; pruned every snapshot cycle
+    original_affinities: HashMap<u32, HashSet<u32>>,
+    /// pid → expiry Instant (suppress rule re-enforcement after manual change)
+    manual_overrides: HashMap<u32, Instant>,
+    /// (rule_id, pid) pairs whose set_nice failed during enforcement — retried
+    /// once, not every 500ms tick; pruned when the PID dies.
+    enforce_nice_failed: HashSet<(String, u32)>,
+    gaming: GamingState,
+    /// Previously throttled PIDs, for change-based notifications
+    prev_throttled: HashSet<u32>,
+    /// HW alert cooldown: sensor_label → last alert time
+    last_alert_times: HashMap<String, Instant>,
+
+    // When each phase last ran.
+    last_enforce: Instant,
+    last_pb: Instant,
+    last_pb_tick: Instant,
+    last_snapshot: Instant,
+    last_sensors: Instant,
+    last_io_sample: Instant,
+    toggle_dir: std::path::PathBuf,
+}
+
+impl Daemon {
+    fn start(
+        state: Arc<Mutex<AppState>>,
+        config: Config,
+        rule_engine: Arc<Mutex<RuleEngine>>,
+    ) -> Self {
+        let ipc = ipc_server::Broadcaster::start();
+        ipc.broadcast(&argus_ipc::IpcMessage::Config(
+            config.gaming_mode.overlay.clone(),
+        ));
+
+        let mut probalance = ProBalance::new(config.probalance.clone());
+        probalance.set_log_callback(logger(&state));
         if let Ok(mut re) = rule_engine.lock() {
-            re.set_log_callback(log_cb3);
+            re.set_log_callback(logger(&state));
+        }
+        let log = Box::new(logger(&state));
+
+        // Startup log entry so users can see the log is working
+        log(format!(
+            "Argus-Lasso started — ProBalance: {}  |  Display refresh: {}ms  |  Rule enforce: {}ms",
+            if config.probalance.enabled {
+                "on"
+            } else {
+                "off"
+            },
+            config.monitor.display_refresh_interval_ms,
+            config.monitor.rule_enforce_interval_ms,
+        ));
+
+        let now = Instant::now();
+        Self {
+            state,
+            rule_engine,
+            config,
+            ipc,
+            log,
+            probalance,
+            hw_collector: HwCollector::new(),
+            cpu_sampler: CpuSampler::default(),
+            cpu_percents: Vec::new(),
+            avg: 0.0,
+            raw_snapshot: Vec::new(),
+            caches: SnapshotCaches::default(),
+            prev_cpu_times: HashMap::new(),
+            prev_sys_total: 0,
+            known_pids: HashSet::new(),
+            first_snapshot: true,
+            original_affinities: HashMap::new(),
+            manual_overrides: HashMap::new(),
+            enforce_nice_failed: HashSet::new(),
+            gaming: GamingState::default(),
+            prev_throttled: HashSet::new(),
+            last_alert_times: HashMap::new(),
+            last_enforce: now,
+            last_pb: now,
+            last_pb_tick: now,
+            last_snapshot: now,
+            last_sensors: now - Duration::from_secs(1),
+            last_io_sample: now,
+            toggle_dir: crate::config::config_dir(),
         }
     }
 
-    // Startup log entry so users can see the log is working
-    log_cb(format!(
-        "Argus-Lasso started — ProBalance: {}  |  Display refresh: {}ms  |  Rule enforce: {}ms",
-        if config.probalance.enabled {
-            "on"
-        } else {
-            "off"
-        },
-        config.monitor.display_refresh_interval_ms,
-        config.monitor.rule_enforce_interval_ms,
-    ));
-
-    let mut known_pids: HashSet<u32> = HashSet::new();
-    let mut first_snapshot = true;
-    // Track previously throttled PIDs for change-based notifications
-    let mut prev_throttled: HashSet<u32> = HashSet::new();
-    // pid → original affinity set before we changed it; pruned every snapshot cycle
-    let mut original_affinities: HashMap<u32, HashSet<u32>> = HashMap::new();
-    // pid → expiry Instant (suppress rule re-enforcement after manual change)
-    let mut manual_overrides: HashMap<u32, Instant> = HashMap::new();
-    // Gaming Mode nice tracking: pid → (start_ticks, original nice before we
-    // elevated). start_ticks pins this to the specific process instance, not
-    // just the pid number — see the retain call below and restore_gaming_nices.
-    let mut gaming_mode = false;
-    let mut launch_profiles = Vec::<argus_ipc::LaunchProfile>::new();
-    let mut gaming_elevate_nice = false;
-    let mut gaming_niced: HashMap<u32, (u64, i32)> = HashMap::new();
-    // Did WE auto-enable Gaming Mode? (never auto-disable a manual activation)
-    let mut auto_gaming = false;
-    // Consecutive snapshots without a detected game before auto-disabling
-    let mut game_absent_snapshots: u32 = 0;
-    // Per-PID caches: immutable metadata, display-only fields, I/O counters.
-    let mut caches = SnapshotCaches::default();
-    let mut last_io_sample = Instant::now();
-    // HW alert cooldown: sensor_label → last alert time
-    let mut last_alert_times: HashMap<String, Instant> = HashMap::new();
-
-    let mut last_enforce = Instant::now();
-    let mut last_pb = Instant::now();
-    let mut last_snapshot = Instant::now();
-    let mut last_pb_tick = Instant::now();
-
-    // CPU percentage tracking: previous jiffies per process for delta
-    let mut prev_cpu_times: HashMap<u32, u64> = HashMap::new();
-    let mut prev_sys_total: u64 = 0;
-    // Cached snapshot — rebuilt only on enforce/display cadence
-    let mut raw_snapshot: Vec<ProcInfo> = Vec::new();
-    // (rule_id, pid) pairs whose set_nice failed during enforcement — retried
-    // once, not every 500ms tick; pruned when the PID dies.
-    let mut enforce_nice_failed: HashSet<(String, u32)> = HashSet::new();
-
-    let toggle_dir = crate::config::config_dir();
-    loop {
-        // ── Check for CLI overlay toggle ────────────────────────────────────
-        if !crate::overlay_toggle::drain(&toggle_dir).is_multiple_of(2) {
-            config.gaming_mode.overlay.show_overlay = !config.gaming_mode.overlay.show_overlay;
-            ipc.broadcast(&argus_ipc::IpcMessage::Config(
-                config.gaming_mode.overlay.clone(),
-            ));
-            // Merge just the field this toggle actually changed into shared
-            // state, not the whole Config: `config` here is this loop's own
-            // mirror, refreshed only by DaemonCmd::ConfigChanged, so it can't
-            // see GUI-only fields (column widths, rules, opacity/theme) the
-            // GUI thread writes directly into s.config between ConfigChanged
-            // calls. Overwriting the whole struct raced those writes and
-            // could silently discard them — including, in the rules case, a
-            // user's just-edited rule definitions on the next config save.
-            if let Ok(mut s) = state.lock() {
-                s.config.gaming_mode.overlay.show_overlay = config.gaming_mode.overlay.show_overlay;
-            }
-            persist_config(&state);
-            log_cb(format!(
-                "Overlay visibility toggled to {}",
-                config.gaming_mode.overlay.show_overlay
-            ));
-        }
-
-        // ── Drain commands from GUI ─────────────────────────────────────────
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                DaemonCmd::SaveConfig => persist_config(&state),
-                DaemonCmd::GameLaunched { pid, profile } => {
-                    if let Some(stat) = crate::fast_proc::read_stat(pid, &mut [0; 1024]) {
-                        launch_profiles.retain(|p| p.pid != pid);
-                        launch_profiles.push(argus_ipc::LaunchProfile {
-                            pid,
-                            start_ticks: stat.starttime,
-                            profile,
-                        });
-                    }
-                }
-                DaemonCmd::ConfigChanged => {
-                    let Ok(cfg) = state.lock().map(|s| s.config.clone()) else {
-                        continue;
-                    };
-                    probalance.update_config(cfg.probalance.clone());
-                    config = cfg.clone();
-                    ipc.broadcast(&argus_ipc::IpcMessage::Config(
-                        config.gaming_mode.overlay.clone(),
-                    ));
-                    log_cb(format!(
-                        "Config updated — ProBalance: {}  |  Notifications: {}",
-                        if config.probalance.enabled {
-                            "on"
-                        } else {
-                            "off"
-                        },
-                        if config.ui.notifications_enabled {
-                            "on"
-                        } else {
-                            "off"
-                        },
-                    ));
-                }
-                DaemonCmd::SetGamingMode {
-                    active,
-                    elevate_nice,
-                    parking,
-                } => {
-                    // A requested activation whose parking fails stays off
-                    // rather than half-applied.
-                    let active = apply_gaming_parking(active, &parking, &log_cb) && active;
-                    gaming_mode = active;
-                    gaming_elevate_nice = elevate_nice;
-                    // A manual toggle takes ownership: the auto-detector must
-                    // not later auto-disable a manually (re-)enabled mode.
-                    auto_gaming = false;
-                    game_absent_snapshots = 0;
-                    if !active && !gaming_niced.is_empty() {
-                        restore_gaming_nices(&mut gaming_niced, &log_cb);
-                    }
-                    publish_gaming_state(&state, active);
-                }
-                DaemonCmd::SetManualOverride { pid, duration_secs } => {
-                    manual_overrides
-                        .insert(pid, Instant::now() + Duration::from_secs_f64(duration_secs));
-                }
-                DaemonCmd::ResetAffinities => {
-                    reset_all_affinities(&mut original_affinities, &log_cb);
-                }
-                DaemonCmd::ReapplyDefaults => {
-                    // Rules may have changed — failed nice attempts get a fresh
-                    // chance (an edited rule can now have an achievable nice).
-                    enforce_nice_failed.clear();
-                    reapply_defaults(&config, &rule_engine, &known_pids, &log_cb);
-                }
-                DaemonCmd::Shutdown => {
-                    log_cb("[Shutdown] Restoring system state…".into());
-                    if !gaming_niced.is_empty() {
-                        restore_gaming_nices(&mut gaming_niced, &log_cb);
-                    }
-                    probalance.shutdown();
-                    if !utils::get_offline_cpus().is_empty() {
-                        cpu_park::unpark_all(&log_cb);
-                    }
-                    if let Ok(mut s) = state.lock() {
-                        s.shutdown_complete = true;
-                    }
-                    // Stop the loop entirely: if it kept running, the very
-                    // next ProBalance/auto-gaming tick could re-throttle or
-                    // re-park in the window before process exit — and a
-                    // cgroup re-throttle would outlive us until logout,
-                    // since nothing would ever restore it.
+    fn run(mut self, cmd_rx: &Receiver<DaemonCmd>) {
+        loop {
+            self.poll_overlay_toggle();
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                if self.handle(cmd).is_break() {
                     return;
                 }
             }
-        }
 
-        let now = Instant::now();
-        let enforce_interval = Duration::from_millis(config.monitor.rule_enforce_interval_ms);
-        // With no enabled rules and no default affinity there is nothing for
-        // an enforce pass to do, so it should not be a reason to walk /proc.
-        // On a default install that halves the walks: two a second down to
-        // ProBalance's one. Cheap to recheck — the engine holds a Vec.
-        let enforcing = config.cpu.default_affinity.is_some()
-            || rule_engine
+            let now = Instant::now();
+            let enforce_interval =
+                Duration::from_millis(self.config.monitor.rule_enforce_interval_ms);
+            let display_interval =
+                Duration::from_millis(self.config.monitor.display_refresh_interval_ms);
+            let enforce_due =
+                self.enforcing() && now.duration_since(self.last_enforce) >= enforce_interval;
+            let display_due = now.duration_since(self.last_snapshot) >= display_interval;
+            let probalance_due = now.duration_since(self.last_pb) >= Duration::from_secs(1);
+
+            if enforce_due || display_due || probalance_due {
+                self.refresh_snapshot(now, display_due);
+            }
+            if enforce_due {
+                self.enforce_rules(now);
+            }
+            if probalance_due {
+                self.tick_probalance(now);
+            }
+            if now.duration_since(self.last_sensors) >= Duration::from_secs(1) {
+                self.update_sensors(now);
+            }
+            if display_due {
+                self.publish(now);
+            }
+
+            // Sleep no longer than the enforcement interval so a sub-500ms
+            // rule_enforce_interval_ms is honoured instead of silently ignored.
+            let tick =
+                enforce_interval.clamp(Duration::from_millis(50), Duration::from_millis(500));
+            std::thread::sleep(tick);
+        }
+    }
+
+    /// With no enabled rules and no default affinity there is nothing for
+    /// an enforce pass to do, so it should not be a reason to walk /proc.
+    /// On a default install that halves the walks: two a second down to
+    /// ProBalance's one. Cheap to recheck — the engine holds a Vec.
+    fn enforcing(&self) -> bool {
+        self.config.cpu.default_affinity.is_some()
+            || self
+                .rule_engine
                 .lock()
                 .map(|re| re.get_rules().iter().any(|r| r.enabled))
-                .unwrap_or(false);
-        let needs_snapshot = (enforcing && now.duration_since(last_enforce) >= enforce_interval)
-            || now.duration_since(last_snapshot)
-                >= Duration::from_millis(config.monitor.display_refresh_interval_ms)
-            || now.duration_since(last_pb) >= Duration::from_secs(1);
+                .unwrap_or(false)
+    }
 
-        // ── Collect process snapshot (only when needed) ─────────────────────
-        if needs_snapshot {
-            // Affinity, I/O priority and disk rates are rendered by the
-            // process table and nothing else, so only pay for them on the
-            // pass that will actually be published.
-            let detail = now.duration_since(last_snapshot)
-                >= Duration::from_millis(config.monitor.display_refresh_interval_ms);
-            let io_elapsed = if detail {
-                let e = now.duration_since(last_io_sample).as_secs_f32();
-                last_io_sample = now;
-                e
-            } else {
-                0.0
-            };
-            let (new_cpu_times, sys_total) = collect_snapshot(
-                &mut raw_snapshot,
-                &mut prev_cpu_times,
-                prev_sys_total,
-                &mut caches,
-                detail,
-                io_elapsed,
-            );
-            prev_cpu_times = new_cpu_times;
-            prev_sys_total = sys_total;
+    fn poll_overlay_toggle(&mut self) {
+        if crate::overlay_toggle::drain(&self.toggle_dir).is_multiple_of(2) {
+            return;
+        }
+        let overlay = &mut self.config.gaming_mode.overlay;
+        overlay.show_overlay = !overlay.show_overlay;
+        self.ipc
+            .broadcast(&argus_ipc::IpcMessage::Config(overlay.clone()));
+        // Merge just the field this toggle actually changed into shared
+        // state, not the whole Config: `config` here is this thread's own
+        // mirror, refreshed only by DaemonCmd::ConfigChanged, so it can't
+        // see GUI-only fields (column widths, rules, opacity/theme) the
+        // GUI thread writes directly into s.config between ConfigChanged
+        // calls. Overwriting the whole struct raced those writes and
+        // could silently discard them — including, in the rules case, a
+        // user's just-edited rule definitions on the next config save.
+        let shown = overlay.show_overlay;
+        if let Ok(mut s) = self.state.lock() {
+            s.config.gaming_mode.overlay.show_overlay = shown;
+        }
+        persist_config(&self.state);
+        (self.log)(format!("Overlay visibility toggled to {shown}"));
+    }
 
-            let current_pids: HashSet<u32> = raw_snapshot.iter().map(|p| p.pid).collect();
-
-            // Prune dead PIDs from per-PID maps: avoids unbounded growth, and —
-            // for gaming_niced — stops a reused PID from getting an unrelated
-            // process's nice restored onto it when Gaming Mode is disabled.
-            //
-            // gaming_niced additionally keys on start_ticks, not just pid
-            // liveness: current_pids.contains(pid) is true again the instant
-            // a dead pid is reused by an unrelated process, which — within
-            // one scan interval — could otherwise inherit the previous
-            // occupant's nice-restore entry. Two processes can't share a
-            // start time, so comparing it catches reuse that a liveness
-            // check alone would miss.
-            original_affinities.retain(|pid, _| current_pids.contains(pid));
-            if !gaming_niced.is_empty() {
-                let live_start_ticks: HashMap<u32, u64> = raw_snapshot
-                    .iter()
-                    .filter(|p| gaming_niced.contains_key(&p.pid))
-                    .map(|p| (p.pid, p.start_ticks))
-                    .collect();
-                gaming_niced
-                    .retain(|pid, entry| live_start_ticks.get(pid).copied() == Some(entry.0));
-            }
-            caches.retain_live(&current_pids);
-            enforce_nice_failed.retain(|(_, pid)| current_pids.contains(pid));
-
-            // ── New PIDs: apply rules or default affinity ───────────────────
-            let new_pids: HashSet<u32> = current_pids.difference(&known_pids).copied().collect();
-            if !new_pids.is_empty() {
-                for proc in raw_snapshot.iter().filter(|p| new_pids.contains(&p.pid)) {
-                    apply_new_pid(
-                        proc,
-                        &config,
-                        &rule_engine,
-                        &mut original_affinities,
-                        gaming_mode,
-                        gaming_elevate_nice,
-                        &mut gaming_niced,
-                        &log_cb,
-                    );
+    /// Break means stop the thread.
+    fn handle(&mut self, cmd: DaemonCmd) -> std::ops::ControlFlow<()> {
+        match cmd {
+            DaemonCmd::SaveConfig => persist_config(&self.state),
+            DaemonCmd::GameLaunched { pid, profile } => {
+                if let Some(stat) = crate::fast_proc::read_stat(pid, &mut [0; 1024]) {
+                    let profiles = &mut self.gaming.launch_profiles;
+                    profiles.retain(|p| p.pid != pid);
+                    profiles.push(argus_ipc::LaunchProfile {
+                        pid,
+                        start_ticks: stat.starttime,
+                        profile,
+                    });
                 }
             }
-            if first_snapshot {
-                log_cb(format!(
-                    "Initial scan: {} processes found.",
-                    raw_snapshot.len()
+            DaemonCmd::ConfigChanged => {
+                let Ok(cfg) = self.state.lock().map(|s| s.config.clone()) else {
+                    return std::ops::ControlFlow::Continue(());
+                };
+                self.probalance.update_config(cfg.probalance.clone());
+                self.config = cfg;
+                self.ipc.broadcast(&argus_ipc::IpcMessage::Config(
+                    self.config.gaming_mode.overlay.clone(),
                 ));
-                first_snapshot = false;
-            }
-            known_pids = current_pids;
-
-            // ── Auto Gaming Mode (Steam/Proton detection) ───────────────────
-            if config.gaming_mode.auto_detect {
-                let game = raw_snapshot.iter().find(|p| is_game_process(p));
-                if let Some(game) = game {
-                    game_absent_snapshots = 0;
-                    if !gaming_mode {
-                        gaming_mode = true;
-                        gaming_elevate_nice = true;
-                        auto_gaming = true;
-                        log_cb(format!(
-                            "[Gaming Mode] Auto-enabled — game detected: {} ({})",
-                            game.name, game.pid
-                        ));
-                        // Detection turns Gaming Mode on even if parking fails:
-                        // the priority boost still applies.
-                        if config.gaming_mode.auto_park {
-                            apply_gaming_parking(true, &Parking::NonPreferred, &log_cb);
-                        }
-                        publish_gaming_state(&state, true);
-                    }
-                } else if auto_gaming && gaming_mode {
-                    // Require a couple of game-free snapshots before restoring,
-                    // so a brief exec/restart doesn't bounce the CPUs.
-                    game_absent_snapshots += 1;
-                    if game_absent_snapshots >= 2 {
-                        gaming_mode = false;
-                        auto_gaming = false;
-                        game_absent_snapshots = 0;
-                        log_cb("[Gaming Mode] Auto-disabled — game exited.".into());
-                        if !gaming_niced.is_empty() {
-                            restore_gaming_nices(&mut gaming_niced, &log_cb);
-                        }
-                        if config.gaming_mode.auto_park {
-                            apply_gaming_parking(false, &Parking::Keep, &log_cb);
-                        }
-                        publish_gaming_state(&state, false);
-                    }
-                }
-            }
-        }
-
-        // ── Rule enforcement every enforce_interval ─────────────────────────
-        if enforcing && now.duration_since(last_enforce) >= enforce_interval {
-            // Expire stale manual overrides
-            manual_overrides.retain(|_, exp| *exp > now);
-            // Clone the rules and enforce WITHOUT holding the engine lock:
-            // enforcement does procfs reads and renice/ionice subprocess spawns
-            // per process, and the GUI thread locks the same engine to edit
-            // rules — holding it here would freeze the UI for the whole pass.
-            let rules: Vec<crate::rules::Rule> = rule_engine
-                .lock()
-                .map(|re| re.get_rules().to_vec())
-                .unwrap_or_default();
-            if !rules.is_empty() {
-                for proc in &raw_snapshot {
-                    if manual_overrides.contains_key(&proc.pid) {
-                        continue;
-                    }
-                    crate::rules::apply_rules(
-                        &rules,
-                        proc.pid,
-                        &proc.name,
-                        Some(proc.nice),
-                        crate::utils::get_ionice_raw(proc.pid), // Could be cached, but only queried if rule matches
-                        &mut enforce_nice_failed,
-                        &log_cb,
-                    );
-                }
-            }
-            last_enforce = now;
-        }
-
-        // ── ProBalance every 1s ────────────────────────────────────────────
-        if now.duration_since(last_pb) >= Duration::from_secs(1) {
-            let pb_tick = now.duration_since(last_pb_tick).as_secs_f32();
-            last_pb_tick = now;
-            let pb_snap: Vec<ProcSnapshot> = raw_snapshot
-                .iter()
-                .map(|p| ProcSnapshot {
-                    pid: p.pid,
-                    start_ticks: p.start_ticks,
-                    name: p.name.to_string(),
-                    cpu_percent: p.cpu_percent,
-                    nice: p.nice,
-                })
-                .collect();
-            let (readings, system_cpu) = cpu_sampler.sample(read_percpu_stats());
-            cpu_percents = readings;
-            cpu_percents.resize(utils::get_cpu_count() as usize, 0.0);
-            if let Some(total) = system_cpu {
-                avg = total;
-            }
-            let protected = protected_processes(&raw_snapshot, &launch_profiles, &manual_overrides);
-            probalance.tick(&pb_snap, pb_tick, system_cpu, &protected);
-
-            // Fire desktop notifications for newly throttled / restored PIDs
-            let cur_throttled = probalance.throttled_pids();
-            if cur_throttled != prev_throttled && config.ui.notifications_enabled {
-                // Build a name lookup from the current snapshot
-                let name_map: HashMap<u32, &str> = raw_snapshot
-                    .iter()
-                    .map(|p| (p.pid, p.name.as_ref()))
-                    .collect();
-
-                // Newly throttled
-                for &pid in cur_throttled.difference(&prev_throttled) {
-                    let name = name_map.get(&pid).copied().unwrap_or("unknown");
-                    let _ = notify_rust::Notification::new()
-                        .summary("ProBalance")
-                        .body(&format!("Throttled: {name} (PID {pid})"))
-                        .timeout(notify_rust::Timeout::Milliseconds(3000))
-                        .show();
-                }
-                // Restored
-                for &pid in prev_throttled.difference(&cur_throttled) {
-                    let name = name_map.get(&pid).copied().unwrap_or("unknown");
-                    let _ = notify_rust::Notification::new()
-                        .summary("ProBalance")
-                        .body(&format!("Restored: {name} (PID {pid})"))
-                        .timeout(notify_rust::Timeout::Milliseconds(3000))
-                        .show();
-                }
-            }
-            prev_throttled = cur_throttled;
-
-            last_pb = now;
-        }
-
-        if now.duration_since(last_sensors) >= Duration::from_secs(1) {
-            // Update hardware sensor readings
-            let extended = crate::sensor_data::read().ok();
-            hw_collector.update(extended.as_ref());
-
-            // Per-process GPU utilization (empty map without NVIDIA/NVML)
-            let gpu_util = crate::hw_monitor::collect_gpu_process_util();
-            if !gpu_util.is_empty() {
-                for p in &mut raw_snapshot {
-                    p.gpu_percent = gpu_util.get(&p.pid).copied().unwrap_or(0.0);
-                }
-            }
-
-            // Check temperature alerts
-            check_hw_alerts(
-                &hw_collector.data,
-                &config.hw_alerts,
-                config.ui.notifications_enabled,
-                &mut last_alert_times,
-                &log_cb,
-            );
-
-            // Broadcast overlay telemetry
-            let parked_cores = utils::get_offline_cpus().len() as u32;
-            let active_profile = if gaming_mode {
-                "Gaming".to_string()
-            } else {
-                "Normal".to_string()
-            };
-            let gpu_usage = hw_collector.data.get_gpu_usage();
-            let gpu_temp = hw_collector.data.get_gpu_temp();
-            let cpu_temp = hw_collector.data.get_cpu_temp();
-            let gpu_power = hw_collector.data.get_gpu_power();
-            let cpu_power = extended
-                .as_ref()
-                .and_then(|s| s.cpu_power_w)
-                .or_else(|| hw_collector.data.get_cpu_power());
-            let gpu_name = hw_collector.data.get_gpu_name();
-            let cpu_name = read_cpu_model();
-            let (ram_used, ram_total) = get_ram_info();
-            let vram_used = hw_collector.data.get_vram_usage_gb();
-            let vram_total = hw_collector.data.get_vram_total_gb();
-
-            ipc.broadcast(&argus_ipc::IpcMessage::Telemetry(
-                argus_ipc::TelemetryFrame {
-                    cpu_name,
-                    cpu_usage_percent: avg as u8,
-                    cpu_temp_c: cpu_temp,
-                    cpu_power_w: cpu_power,
-                    gpu_name,
-                    gpu_usage_percent: gpu_usage,
-                    gpu_temp_c: gpu_temp,
-                    gpu_power_w: gpu_power,
-                    gpu_core_clock_mhz: hw_collector.data.get_gpu_core_clock(),
-                    gpu_mem_clock_mhz: hw_collector.data.get_gpu_mem_clock(),
-                    gpu_fan_speed_percent: hw_collector.data.get_gpu_fan_speed(),
-                    cpu_freq_mhz: hw_collector.data.get_cpu_freq(),
-                    ram_speed_mts: extended
-                        .as_ref()
-                        .and_then(|s| s.ram_speed_mts)
-                        .or_else(get_ram_speed_mts),
-                    ram_used_gb: ram_used,
-                    ram_total_gb: ram_total,
-                    vram_used_gb: vram_used,
-                    vram_total_gb: vram_total,
-                    active_profile,
-                    game: None,
-                    launch_profiles: {
-                        launch_profiles.retain(|p| {
-                            crate::fast_proc::read_stat(p.pid, &mut [0; 1024])
-                                .is_some_and(|s| s.starttime == p.start_ticks)
-                        });
-                        launch_profiles.clone()
+                (self.log)(format!(
+                    "Config updated — ProBalance: {}  |  Notifications: {}",
+                    if self.config.probalance.enabled {
+                        "on"
+                    } else {
+                        "off"
                     },
-                    probalance_pids: probalance.throttled_pids().into_iter().collect(),
-                    parked_cores,
-                    cpus: logical_cpus(&cpu_percents),
-                    sample_unix_ms: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64,
-                    sample_interval_ms: 1000,
-                    cpu_power_status: extended
-                        .as_ref()
-                        .map(|s| s.cpu_power_status.clone())
-                        .unwrap_or_else(|| {
-                            sensor_access_status("/sys/class/powercap/intel-rapl:0/energy_uj")
-                        }),
-                    ram_speed_status: extended
-                        .as_ref()
-                        .map(|s| s.ram_speed_status.clone())
-                        .unwrap_or_else(|| sensor_access_status("/sys/firmware/dmi/tables/DMI")),
-                },
-            ));
-
-            last_sensors = now;
-        }
-
-        // ── Snapshot emit every display_refresh_interval ───────────────────
-        let refresh = Duration::from_millis(config.monitor.display_refresh_interval_ms);
-        if now.duration_since(last_snapshot) >= refresh {
-            let throttled = probalance.throttled_pids();
-            let pb_snap_for_infos: Vec<crate::probalance::ProcSnapshot> = raw_snapshot
-                .iter()
-                .map(|p| crate::probalance::ProcSnapshot {
-                    pid: p.pid,
-                    start_ticks: p.start_ticks,
-                    name: p.name.to_string(),
-                    cpu_percent: p.cpu_percent,
-                    nice: p.nice,
-                })
-                .collect();
-            let throttle_infos = probalance.throttle_infos(&pb_snap_for_infos);
-
-            if let Ok(mut s) = state.lock() {
-                s.snapshot = std::sync::Arc::new(raw_snapshot.clone());
-                s.cpu_percents = cpu_percents.clone();
-                s.cpu_generation = s.cpu_generation.wrapping_add(1);
-                s.throttled_pids = throttled;
-                s.throttle_infos = throttle_infos;
-                s.cpu_avg = avg;
-                s.cpu_history.push_back(avg);
-                while s.cpu_history.len() > 120 {
-                    s.cpu_history.pop_front();
-                }
-                // Aggregate disk/net totals for the Overview graphs
-                let (disk, net) = hw_io_totals(&hw_collector.data);
-                s.disk_io_history.push_back(disk);
-                while s.disk_io_history.len() > 120 {
-                    s.disk_io_history.pop_front();
-                }
-                s.net_io_history.push_back(net);
-                while s.net_io_history.len() > 120 {
-                    s.net_io_history.pop_front();
-                }
-                s.hw_monitor = hw_collector.data.clone();
-                // Update per-PID CPU history
-                let current_pids: std::collections::HashSet<u32> =
-                    raw_snapshot.iter().map(|p| p.pid).collect();
-                for p in &raw_snapshot {
-                    let hist = s
-                        .proc_cpu_history
-                        .entry(p.pid)
-                        .or_insert_with(|| std::collections::VecDeque::with_capacity(30));
-                    hist.push_back(p.cpu_percent);
-                    while hist.len() > 30 {
-                        hist.pop_front();
-                    }
-                }
-                s.proc_cpu_history
-                    .retain(|pid, _| current_pids.contains(pid));
+                    if self.config.ui.notifications_enabled {
+                        "on"
+                    } else {
+                        "off"
+                    },
+                ));
             }
-            last_snapshot = now;
+            DaemonCmd::SetGamingMode {
+                active,
+                elevate_nice,
+                parking,
+            } => {
+                // A requested activation whose parking fails stays off
+                // rather than half-applied.
+                let active = apply_gaming_parking(active, &parking, &self.log) && active;
+                let gaming = &mut self.gaming;
+                gaming.active = active;
+                gaming.elevate_nice = elevate_nice;
+                // A manual toggle takes ownership: the auto-detector must
+                // not later auto-disable a manually (re-)enabled mode.
+                gaming.auto = false;
+                gaming.absent_snapshots = 0;
+                if !active && !gaming.niced.is_empty() {
+                    restore_gaming_nices(&mut gaming.niced, &self.log);
+                }
+                publish_gaming_state(&self.state, active);
+            }
+            DaemonCmd::SetManualOverride { pid, duration_secs } => {
+                self.manual_overrides
+                    .insert(pid, Instant::now() + Duration::from_secs_f64(duration_secs));
+            }
+            DaemonCmd::ResetAffinities => {
+                reset_all_affinities(&mut self.original_affinities, &self.log);
+            }
+            DaemonCmd::ReapplyDefaults => {
+                // Rules may have changed — failed nice attempts get a fresh
+                // chance (an edited rule can now have an achievable nice).
+                self.enforce_nice_failed.clear();
+                reapply_defaults(&self.config, &self.rule_engine, &self.known_pids, &self.log);
+            }
+            DaemonCmd::Shutdown => {
+                self.shutdown();
+                // Stop the loop entirely: if it kept running, the very
+                // next ProBalance/auto-gaming tick could re-throttle or
+                // re-park in the window before process exit — and a
+                // cgroup re-throttle would outlive us until logout,
+                // since nothing would ever restore it.
+                return std::ops::ControlFlow::Break(());
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn shutdown(&mut self) {
+        (self.log)("[Shutdown] Restoring system state…".into());
+        if !self.gaming.niced.is_empty() {
+            restore_gaming_nices(&mut self.gaming.niced, &self.log);
+        }
+        self.probalance.shutdown();
+        if !utils::get_offline_cpus().is_empty() {
+            cpu_park::unpark_all(&self.log);
+        }
+        if let Ok(mut s) = self.state.lock() {
+            s.shutdown_complete = true;
+        }
+    }
+
+    /// Collect a process snapshot and act on what changed: dead PIDs are
+    /// forgotten, new ones get rules or the default affinity, and the game
+    /// detector runs.
+    fn refresh_snapshot(&mut self, now: Instant, display_due: bool) {
+        // Affinity, I/O priority and disk rates are rendered by the process
+        // table and nothing else, so only pay for them on the pass that will
+        // actually be published.
+        let detail = display_due;
+        let io_elapsed = if detail {
+            let e = now.duration_since(self.last_io_sample).as_secs_f32();
+            self.last_io_sample = now;
+            e
+        } else {
+            0.0
+        };
+        let (new_cpu_times, sys_total) = collect_snapshot(
+            &mut self.raw_snapshot,
+            &mut self.prev_cpu_times,
+            self.prev_sys_total,
+            &mut self.caches,
+            detail,
+            io_elapsed,
+        );
+        self.prev_cpu_times = new_cpu_times;
+        self.prev_sys_total = sys_total;
+
+        let current_pids: HashSet<u32> = self.raw_snapshot.iter().map(|p| p.pid).collect();
+        self.prune_dead(&current_pids);
+
+        // ── New PIDs: apply rules or default affinity ───────────────────
+        for proc in self
+            .raw_snapshot
+            .iter()
+            .filter(|p| !self.known_pids.contains(&p.pid))
+        {
+            apply_new_pid(
+                proc,
+                &self.config,
+                &self.rule_engine,
+                &mut self.original_affinities,
+                &mut self.gaming,
+                &self.log,
+            );
+        }
+        if self.first_snapshot {
+            (self.log)(format!(
+                "Initial scan: {} processes found.",
+                self.raw_snapshot.len()
+            ));
+            self.first_snapshot = false;
+        }
+        self.known_pids = current_pids;
+
+        if self.config.gaming_mode.auto_detect {
+            self.detect_game();
+        }
+    }
+
+    /// Prune dead PIDs from per-PID maps: avoids unbounded growth, and — for
+    /// the Gaming Mode nices — stops a reused PID from getting an unrelated
+    /// process's nice restored onto it when Gaming Mode is disabled.
+    ///
+    /// Those additionally key on start_ticks, not just pid liveness:
+    /// current_pids.contains(pid) is true again the instant a dead pid is
+    /// reused by an unrelated process, which — within one scan interval —
+    /// could otherwise inherit the previous occupant's nice-restore entry.
+    /// Two processes can't share a start time, so comparing it catches reuse
+    /// that a liveness check alone would miss.
+    fn prune_dead(&mut self, current_pids: &HashSet<u32>) {
+        self.original_affinities
+            .retain(|pid, _| current_pids.contains(pid));
+        let niced = &mut self.gaming.niced;
+        if !niced.is_empty() {
+            let live_start_ticks: HashMap<u32, u64> = self
+                .raw_snapshot
+                .iter()
+                .filter(|p| niced.contains_key(&p.pid))
+                .map(|p| (p.pid, p.start_ticks))
+                .collect();
+            niced.retain(|pid, entry| live_start_ticks.get(pid).copied() == Some(entry.0));
+        }
+        self.caches.retain_live(current_pids);
+        self.enforce_nice_failed
+            .retain(|(_, pid)| current_pids.contains(pid));
+    }
+
+    /// Auto Gaming Mode (Steam/Proton detection).
+    fn detect_game(&mut self) {
+        let game = self.raw_snapshot.iter().find(|p| is_game_process(p));
+        let gaming = &mut self.gaming;
+        if let Some(game) = game {
+            gaming.absent_snapshots = 0;
+            if !gaming.active {
+                gaming.active = true;
+                gaming.elevate_nice = true;
+                gaming.auto = true;
+                (self.log)(format!(
+                    "[Gaming Mode] Auto-enabled — game detected: {} ({})",
+                    game.name, game.pid
+                ));
+                // Detection turns Gaming Mode on even if parking fails:
+                // the priority boost still applies.
+                if self.config.gaming_mode.auto_park {
+                    apply_gaming_parking(true, &Parking::NonPreferred, &self.log);
+                }
+                publish_gaming_state(&self.state, true);
+            }
+        } else if gaming.auto && gaming.active {
+            // Require a couple of game-free snapshots before restoring,
+            // so a brief exec/restart doesn't bounce the CPUs.
+            gaming.absent_snapshots += 1;
+            if gaming.absent_snapshots >= 2 {
+                gaming.active = false;
+                gaming.auto = false;
+                gaming.absent_snapshots = 0;
+                (self.log)("[Gaming Mode] Auto-disabled — game exited.".into());
+                if !gaming.niced.is_empty() {
+                    restore_gaming_nices(&mut gaming.niced, &self.log);
+                }
+                if self.config.gaming_mode.auto_park {
+                    apply_gaming_parking(false, &Parking::Keep, &self.log);
+                }
+                publish_gaming_state(&self.state, false);
+            }
+        }
+    }
+
+    fn enforce_rules(&mut self, now: Instant) {
+        // Expire stale manual overrides
+        self.manual_overrides.retain(|_, exp| *exp > now);
+        // Clone the rules and enforce WITHOUT holding the engine lock:
+        // enforcement does procfs reads and renice/ionice subprocess spawns
+        // per process, and the GUI thread locks the same engine to edit
+        // rules — holding it here would freeze the UI for the whole pass.
+        let rules: Vec<crate::rules::Rule> = self
+            .rule_engine
+            .lock()
+            .map(|re| re.get_rules().to_vec())
+            .unwrap_or_default();
+        if !rules.is_empty() {
+            for proc in &self.raw_snapshot {
+                if self.manual_overrides.contains_key(&proc.pid) {
+                    continue;
+                }
+                crate::rules::apply_rules(
+                    &rules,
+                    proc.pid,
+                    &proc.name,
+                    Some(proc.nice),
+                    crate::utils::get_ionice_raw(proc.pid), // Could be cached, but only queried if rule matches
+                    &mut self.enforce_nice_failed,
+                    &self.log,
+                );
+            }
+        }
+        self.last_enforce = now;
+    }
+
+    fn tick_probalance(&mut self, now: Instant) {
+        let pb_tick = now.duration_since(self.last_pb_tick).as_secs_f32();
+        self.last_pb_tick = now;
+        let pb_snap = probalance_snapshot(&self.raw_snapshot);
+        let (readings, system_cpu) = self.cpu_sampler.sample(read_percpu_stats());
+        self.cpu_percents = readings;
+        self.cpu_percents
+            .resize(utils::get_cpu_count() as usize, 0.0);
+        if let Some(total) = system_cpu {
+            self.avg = total;
+        }
+        let protected = protected_processes(
+            &self.raw_snapshot,
+            &self.gaming.launch_profiles,
+            &self.manual_overrides,
+        );
+        self.probalance
+            .tick(&pb_snap, pb_tick, system_cpu, &protected);
+        self.notify_throttle_changes();
+        self.last_pb = now;
+    }
+
+    /// Desktop notifications for newly throttled / restored PIDs.
+    fn notify_throttle_changes(&mut self) {
+        let cur_throttled = self.probalance.throttled_pids();
+        if cur_throttled != self.prev_throttled && self.config.ui.notifications_enabled {
+            // Build a name lookup from the current snapshot
+            let name_map: HashMap<u32, &str> = self
+                .raw_snapshot
+                .iter()
+                .map(|p| (p.pid, p.name.as_ref()))
+                .collect();
+            let notify = |verb: &str, pid: u32| {
+                let name = name_map.get(&pid).copied().unwrap_or("unknown");
+                let _ = notify_rust::Notification::new()
+                    .summary("ProBalance")
+                    .body(&format!("{verb}: {name} (PID {pid})"))
+                    .timeout(notify_rust::Timeout::Milliseconds(3000))
+                    .show();
+            };
+            for &pid in cur_throttled.difference(&self.prev_throttled) {
+                notify("Throttled", pid);
+            }
+            for &pid in self.prev_throttled.difference(&cur_throttled) {
+                notify("Restored", pid);
+            }
+        }
+        self.prev_throttled = cur_throttled;
+    }
+
+    fn update_sensors(&mut self, now: Instant) {
+        // Update hardware sensor readings
+        let extended = crate::sensor_data::read().ok();
+        self.hw_collector.update(extended.as_ref());
+
+        // Per-process GPU utilization (empty map without NVIDIA/NVML)
+        let gpu_util = crate::hw_monitor::collect_gpu_process_util();
+        if !gpu_util.is_empty() {
+            for p in &mut self.raw_snapshot {
+                p.gpu_percent = gpu_util.get(&p.pid).copied().unwrap_or(0.0);
+            }
         }
 
-        // Sleep no longer than the enforcement interval so a sub-500ms
-        // rule_enforce_interval_ms is honoured instead of silently ignored.
-        let tick = enforce_interval.clamp(Duration::from_millis(50), Duration::from_millis(500));
-        std::thread::sleep(tick);
+        // Check temperature alerts
+        check_hw_alerts(
+            &self.hw_collector.data,
+            &self.config.hw_alerts,
+            self.config.ui.notifications_enabled,
+            &mut self.last_alert_times,
+            &self.log,
+        );
+
+        self.broadcast_telemetry(extended.as_ref());
+        self.last_sensors = now;
+    }
+
+    /// Send the overlay its telemetry frame.
+    fn broadcast_telemetry(&mut self, extended: Option<&crate::sensor_data::ExtendedSensors>) {
+        let hw = &self.hw_collector.data;
+        let parked_cores = utils::get_offline_cpus().len() as u32;
+        let active_profile = if self.gaming.active {
+            "Gaming".to_string()
+        } else {
+            "Normal".to_string()
+        };
+        let gpu_usage = hw.get_gpu_usage();
+        let gpu_temp = hw.get_gpu_temp();
+        let cpu_temp = hw.get_cpu_temp();
+        let gpu_power = hw.get_gpu_power();
+        let cpu_power = extended
+            .and_then(|s| s.cpu_power_w)
+            .or_else(|| hw.get_cpu_power());
+        let gpu_name = hw.get_gpu_name();
+        let cpu_name = read_cpu_model();
+        let (ram_used, ram_total) = get_ram_info();
+        let vram_used = hw.get_vram_usage_gb();
+        let vram_total = hw.get_vram_total_gb();
+
+        self.ipc.broadcast(&argus_ipc::IpcMessage::Telemetry(
+            argus_ipc::TelemetryFrame {
+                cpu_name,
+                cpu_usage_percent: self.avg as u8,
+                cpu_temp_c: cpu_temp,
+                cpu_power_w: cpu_power,
+                gpu_name,
+                gpu_usage_percent: gpu_usage,
+                gpu_temp_c: gpu_temp,
+                gpu_power_w: gpu_power,
+                gpu_core_clock_mhz: hw.get_gpu_core_clock(),
+                gpu_mem_clock_mhz: hw.get_gpu_mem_clock(),
+                gpu_fan_speed_percent: hw.get_gpu_fan_speed(),
+                cpu_freq_mhz: hw.get_cpu_freq(),
+                ram_speed_mts: extended
+                    .and_then(|s| s.ram_speed_mts)
+                    .or_else(get_ram_speed_mts),
+                ram_used_gb: ram_used,
+                ram_total_gb: ram_total,
+                vram_used_gb: vram_used,
+                vram_total_gb: vram_total,
+                active_profile,
+                game: None,
+                launch_profiles: {
+                    self.gaming.launch_profiles.retain(|p| {
+                        crate::fast_proc::read_stat(p.pid, &mut [0; 1024])
+                            .is_some_and(|s| s.starttime == p.start_ticks)
+                    });
+                    self.gaming.launch_profiles.clone()
+                },
+                probalance_pids: self.probalance.throttled_pids().into_iter().collect(),
+                parked_cores,
+                cpus: logical_cpus(&self.cpu_percents),
+                sample_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                sample_interval_ms: 1000,
+                cpu_power_status: extended.map(|s| s.cpu_power_status.clone()).unwrap_or_else(
+                    || sensor_access_status("/sys/class/powercap/intel-rapl:0/energy_uj"),
+                ),
+                ram_speed_status: extended
+                    .map(|s| s.ram_speed_status.clone())
+                    .unwrap_or_else(|| sensor_access_status("/sys/firmware/dmi/tables/DMI")),
+            },
+        ));
+    }
+
+    /// Hand the GUI this pass's snapshot and histories.
+    fn publish(&mut self, now: Instant) {
+        let throttled = self.probalance.throttled_pids();
+        let throttle_infos = self
+            .probalance
+            .throttle_infos(&probalance_snapshot(&self.raw_snapshot));
+
+        if let Ok(mut s) = self.state.lock() {
+            s.snapshot = std::sync::Arc::new(self.raw_snapshot.clone());
+            s.cpu_percents = self.cpu_percents.clone();
+            s.cpu_generation = s.cpu_generation.wrapping_add(1);
+            s.throttled_pids = throttled;
+            s.throttle_infos = throttle_infos;
+            s.cpu_avg = self.avg;
+            push_capped(&mut s.cpu_history, self.avg, 120);
+            // Aggregate disk/net totals for the Overview graphs
+            let (disk, net) = hw_io_totals(&self.hw_collector.data);
+            push_capped(&mut s.disk_io_history, disk, 120);
+            push_capped(&mut s.net_io_history, net, 120);
+            s.hw_monitor = self.hw_collector.data.clone();
+            // Update per-PID CPU history
+            let current_pids: HashSet<u32> = self.raw_snapshot.iter().map(|p| p.pid).collect();
+            for p in &self.raw_snapshot {
+                let hist = s
+                    .proc_cpu_history
+                    .entry(p.pid)
+                    .or_insert_with(|| std::collections::VecDeque::with_capacity(30));
+                push_capped(hist, p.cpu_percent, 30);
+            }
+            s.proc_cpu_history
+                .retain(|pid, _| current_pids.contains(pid));
+        }
+        self.last_snapshot = now;
+    }
+}
+
+fn probalance_snapshot(snapshot: &[ProcInfo]) -> Vec<ProcSnapshot> {
+    snapshot
+        .iter()
+        .map(|p| ProcSnapshot {
+            pid: p.pid,
+            start_ticks: p.start_ticks,
+            name: p.name.to_string(),
+            cpu_percent: p.cpu_percent,
+            nice: p.nice,
+        })
+        .collect()
+}
+
+/// Append to a bounded history, dropping the oldest entries.
+fn push_capped<T>(history: &mut std::collections::VecDeque<T>, value: T, cap: usize) {
+    history.push_back(value);
+    while history.len() > cap {
+        history.pop_front();
     }
 }
 
@@ -1582,15 +1679,12 @@ fn read_ionice(pid: u32) -> String {
 
 // ── New PID handling ──────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 fn apply_new_pid(
     proc: &ProcInfo,
     config: &Config,
     rule_engine: &Arc<Mutex<RuleEngine>>,
     original_affinities: &mut HashMap<u32, HashSet<u32>>,
-    gaming_mode: bool,
-    gaming_elevate_nice: bool,
-    gaming_niced: &mut HashMap<u32, (u64, i32)>,
+    gaming: &mut GamingState,
     log_cb: &impl Fn(String),
 ) {
     let pid = proc.pid;
@@ -1610,10 +1704,10 @@ fn apply_new_pid(
 
     if matched {
         // Rule matched — if gaming mode + elevate_nice, apply nice -1 and pin to preferred cores
-        if gaming_mode && gaming_elevate_nice && !gaming_niced.contains_key(&pid) {
+        if gaming.active && gaming.elevate_nice && !gaming.niced.contains_key(&pid) {
             let orig_nice = proc.nice;
             if cpu_park::set_process_nice_via_helper(pid, proc.start_ticks, -1) {
-                gaming_niced.insert(pid, (proc.start_ticks, orig_nice));
+                gaming.niced.insert(pid, (proc.start_ticks, orig_nice));
                 log_cb(format!("[Gaming Mode] nice -1 → {}({})", proc.name, pid));
             }
             // Pin game process to preferred cores (P-cores / V-Cache CCD)
