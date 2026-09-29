@@ -215,14 +215,39 @@ pub struct GamingModeConfig {
 
 // ── Rule (stored inline in config) ───────────────────────────────────────────
 
+/// How a rule's pattern is compared with a process name. Stored as the same
+/// lowercase words the field always held; anything else is now a parse error
+/// instead of silently meaning "contains".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchType {
+    /// Case-insensitive substring.
+    #[default]
+    Contains,
+    /// The whole name, case-sensitive.
+    Exact,
+    Regex,
+}
+
+impl MatchType {
+    pub const ALL: [MatchType; 3] = [MatchType::Contains, MatchType::Exact, MatchType::Regex];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MatchType::Contains => "contains",
+            MatchType::Exact => "exact",
+            MatchType::Regex => "regex",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RuleConfig {
     pub rule_id: String,
     pub name: String,
     pub pattern: String,
-    /// "contains" | "exact" | "regex"
-    pub match_type: String,
+    pub match_type: MatchType,
     pub affinity: Option<String>,
     pub nice: Option<i32>,
     pub ionice_class: Option<i32>,
@@ -236,7 +261,7 @@ impl Default for RuleConfig {
             rule_id: uuid::Uuid::new_v4().to_string(),
             name: String::new(),
             pattern: String::new(),
-            match_type: "contains".into(),
+            match_type: MatchType::Contains,
             affinity: None,
             nice: None,
             ionice_class: None,
@@ -424,6 +449,32 @@ pub(crate) fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Res
 
 #[cfg(test)]
 mod tests {
+    /// The words older versions wrote still parse, and are written back
+    /// unchanged, so rolling back to an older version keeps its rules.
+    #[test]
+    fn match_types_keep_their_stored_words() {
+        for (word, kind) in [
+            ("contains", MatchType::Contains),
+            ("exact", MatchType::Exact),
+            ("regex", MatchType::Regex),
+        ] {
+            let text = format!("pattern = \"game\"\nmatch_type = \"{word}\"\n");
+            let rule: RuleConfig = toml::from_str(&text).unwrap();
+            assert_eq!(rule.match_type, kind);
+            assert!(toml::to_string(&rule)
+                .unwrap()
+                .contains(&format!("match_type = \"{word}\"")));
+        }
+    }
+
+    /// An unknown match type used to fall through to "contains" without a
+    /// word; a rule meant as a regex then matched as a substring.
+    #[test]
+    fn an_unknown_match_type_is_an_error() {
+        let err = toml::from_str::<RuleConfig>("match_type = \"regx\"\n").unwrap_err();
+        assert!(err.to_string().contains("regx"), "{err}");
+    }
+
     /// One unparseable value used to mean defaults in memory and, on the
     /// next save, every rule and profile gone from disk.
     #[test]
@@ -498,7 +549,7 @@ mod tests {
         cfg.rules = vec![RuleConfig {
             name: "Steam → V-Cache".into(),
             pattern: "steam".into(),
-            match_type: "contains".into(),
+            match_type: MatchType::Contains,
             affinity: Some("0-7".into()),
             nice: Some(-5),
             ..Default::default()

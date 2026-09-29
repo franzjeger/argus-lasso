@@ -130,7 +130,7 @@ impl ActionHandler {
                 let mut rule = crate::rules::Rule::new_empty();
                 rule.name = name.clone();
                 rule.pattern = name;
-                rule.match_type = "contains".into();
+                rule.match_type = crate::config::MatchType::Contains;
                 *trigger_rules_tab = Some(rule);
             }
             TableAction::ShowDetails { pid } => {

@@ -147,6 +147,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Changed
 
+- A rule's match type is a closed set (contains, exact, regex) stored as the same
+  words as before. An unknown value is reported instead of silently matching as
+  "contains"; an imported rule file with one names it in the error.
+
 - Documentation reconciled with current source: release/source distinction,
   updater signing and restart behavior, cgroup defaults/restoration limits,
   dated validation evidence and refreshed main-page screenshots.

@@ -305,7 +305,7 @@ impl RulesTab {
                                         ui.label(RichText::new(&rule.pattern).color(row_color));
                                     });
                                     let (_, r3) = row.col(|ui| {
-                                        theme::badge_outline(ui, &rule.match_type);
+                                        theme::badge_outline(ui, rule.match_type.as_str());
                                     });
                                     let (_, r4) = row.col(|ui| {
                                         ui.label(

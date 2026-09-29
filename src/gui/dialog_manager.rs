@@ -235,7 +235,7 @@ impl DialogManager {
                 let mut rule = crate::rules::Rule::new_empty();
                 rule.name = offer.proc_name.clone();
                 rule.pattern = offer.proc_name.clone();
-                rule.match_type = "exact".into();
+                rule.match_type = crate::config::MatchType::Exact;
                 rule.affinity = offer.affinity;
                 rule.nice = offer.nice;
                 rule.ionice_class = offer.ionice.map(|(c, _)| c);

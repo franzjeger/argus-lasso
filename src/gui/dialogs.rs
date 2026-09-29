@@ -4,6 +4,7 @@
 use egui::{Context, Ui, ViewportBuilder, ViewportId};
 use std::collections::HashSet;
 
+use crate::config::MatchType;
 use crate::cpu_park::{detect_topology, get_smt_siblings_of};
 use crate::gui::theme::Breeze;
 use crate::rules::Rule;
@@ -869,14 +870,14 @@ impl RuleEditDialog {
                             // question on its own row.
                             th::form_row_w(ui, LW, "Pattern", |ui| {
                                 egui::ComboBox::from_id_salt("match_type")
-                                    .selected_text(&rule.match_type)
+                                    .selected_text(rule.match_type.as_str())
                                     .width(90.0)
                                     .show_ui(ui, |ui| {
-                                        for mt in ["contains", "exact", "regex"] {
+                                        for mt in MatchType::ALL {
                                             ui.selectable_value(
                                                 &mut rule.match_type,
-                                                mt.to_string(),
                                                 mt,
+                                                mt.as_str(),
                                             );
                                         }
                                     });
@@ -1068,7 +1069,7 @@ fn match_summary(
 pub type RulePreset = (
     &'static str,
     &'static str,
-    &'static str,
+    MatchType,
     Option<String>,
     Option<i32>,
     Option<i32>,
@@ -1090,7 +1091,7 @@ pub fn rule_presets() -> Vec<RulePreset> {
         (
             "Steam (preferred)",
             "steam",
-            "exact",
+            MatchType::Exact,
             pref.clone(),
             None,
             None,
@@ -1099,7 +1100,7 @@ pub fn rule_presets() -> Vec<RulePreset> {
         (
             "steamwebhelper",
             "steamwebhelper",
-            "exact",
+            MatchType::Exact,
             pref.clone(),
             Some(5),
             None,
@@ -1108,7 +1109,7 @@ pub fn rule_presets() -> Vec<RulePreset> {
         (
             "Wine / Proton",
             "wine",
-            "contains",
+            MatchType::Contains,
             pref.clone(),
             None,
             None,
@@ -1117,7 +1118,7 @@ pub fn rule_presets() -> Vec<RulePreset> {
         (
             "Proton",
             "proton",
-            "contains",
+            MatchType::Contains,
             pref.clone(),
             None,
             None,
@@ -1126,7 +1127,7 @@ pub fn rule_presets() -> Vec<RulePreset> {
         (
             "OBS Studio",
             "obs",
-            "exact",
+            MatchType::Exact,
             pref.clone(),
             Some(-1),
             None,
@@ -1135,7 +1136,7 @@ pub fn rule_presets() -> Vec<RulePreset> {
         (
             "Discord",
             "discord",
-            "contains",
+            MatchType::Contains,
             npref.clone(),
             Some(5),
             None,
@@ -1144,7 +1145,7 @@ pub fn rule_presets() -> Vec<RulePreset> {
         (
             "Firefox",
             "firefox",
-            "contains",
+            MatchType::Contains,
             npref.clone(),
             None,
             None,
@@ -1153,17 +1154,17 @@ pub fn rule_presets() -> Vec<RulePreset> {
         (
             "Chromium / Chrome",
             "chrom",
-            "contains",
+            MatchType::Contains,
             npref.clone(),
             None,
             None,
             None,
         ),
-        ("KWin", "kwin", "contains", None, None, None, None),
+        ("KWin", "kwin", MatchType::Contains, None, None, None, None),
         (
             "Plasma Shell",
             "plasmashell",
-            "exact",
+            MatchType::Exact,
             npref.clone(),
             Some(5),
             None,
@@ -1172,7 +1173,7 @@ pub fn rule_presets() -> Vec<RulePreset> {
         (
             "Compiler (gcc/clang)",
             "gcc",
-            "contains",
+            MatchType::Contains,
             None,
             None,
             Some(2),
@@ -1181,7 +1182,7 @@ pub fn rule_presets() -> Vec<RulePreset> {
         (
             "Archive / compress",
             "7z",
-            "contains",
+            MatchType::Contains,
             npref.clone(),
             Some(10),
             Some(3),
@@ -1358,7 +1359,12 @@ impl RulePresetsDialog {
                                 };
                                 let resp = draw_row(
                                     ui,
-                                    [name, pat, match_type, aff.as_deref().unwrap_or("—")],
+                                    [
+                                        name,
+                                        pat,
+                                        match_type.as_str(),
+                                        aff.as_deref().unwrap_or("—"),
+                                    ],
                                     Some(bg),
                                     false,
                                 );
@@ -1385,7 +1391,7 @@ impl RulePresetsDialog {
                     let mut rule = Rule::new_empty();
                     rule.name = name.to_string();
                     rule.pattern = pat.to_string();
-                    rule.match_type = match_type.to_string();
+                    rule.match_type = match_type;
                     rule.affinity = aff.clone();
                     rule.nice = nice;
                     rule.ionice_class = ioc;
