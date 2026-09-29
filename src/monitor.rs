@@ -37,7 +37,10 @@ pub enum Parking {
 
 #[derive(Debug)]
 pub enum DaemonCmd {
-    UpdateConfig(Box<Config>),
+    /// `AppState::config` changed. It is the one authoritative copy: writers
+    /// change it under the lock and send this, and this thread re-reads it
+    /// instead of trusting a copy that may already be stale.
+    ConfigChanged,
     /// Persist the latest shared configuration on the monitor thread.
     SaveConfig,
     GameLaunched {
@@ -672,9 +675,9 @@ fn run_loop(
             ));
             // Merge just the field this toggle actually changed into shared
             // state, not the whole Config: `config` here is this loop's own
-            // mirror, refreshed only by DaemonCmd::UpdateConfig, so it can't
+            // mirror, refreshed only by DaemonCmd::ConfigChanged, so it can't
             // see GUI-only fields (column widths, rules, opacity/theme) the
-            // GUI thread writes directly into s.config between UpdateConfig
+            // GUI thread writes directly into s.config between ConfigChanged
             // calls. Overwriting the whole struct raced those writes and
             // could silently discard them — including, in the rules case, a
             // user's just-edited rule definitions on the next config save.
@@ -702,8 +705,10 @@ fn run_loop(
                         });
                     }
                 }
-                DaemonCmd::UpdateConfig(cfg) => {
-                    let cfg = state.lock().map(|s| s.config.clone()).unwrap_or(*cfg);
+                DaemonCmd::ConfigChanged => {
+                    let Ok(cfg) = state.lock().map(|s| s.config.clone()) else {
+                        continue;
+                    };
                     probalance.update_config(cfg.probalance.clone());
                     config = cfg.clone();
                     ipc.broadcast(&argus_ipc::IpcMessage::Config(

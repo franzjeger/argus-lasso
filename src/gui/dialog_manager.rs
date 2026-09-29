@@ -3,7 +3,6 @@ use eframe::egui;
 use egui::Context;
 use std::sync::{Arc, Mutex};
 
-use crate::config;
 use crate::gui::dialogs::{AffinityDialog, IoNiceDialog, NiceDialog};
 use crate::monitor::{AppState, DaemonCmd, ProcInfo};
 use crate::process_control::ProcessHandle;
@@ -247,28 +246,17 @@ impl DialogManager {
                 } else {
                     Vec::new()
                 };
-                let cfg = if let Ok(mut s) = state.lock() {
+                if let Ok(mut s) = state.lock() {
                     s.config.rules = rules_cfg;
                     s.append_log(format!(
                         "[Rule] Created rule for '{}' from manual change",
                         offer.proc_name
                     ));
-                    Some(s.config.clone())
-                } else {
-                    None
-                };
-
-                if let Some(cfg) = cfg {
-                    if let Err(e) = config::save(&cfg) {
-                        log::warn!("Failed to save rule to disk: {e}");
-                        if let Ok(mut s) = state.lock() {
-                            s.append_log(format!(
-                                "[Rule] Failed to save '{}' to disk: {e}",
-                                offer.proc_name
-                            ));
-                        }
-                    }
                 }
+                // The daemon is the only config writer; saving here too
+                // raced its writes, and a save failure went only to the log.
+                let _ = cmd_tx.send(DaemonCmd::ConfigChanged);
+                let _ = cmd_tx.send(DaemonCmd::SaveConfig);
                 let _ = cmd_tx.send(DaemonCmd::ReapplyDefaults);
             } else if dismiss {
                 self.rule_offer = None;

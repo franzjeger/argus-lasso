@@ -304,6 +304,16 @@ impl ArgusLassoApp {
         self.send(DaemonCmd::SaveConfig);
     }
 
+    /// Change the shared configuration and tell the daemon. The shared copy
+    /// is the only authoritative one; editing it in place under the lock is
+    /// what keeps concurrent edits of other fields from being overwritten.
+    fn update_config(&self, change: impl FnOnce(&mut Config)) {
+        if let Ok(mut s) = self.state.lock() {
+            change(&mut s.config);
+        }
+        self.send(DaemonCmd::ConfigChanged);
+    }
+
     /// Put the UI into the state the current tour step documents.
     ///
     /// Re-applied every frame rather than once on entry: the dialogs close
@@ -469,24 +479,17 @@ impl eframe::App for ArgusLassoApp {
                     }
                 }
                 GamingEvent::ConfigChanged(cfg) => {
-                    let mut updated = *cfg;
-                    if let Ok(mut s) = self.state.lock() {
-                        s.config.gaming_mode = updated.gaming_mode;
-                        s.config.ui.global_overlay = updated.ui.global_overlay;
-                        updated = s.config.clone();
-                    }
-                    self.send(DaemonCmd::UpdateConfig(Box::new(updated)));
+                    self.update_config(|c| {
+                        c.gaming_mode = cfg.gaming_mode;
+                        c.ui.global_overlay = cfg.ui.global_overlay;
+                    });
                     self.save_config();
                 }
             }
         }
         if self.gaming_mode_tab.overlay_window(ctx, self.opacity) {
-            let mut config = self.gaming_mode_tab.config.clone();
-            if let Ok(mut s) = self.state.lock() {
-                s.config.gaming_mode.overlay = config.gaming_mode.overlay;
-                config = s.config.clone();
-            }
-            self.send(DaemonCmd::UpdateConfig(Box::new(config)));
+            let overlay = self.gaming_mode_tab.config.gaming_mode.overlay.clone();
+            self.update_config(|c| c.gaming_mode.overlay = overlay);
             self.save_config();
         }
         // --ui-tour drives the UI from a script rather than from the user.
@@ -1158,43 +1161,22 @@ impl eframe::App for ArgusLassoApp {
                             .lock()
                             .map(|re| re.to_config_list())
                             .unwrap_or_default();
-                        // ReapplyDefaults alone doesn't touch the daemon's
-                        // own config mirror (it only re-runs the shared
-                        // RuleEngine against known PIDs) — without also
-                        // sending UpdateConfig, a later CLI overlay toggle
-                        // merging that stale mirror into shared state could
-                        // permanently discard the user's just-edited rules
-                        // the next time anything calls save_config().
-                        let full = self.state.lock().ok().map(|mut s| {
-                            s.config.rules = rules_cfg;
-                            s.config.clone()
-                        });
-                        if let Some(full) = full {
-                            self.send(DaemonCmd::UpdateConfig(Box::new(full)));
-                        }
+                        // ReapplyDefaults alone only re-runs the shared
+                        // RuleEngine against known PIDs; the daemon's config
+                        // mirror learns about the rules from ConfigChanged.
+                        self.update_config(|c| c.rules = rules_cfg);
                         self.send(DaemonCmd::ReapplyDefaults);
                         self.save_config();
                     }
                     if profiles_changed {
-                        let full = self.state.lock().ok().map(|mut s| {
-                            s.config.rule_profiles = rule_profiles;
-                            s.config.clone()
-                        });
-                        if let Some(full) = full {
-                            self.send(DaemonCmd::UpdateConfig(Box::new(full)));
-                        }
+                        self.update_config(|c| c.rule_profiles = rule_profiles);
                         self.save_config();
                     }
                 }
 
                 Tab::ProBalance => {
                     if let Some(pb_cfg) = self.probalance_tab.show(ui, &snapshot, &throttle_infos, cpu_avg) {
-                        if let Ok(mut s) = self.state.lock() {
-                            s.config.probalance = pb_cfg.clone();
-                        }
-                        let mut updated = config.clone();
-                        updated.probalance = pb_cfg;
-                        self.send(DaemonCmd::UpdateConfig(Box::new(updated)));
+                        self.update_config(|c| c.probalance = pb_cfg);
                         self.save_config();
                     }
                 }
@@ -1246,17 +1228,16 @@ impl eframe::App for ArgusLassoApp {
                         }
                     }
 
-                    if let Some(mut updated) = config_changed {
-                        if let Ok(mut s) = self.state.lock() {
-                            s.config.cpu.default_affinity = updated.cpu.default_affinity;
-                            s.config.monitor = updated.monitor;
-                            s.config.hw_alerts = updated.hw_alerts;
-                            s.config.ui.notifications_enabled = updated.ui.notifications_enabled;
-                            s.config.ui.check_updates_on_start = updated.ui.check_updates_on_start;
-                            s.config.ui.theme = updated.ui.theme;
-                            s.config.ui.opacity = updated.ui.opacity;
-                            updated = s.config.clone();
-                        }
+                    if let Some(updated) = config_changed {
+                        self.update_config(|c| {
+                            c.cpu.default_affinity = updated.cpu.default_affinity;
+                            c.monitor = updated.monitor;
+                            c.hw_alerts = updated.hw_alerts;
+                            c.ui.notifications_enabled = updated.ui.notifications_enabled;
+                            c.ui.check_updates_on_start = updated.ui.check_updates_on_start;
+                            c.ui.theme = updated.ui.theme;
+                            c.ui.opacity = updated.ui.opacity;
+                        });
                         // Re-apply full theme (resets window_fill to opaque if needed)
                         crate::gui::theme::apply_theme(
                             ctx,
@@ -1267,7 +1248,6 @@ impl eframe::App for ArgusLassoApp {
                         if let Some(ref wo) = self.wayland_opacity {
                             wo.set(self.opacity);
                         }
-                        self.send(DaemonCmd::UpdateConfig(Box::new(updated.clone())));
                         self.send(DaemonCmd::ReapplyDefaults);
                         self.last_saved_opacity = self.settings_tab.opacity;
                         self.last_saved_theme = self.settings_tab.theme.to_str().to_string();
@@ -1282,20 +1262,13 @@ impl eframe::App for ArgusLassoApp {
                     {
                         self.last_saved_opacity = cur_opacity;
                         self.last_saved_theme = cur_theme.clone();
-                        // Re-lock-and-clone the same way the Apply handler
-                        // above does, then send UpdateConfig: without this,
-                        // the daemon's own config mirror never learns about
-                        // the change, and a later CLI overlay toggle merging
-                        // its stale mirror back into shared state (see
-                        // run_loop) would have nothing to preserve it with.
-                        let full = self.state.lock().ok().map(|mut s| {
-                            s.config.ui.opacity = cur_opacity;
-                            s.config.ui.theme = cur_theme;
-                            s.config.clone()
+                        // Through update_config like the Apply handler above:
+                        // without ConfigChanged the daemon's own config
+                        // mirror never learns about the change.
+                        self.update_config(|c| {
+                            c.ui.opacity = cur_opacity;
+                            c.ui.theme = cur_theme;
                         });
-                        if let Some(full) = full {
-                            self.send(DaemonCmd::UpdateConfig(Box::new(full)));
-                        }
                         // Same 300ms debounce as column-width dragging:
                         // egui reports a changed value on every frame of a
                         // slider drag, so saving unconditionally here would
