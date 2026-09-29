@@ -82,6 +82,11 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Recording files are read only if they are regular files, opened without
   blocking: a FIFO left in their place by a game no longer hangs the recordings
   list for good. The recording control file is read with a size cap.
+- Gaming Mode has one owner, the background service: the Gaming page and the tray
+  ask it, and the page shows its state. Enabling from the tray no longer leaves
+  the page reporting "off" while CPUs are parked, parking no longer freezes the
+  window, and it takes one authorization instead of one per CPU. Activation whose
+  parking fails brings every CPU back online and stays off.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

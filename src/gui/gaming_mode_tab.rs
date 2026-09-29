@@ -6,16 +6,24 @@ use std::collections::{HashMap, HashSet};
 use crate::config::{Config, GamingProfile};
 use crate::cpu_park::{
     self, detect_topology, get_smt_siblings_of, is_helper_authorized, is_helper_current,
-    is_helper_installed, park_cpus, unpark_all, CpuTopology,
+    is_helper_installed, CpuTopology,
 };
+use crate::monitor::Parking;
 use crate::utils::{get_offline_cpus, get_online_cpus};
 
 // ── Events emitted from this tab ──────────────────────────────────────────────
 
 pub enum GamingEvent {
-    GamingModeChanged { active: bool, elevate_nice: bool },
+    GamingModeChanged {
+        active: bool,
+        elevate_nice: bool,
+        parking: Parking,
+    },
     ResetAll,
-    GameLaunched { pid: u32, profile: String },
+    GameLaunched {
+        pid: u32,
+        profile: String,
+    },
     LogMessage(String),
     ConfigChanged(Box<Config>),
 }
@@ -68,8 +76,12 @@ pub struct GamingModeTab {
     pub config: Config,
     pub topo: Option<CpuTopology>,
     pub topo_description: String,
+    /// Mirrors the daemon, which owns Gaming Mode (see `sync_gaming_state`).
     pub parked: bool,
-    pub parking_in_progress: bool,
+    /// The state asked of the daemon, until it reports the request handled.
+    gaming_request: Option<bool>,
+    /// The daemon's change counter as last seen.
+    seen_gaming_changes: u64,
 
     // Preferred CCD checkbox grid: cpu_num → checked
     pub preferred_checks: HashMap<u32, bool>,
@@ -120,8 +132,6 @@ pub struct GamingModeTab {
     steam_picker: Option<crate::gui::dialogs::SteamGamePickerDialog>,
     lutris_picker: Option<crate::gui::dialogs::LutrisGamePickerDialog>,
 
-    // Pending re-enable after unpark (profile switch)
-    pending_enable_after_unpark: bool,
     /// Expansion state of the two panels behind the footer buttons.
     overlay_settings_open: bool,
     sensor_access: crate::sensor_access::SensorAccess,
@@ -156,7 +166,8 @@ impl GamingModeTab {
             topo: Some(topo),
             topo_description,
             parked,
-            parking_in_progress: false,
+            gaming_request: None,
+            seen_gaming_changes: 0,
             preferred_checks,
             smt_siblings,
             helper_status_text: String::new(),
@@ -182,7 +193,6 @@ impl GamingModeTab {
             install_result_rx: None,
             steam_picker: None,
             lutris_picker: None,
-            pending_enable_after_unpark: false,
             section: GamingSection::default(),
             overlay_install_status: String::new(),
             overlay_settings_open: false,
@@ -194,11 +204,10 @@ impl GamingModeTab {
         tab.refresh_cpu_status();
         tab.refresh_power_status();
 
+        // CPUs already parked at start (e.g. after a crash) are adopted as
+        // they are.
         if parked {
-            tab.events.push(GamingEvent::GamingModeChanged {
-                active: true,
-                elevate_nice: tab.elevate_nice,
-            });
+            tab.request_gaming(true, Parking::Keep);
         }
 
         tab
@@ -251,89 +260,80 @@ impl GamingModeTab {
         }
     }
 
-    fn enable_gaming_mode(&mut self) {
-        if let Some(ref topo) = self.topo.clone() {
-            if !topo.has_asymmetry() {
-                return;
-            }
-            if !is_helper_installed() {
-                self.append_log("[Gaming Mode] Helper missing — install first.".into());
-                return;
-            }
-            let unchecked: HashSet<u32> = self
-                .preferred_checks
-                .iter()
-                .filter(|(_, &checked)| !checked)
-                .map(|(&cpu, _)| cpu)
-                .collect();
-            let to_park: HashSet<u32> = topo
-                .non_preferred
+    /// Ask the daemon, which owns Gaming Mode, for a change. It parks on its
+    /// own thread; `sync_gaming_state` picks up the outcome.
+    fn request_gaming(&mut self, active: bool, parking: Parking) {
+        self.gaming_request = Some(active);
+        self.events.push(GamingEvent::GamingModeChanged {
+            active,
+            elevate_nice: active && self.elevate_nice,
+            parking,
+        });
+    }
+
+    /// Mirror the daemon's Gaming Mode state, called every frame.
+    pub fn sync_gaming_state(&mut self, active: bool, changes: u64) {
+        if changes == self.seen_gaming_changes {
+            return;
+        }
+        self.seen_gaming_changes = changes;
+        let requested = self.gaming_request.take();
+        let was_active = std::mem::replace(&mut self.parked, active);
+        if requested == Some(true) && !active {
+            self.append_log("[Gaming Mode] Could not be enabled — see the log.".into());
+        } else if was_active != active {
+            self.append_log(format!(
+                "[Gaming Mode] {}",
+                if active { "Enabled" } else { "Disabled" }
+            ));
+        }
+        self.refresh_cpu_status();
+        if !active {
+            // Re-detect topology now all CPUs are back online
+            let topo = detect_topology();
+            self.topo_description = topo.description.clone();
+            self.rebuild_preferred_checks(&topo);
+            self.topo = Some(topo);
+        }
+    }
+
+    /// The CPUs Gaming Mode parks: the non-preferred ones plus any preferred
+    /// ones the user unchecked.
+    fn cpus_to_park(&self) -> Option<HashSet<u32>> {
+        let topo = self.topo.as_ref().filter(|t| t.has_asymmetry())?;
+        let unchecked = self
+            .preferred_checks
+            .iter()
+            .filter(|(_, &checked)| !checked)
+            .map(|(&cpu, _)| cpu);
+        Some(
+            topo.non_preferred
                 .iter()
                 .copied()
                 .chain(unchecked)
-                .collect();
-            self.append_log(format!("[Gaming Mode] Parking CPUs {:?}…", {
-                let mut v: Vec<_> = to_park.iter().copied().collect();
-                v.sort_unstable();
-                v
-            }));
-            self.parking_in_progress = true;
+                .collect(),
+        )
+    }
 
-            // Park synchronously (blocking — parking is fast, sub-second)
-            let log_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-            let ll = log_lines.clone();
-            let ok = park_cpus(&to_park, move |msg| {
-                ll.lock().unwrap().push(msg);
-            });
-            for msg in log_lines.lock().unwrap().drain(..) {
-                self.append_log(msg);
-            }
-            self.parking_in_progress = false;
-            self.parked = ok;
-            self.refresh_cpu_status();
-            if ok {
-                self.append_log("[Gaming Mode] ACTIVE — non-preferred CPUs offline.".into());
-                self.events.push(GamingEvent::GamingModeChanged {
-                    active: true,
-                    elevate_nice: self.elevate_nice,
-                });
-                self.events
-                    .push(GamingEvent::LogMessage("[Gaming Mode] enabled".into()));
-            } else {
-                self.append_log("[Gaming Mode] Parking failed — check log.".into());
-            }
+    /// Returns whether a request was sent.
+    fn enable_gaming_mode(&mut self) -> bool {
+        let Some(to_park) = self.cpus_to_park() else {
+            return false;
+        };
+        if !is_helper_installed() {
+            self.append_log("[Gaming Mode] Helper missing — install first.".into());
+            return false;
         }
+        let mut sorted: Vec<_> = to_park.iter().copied().collect();
+        sorted.sort_unstable();
+        self.append_log(format!("[Gaming Mode] Parking CPUs {sorted:?}…"));
+        self.request_gaming(true, Parking::Exactly(to_park));
+        true
     }
 
     fn disable_gaming_mode(&mut self) {
         self.append_log("[Gaming Mode] Unparking all CPUs…".into());
-        let log_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let ll = log_lines.clone();
-        let _ok = unpark_all(move |msg| {
-            ll.lock().unwrap().push(msg);
-        });
-        for msg in log_lines.lock().unwrap().drain(..) {
-            self.append_log(msg);
-        }
-        self.parked = false;
-        self.refresh_cpu_status();
-        // Re-detect topology now all CPUs are back online
-        let topo = detect_topology();
-        self.topo_description = topo.description.clone();
-        self.rebuild_preferred_checks(&topo);
-        self.topo = Some(topo);
-        self.append_log("[Gaming Mode] Disabled — all CPUs online.".into());
-        self.events.push(GamingEvent::GamingModeChanged {
-            active: false,
-            elevate_nice: false,
-        });
-        self.events
-            .push(GamingEvent::LogMessage("[Gaming Mode] disabled".into()));
-
-        if self.pending_enable_after_unpark {
-            self.pending_enable_after_unpark = false;
-            self.enable_gaming_mode();
-        }
+        self.request_gaming(false, Parking::Keep);
     }
 
     fn rebuild_preferred_checks(&mut self, topo: &CpuTopology) {
@@ -532,7 +532,8 @@ impl GamingModeTab {
                             );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let enabled = has_asym && self.helper_ok && !self.parking_in_progress;
+                            let enabled =
+                                has_asym && self.helper_ok && self.gaming_request.is_none();
                             let label = if self.parked {
                                 "Disable Gaming Mode"
                             } else {
@@ -855,26 +856,11 @@ impl GamingModeTab {
             }
 
             if reset_clicked {
-                if self.parked {
-                    self.events.push(GamingEvent::GamingModeChanged {
-                        active: false,
-                        elevate_nice: false,
-                    });
-                    self.parked = false;
-                }
-                if !get_offline_cpus().is_empty() {
+                // Turning Gaming Mode off also brings every parked CPU back
+                // online, including ones parked outside Gaming Mode.
+                if self.parked || !get_offline_cpus().is_empty() {
                     self.append_log("[Reset] Unparking CPUs…".into());
-                    let ll = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-                    let l2 = ll.clone();
-                    unpark_all(move |m| l2.lock().unwrap().push(m));
-                    for m in ll.lock().unwrap().drain(..) {
-                        self.append_log(m);
-                    }
-                    self.refresh_cpu_status();
-                    let topo = detect_topology();
-                    self.rebuild_preferred_checks(&topo);
-                    self.topo_description = topo.description.clone();
-                    self.topo = Some(topo);
+                    self.request_gaming(false, Parking::Keep);
                 }
                 self.events.push(GamingEvent::ResetAll);
             }
@@ -978,8 +964,7 @@ impl GamingModeTab {
             self.append_log(format!("[Profile] Loaded '{name}' — {}", profile.command));
             if self.parked {
                 self.append_log(format!("[Profile] Re-applying CPU parking for '{name}'…"));
-                self.disable_gaming_mode();
-                self.pending_enable_after_unpark = true;
+                self.enable_gaming_mode();
             }
         }
     }
@@ -1026,10 +1011,7 @@ impl GamingModeTab {
                 return;
             }
         };
-        let was_parked = self.parked;
-        if !was_parked {
-            self.enable_gaming_mode();
-        }
+        let enabled_for_launch = !self.parked && self.enable_gaming_mode();
         match std::process::Command::new(&parts[0])
             .args(&parts[1..])
             .env("ARGUS_LASSO_HUD", "1")
@@ -1052,7 +1034,7 @@ impl GamingModeTab {
                 self.last_poll = std::time::Instant::now();
             }
             Err(error) => {
-                if !was_parked && self.parked {
+                if enabled_for_launch {
                     self.disable_gaming_mode();
                 }
                 self.launch_error = true;

@@ -446,11 +446,12 @@ impl eframe::App for ArgusLassoApp {
                 GamingEvent::GamingModeChanged {
                     active,
                     elevate_nice,
+                    parking,
                 } => {
                     self.send(DaemonCmd::SetGamingMode {
                         active,
                         elevate_nice,
-                        park: false,
+                        parking,
                     });
                     if active {
                         self.send(DaemonCmd::ReapplyDefaults);
@@ -530,6 +531,7 @@ impl eframe::App for ArgusLassoApp {
             log_lines,
             config,
             gaming_active,
+            gaming_changes,
             hw_monitor,
             proc_cpu_history,
             cpu_history,
@@ -557,6 +559,7 @@ impl eframe::App for ArgusLassoApp {
                     },
                     s.config.clone(),
                     s.gaming_active,
+                    s.gaming_changes,
                     if on_hw_tab {
                         s.hw_monitor.clone()
                     } else {
@@ -593,6 +596,10 @@ impl eframe::App for ArgusLassoApp {
 
         self.proc_count = snapshot.len();
         self.throttled_count = throttled_pids.len();
+        // Gaming Mode belongs to the daemon; the tab and the status bar both
+        // show its state rather than keeping their own.
+        self.gaming_mode_tab
+            .sync_gaming_state(gaming_active, gaming_changes);
 
         // Only push CPU bars + history when the daemon has emitted a new sample.
         // The hwmon temp scan (a full /sys/class/hwmon walk) also lives here —

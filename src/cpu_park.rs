@@ -2,7 +2,7 @@
 //!
 //! Mirrors Python cpu_park.py:
 //!   - detect_topology(): AMD X3D (L3 cache asymmetry), Intel Hybrid (max freq), or UNIFORM
-//!   - park_cpus() / unpark_all() via sudo /usr/local/bin/argus-lasso-sysfs
+//!   - set_parked_cpus() / unpark_all() via the polkit-authorised park helper
 //!   - get_smt_siblings_of(): reads /sys/.../topology/core_id
 //!   - Topology cache: preserved across calls so Gaming Mode doesn't lose it once CPUs are parked
 
@@ -56,10 +56,27 @@ const PARK_SCRIPT: &str = r#"#!/bin/bash
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 case "${1-}" in
-    online)
-        [[ "${2-}" =~ ^[0-9]+$ ]] || exit 2
-        [[ "${3-}" =~ ^[01]$   ]] || exit 2
-        echo "$3" > "/sys/devices/system/cpu/cpu$2/online"
+    set-offline)
+        # Make exactly the listed CPUs offline and every other CPU online, in
+        # one authorisation: online first, so fewer CPUs are never online
+        # than either the old or the new state has.
+        shift
+        want=" "
+        for c in "$@"; do
+            [[ "$c" =~ ^[1-9][0-9]*$ ]] || exit 2
+            want+="$c "
+        done
+        rc=0
+        for pass in 1 0; do
+            for f in /sys/devices/system/cpu/cpu[0-9]*/online; do
+                c=${f#/sys/devices/system/cpu/cpu}; c=${c%/online}
+                if [[ "$want" == *" $c "* ]]; then v=0; else v=1; fi
+                [ "$v" = "$pass" ] || continue
+                [ "$(cat "$f" 2>/dev/null)" = "$v" ] && continue
+                echo "$v" > "$f" 2>/dev/null || { echo "cpu$c: could not set online=$v" >&2; rc=1; }
+            done
+        done
+        exit $rc
         ;;
     unpark-all)
         offline=$(cat /sys/devices/system/cpu/offline 2>/dev/null || true)
@@ -78,7 +95,7 @@ case "${1-}" in
     --check)
         exit 0 ;;
     *)
-        echo "usage: cpu-park online <cpu> <0|1> | unpark-all" >&2; exit 2 ;;
+        echo "usage: cpu-park set-offline [<cpu>...] | unpark-all" >&2; exit 2 ;;
 esac
 "#;
 
@@ -631,29 +648,29 @@ fn run_helper(op: &str, args: &[&str]) -> (bool, String) {
     }
 }
 
-/// Take CPUs offline. Returns true if all succeeded.
-pub fn park_cpus(cpus: &HashSet<u32>, log_cb: impl Fn(String)) -> bool {
-    if cpus.is_empty() {
-        return true;
+/// Make exactly `cpus` the parked (offline) CPUs, bringing every other CPU
+/// back online, in one helper call. CPU 0 cannot be taken offline and is
+/// skipped. Returns true if every CPU reached its state.
+pub fn set_parked_cpus(cpus: &HashSet<u32>, log_cb: impl Fn(String)) -> bool {
+    if cpus.contains(&0) {
+        log_cb("[Park] Skipping CPU 0 (bootstrap processor, cannot offline)".to_string());
     }
-    let mut ok = true;
-    let mut sorted: Vec<u32> = cpus.iter().copied().collect();
+    let mut sorted: Vec<u32> = cpus.iter().copied().filter(|&cpu| cpu != 0).collect();
     sorted.sort_unstable();
-    for cpu in sorted {
-        if cpu == 0 {
-            log_cb("[Park] Skipping CPU 0 (bootstrap processor, cannot offline)".to_string());
-            continue;
-        }
-        let (success, msg) = run_helper(OP_PARK, &["online", &cpu.to_string(), "0"]);
-        if success {
-            log_cb(format!("[Park] CPU {cpu} → offline"));
-        } else {
-            log::warn!("park cpu{cpu} failed: {msg}");
-            log_cb(format!("[Park] CPU {cpu} FAILED: {msg}"));
-            ok = false;
-        }
+    let args: Vec<String> = std::iter::once("set-offline".to_string())
+        .chain(sorted.iter().map(u32::to_string))
+        .collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (success, msg) = run_helper(OP_PARK, &args);
+    if success {
+        log_cb(format!(
+            "[Park] Offline: {sorted:?}; every other CPU online."
+        ));
+    } else {
+        log::warn!("set-offline {sorted:?} failed: {msg}");
+        log_cb(format!("[Park] Parking {sorted:?} FAILED: {msg}"));
     }
-    ok
+    success
 }
 
 /// Bring all offline CPUs back online.
@@ -1151,8 +1168,12 @@ mod tests {
     fn park_helper_rejects_out_of_range_arguments() {
         let script = stage_script("park", PARK_SCRIPT);
         for args in [
-            vec!["online", "abc", "0"],
-            vec!["online", "3", "2"],
+            vec!["set-offline", "abc"],
+            vec!["set-offline", "3", "-1"],
+            // CPU 0 cannot be parked, and "03" is not a CPU number.
+            vec!["set-offline", "0"],
+            vec!["set-offline", "03"],
+            vec!["online", "3", "0"],
             vec!["bogus"],
         ] {
             assert_eq!(
@@ -1162,6 +1183,38 @@ mod tests {
             );
         }
         fs::remove_file(&script).ok();
+    }
+
+    /// The installed script, with only its sysfs root rewritten to a fake
+    /// tree: set-offline must leave exactly the listed CPUs offline, bring
+    /// the rest back online, and never touch CPU 0 (which has no switch).
+    #[test]
+    fn set_offline_parks_exactly_the_listed_cpus() {
+        let root = std::env::temp_dir().join(format!("argus-sysfs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("cpu0")).unwrap();
+        for (cpu, online) in [(1, "1"), (2, "1"), (3, "1"), (4, "0"), (5, "1")] {
+            fs::create_dir_all(root.join(format!("cpu{cpu}"))).unwrap();
+            fs::write(root.join(format!("cpu{cpu}/online")), online).unwrap();
+        }
+        let body = PARK_SCRIPT.replace("/sys/devices/system/cpu/", &format!("{}/", root.display()));
+        assert_ne!(body, PARK_SCRIPT);
+        let script = stage_script("park-set-offline", &body);
+
+        assert_eq!(run(&script, &["set-offline", "2", "3"], None), 0);
+
+        let online = |cpu: u32| {
+            fs::read_to_string(root.join(format!("cpu{cpu}/online")))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(
+            [online(1), online(2), online(3), online(4), online(5)],
+            ["1", "0", "0", "1", "1"]
+        );
+        fs::remove_file(&script).ok();
+        fs::remove_dir_all(&root).ok();
     }
 
     /// A policy that does not name every helper would leave one operation

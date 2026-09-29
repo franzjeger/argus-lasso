@@ -96,7 +96,7 @@ impl ksni::Tray for ArgusLassoTray {
                     let _ = tray.cmd_tx.send(monitor::DaemonCmd::SetGamingMode {
                         active: !currently,
                         elevate_nice: true,
-                        park: true,
+                        parking: monitor::Parking::NonPreferred,
                     });
                 }),
                 ..Default::default()
