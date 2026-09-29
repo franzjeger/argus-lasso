@@ -68,6 +68,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - HUD setup that fails part-way (for example out of video memory on a resize)
   frees what it created instead of leaking it on every attempt. A game that has
   run out of threads gets a blank HUD instead of a panic.
+- Updates remove the staged apps and layer directories nothing refers to any more,
+  keeping only the live layer and what one-step rollback restores. Previously
+  every update, including a rejected one, left its files behind permanently.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
