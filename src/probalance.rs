@@ -271,7 +271,7 @@ impl ProBalance {
                 self.release_unit(&unit, reason, logs);
             }
             Some(Applied::Nice) | None => {
-                if utils::set_nice(pid, original_nice) {
+                if utils::set_nice(pid, original_nice).is_ok() {
                     logs.push(format!(
                         "[ProBalance] RESTORE ({reason}) PID {pid} nice→{original_nice}"
                     ));
@@ -400,7 +400,7 @@ impl ProBalance {
         }
 
         // Nice path (method="nice", or auto-fallback)
-        if utils::set_nice(proc.pid, new_nice) {
+        if utils::set_nice(proc.pid, new_nice).is_ok() {
             logs.push(format!(
                 "[ProBalance] THROTTLE {}({}) cpu={:.1}% nice {}→{}",
                 proc.name, proc.pid, proc.cpu_percent, proc.nice, new_nice

@@ -123,22 +123,21 @@ pub fn for_each_thread(pid: u32, mut f: impl FnMut(u32)) {
 // ── sched_setaffinity ────────────────────────────────────────────────────────
 
 /// Apply CPU affinity to a process AND all its threads via sched_setaffinity(2).
-/// Returns true if at least one thread was set successfully.
-pub fn set_affinity(pid: u32, cpulist: &str) -> bool {
-    apply_affinity(pid, cpulist, false)
+/// Succeeds if at least one thread was set; otherwise the first error.
+pub fn set_affinity(pid: u32, cpulist: &str) -> std::io::Result<()> {
+    apply_affinity(pid, cpulist, false).map(|_| ())
 }
 
-fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> bool {
+/// Ok(true) if a thread was changed, Ok(false) if none needed changing.
+fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> std::io::Result<bool> {
+    let invalid = |msg: String| {
+        log::warn!("set_affinity pid {pid}: {msg}");
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
+    };
     let cpuset = match cpulist_to_set(cpulist) {
         Ok(s) if !s.is_empty() => s,
-        Ok(_) => {
-            log::warn!("set_affinity: empty cpulist for pid {pid}");
-            return false;
-        }
-        Err(e) => {
-            log::warn!("set_affinity: bad cpulist {cpulist:?} for pid {pid}: {e}");
-            return false;
-        }
+        Ok(_) => return Err(invalid("empty CPU list".into())),
+        Err(e) => return Err(invalid(format!("bad CPU list {cpulist:?}: {e}"))),
     };
 
     // Build nix CpuSet
@@ -153,6 +152,7 @@ fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> bool {
     }
 
     let mut any_ok = false;
+    let mut first_err = None;
     // Affinity belongs to each thread, not to the process as a whole.
     for_each_thread(pid, |tid| {
         if only_changed
@@ -162,19 +162,27 @@ fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> bool {
         }
         match sched_setaffinity(Pid::from_raw(tid as i32), &cpu_set) {
             Ok(_) => any_ok = true,
-            Err(e) => log::debug!("sched_setaffinity tid={tid}: {e}"),
+            Err(e) => {
+                log::debug!("sched_setaffinity tid={tid}: {e}");
+                first_err.get_or_insert(e);
+            }
         }
     });
-    if any_ok {
-        log::debug!("affinity pid={pid} cpulist={cpulist}: applied");
+    match first_err {
+        Some(e) if !any_ok => Err(e.into()),
+        _ => {
+            if any_ok {
+                log::debug!("affinity pid={pid} cpulist={cpulist}: applied");
+            }
+            Ok(any_ok)
+        }
     }
-    any_ok
 }
 
 /// Apply affinity to every thread whose CPU mask differs from `cpulist`.
 /// Returns true if at least one differing thread was updated successfully.
 pub fn set_affinity_if_changed(pid: u32, cpulist: &str) -> bool {
-    apply_affinity(pid, cpulist, true)
+    apply_affinity(pid, cpulist, true).unwrap_or(false)
 }
 
 /// Read current affinity of the main thread as a cpulist string.
@@ -230,8 +238,8 @@ fn set_every_thread(
 // ── nice ──────────────────────────────────────────────────────────────────────
 
 /// Set the nice value of every thread of `pid` via the `setpriority` syscall.
-/// Negative values require root/CAP_SYS_NICE. Returns true on success.
-pub fn set_nice(pid: u32, nice: i32) -> bool {
+/// Lowering it (raising priority) is limited by RLIMIT_NICE / CAP_SYS_NICE.
+pub fn set_nice(pid: u32, nice: i32) -> std::io::Result<()> {
     use nix::libc;
     let result = set_every_thread(pid, "setpriority", |tid| {
         // Unlike getpriority(2), whose -1 is ambiguous with a legitimate
@@ -250,23 +258,18 @@ pub fn set_nice(pid: u32, nice: i32) -> bool {
             Err(std::io::Error::last_os_error())
         }
     });
-    match result {
-        Ok(()) => {
-            log::debug!("setpriority pid={pid} nice={nice}: OK");
-            true
-        }
-        Err(err) => {
-            log::warn!("setpriority pid={pid} nice={nice} failed: {err}");
-            false
-        }
+    match &result {
+        Ok(()) => log::debug!("setpriority pid={pid} nice={nice}: OK"),
+        Err(err) => log::warn!("setpriority pid={pid} nice={nice} failed: {err}"),
     }
+    result
 }
 
 // ── ionice ───────────────────────────────────────────────────────────────────
 
 /// Set the I/O priority of every thread of `pid` via the `ioprio_set` syscall.
 /// class: 1=realtime, 2=best-effort, 3=idle. level: 0-7 (RT and BE only).
-pub fn set_ionice(pid: u32, class: i32, level: Option<i32>) -> bool {
+pub fn set_ionice(pid: u32, class: i32, level: Option<i32>) -> std::io::Result<()> {
     use nix::libc;
     let class_val = (class as u32) & 0x7;
     let data_val = (level.unwrap_or(0) as u32) & 0x1fff;
@@ -289,16 +292,11 @@ pub fn set_ionice(pid: u32, class: i32, level: Option<i32>) -> bool {
             Err(std::io::Error::last_os_error())
         }
     });
-    match result {
-        Ok(()) => {
-            log::debug!("ioprio_set pid={pid} class={class} level={level:?}: OK");
-            true
-        }
-        Err(err) => {
-            log::warn!("ioprio_set pid={pid} class={class} failed: {err}");
-            false
-        }
+    match &result {
+        Ok(()) => log::debug!("ioprio_set pid={pid} class={class} level={level:?}: OK"),
+        Err(err) => log::warn!("ioprio_set pid={pid} class={class} failed: {err}"),
     }
+    result
 }
 
 // ── Dirty-check reads (avoid redundant syscalls) ─────────────────────────────
@@ -760,8 +758,22 @@ mod tests {
         if target > 19 {
             return;
         }
-        assert!(set_nice(pid, target));
+        set_nice(pid, target).unwrap();
         assert_eq!(get_nice(worker.tid), Some(target));
+    }
+
+    /// The UI used to guess "needs root?" for every failure; the setters now
+    /// hand back what actually went wrong.
+    #[test]
+    fn setters_report_the_actual_error() {
+        let bad = set_affinity(std::process::id(), "not-a-list").unwrap_err();
+        assert_eq!(bad.kind(), std::io::ErrorKind::InvalidInput);
+        // SAFETY: getuid(2) cannot fail and takes no arguments.
+        if unsafe { nix::libc::getuid() } != 0 {
+            // PID 1 belongs to root: changing it is refused, not "root needed?".
+            let denied = set_nice(1, 19).unwrap_err();
+            assert_eq!(denied.raw_os_error(), Some(nix::libc::EPERM));
+        }
     }
 
     #[test]
@@ -770,7 +782,7 @@ mod tests {
         let worker = Worker::spawn();
         let before = get_ionice_raw(pid).unwrap();
         // Best-effort at the lowest level needs no privilege.
-        assert!(set_ionice(pid, 2, Some(7)));
+        set_ionice(pid, 2, Some(7)).unwrap();
         assert_eq!(get_ionice_raw(worker.tid), Some((2, 7)));
         let _ = set_ionice(pid, before.0, Some(before.1));
     }

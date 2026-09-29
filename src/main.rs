@@ -295,11 +295,12 @@ fn main() {
                 return;
             }
             Cmd::SetAffinity { pid, mask } => {
-                if utils::set_affinity(pid, &mask) {
-                    println!("Affinity set to '{mask}' for PID {pid}");
-                } else {
-                    eprintln!("Failed to set affinity for PID {pid}");
-                    std::process::exit(1);
+                match utils::set_affinity(pid, &mask) {
+                    Ok(()) => println!("Affinity set to '{mask}' for PID {pid}"),
+                    Err(e) => {
+                        eprintln!("Failed to set affinity for PID {pid}: {e}");
+                        std::process::exit(1);
+                    }
                 }
                 return;
             }

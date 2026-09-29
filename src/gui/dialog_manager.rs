@@ -66,7 +66,7 @@ fn apply_manual_change(
     target: &DialogTarget,
     name: &str,
     change: &str,
-    apply: impl FnOnce(u32) -> bool,
+    apply: impl FnOnce(u32) -> std::io::Result<()>,
     state: &Arc<Mutex<AppState>>,
     cmd_tx: &Sender<DaemonCmd>,
     notify_error: &impl Fn(&str),
@@ -78,9 +78,9 @@ fn apply_manual_change(
         ));
         return false;
     }
-    if !apply(pid) {
+    if let Err(e) = apply(pid) {
         notify_error(&format!(
-            "Failed to set {change} on {name} (PID {pid}) — needs root?"
+            "Failed to set {change} on {name} (PID {pid}): {e}"
         ));
         return false;
     }
@@ -293,7 +293,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
 
         let applied =
-            apply_manual_change(&target, "sleep", "nice=5", |_| true, &state, &tx, &|_| {});
+            apply_manual_change(&target, "sleep", "nice=5", |_| Ok(()), &state, &tx, &|_| {});
 
         assert!(applied);
         assert!(matches!(
@@ -323,7 +323,7 @@ mod tests {
             "nice=5",
             |_| {
                 called.set(true);
-                true
+                Ok(())
             },
             &state,
             &tx,

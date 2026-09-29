@@ -322,20 +322,20 @@ pub fn apply_rules(
         if let Some(nice) = rule.nice {
             let fail_key = (rule.rule_id.clone(), pid);
             if current_nice != Some(nice) && !nice_failed.contains(&fail_key) {
-                if utils::set_nice(pid, nice) {
-                    current_nice = Some(nice);
+                if let Err(e) = utils::set_nice(pid, nice) {
+                    // Don't retry every tick: a permission failure would spawn
+                    // a renice subprocess and a log line every 500 ms forever.
+                    nice_failed.insert(fail_key);
                     let msg = format!(
-                        "[Rule:{}] Set nice={} on {}({})",
+                        "[Rule:{}] nice={} FAILED for {}({}): {e} — giving up for this process",
                         rule.name, nice, proc_name, pid
                     );
                     log(msg.clone());
                     actions.push(msg);
                 } else {
-                    // Don't retry every tick: a permission failure would spawn
-                    // a renice subprocess and a log line every 500 ms forever.
-                    nice_failed.insert(fail_key);
+                    current_nice = Some(nice);
                     let msg = format!(
-                        "[Rule:{}] nice={} FAILED (root needed?) for {}({}) — giving up for this process",
+                        "[Rule:{}] Set nice={} on {}({})",
                         rule.name, nice, proc_name, pid
                     );
                     log(msg.clone());
@@ -348,7 +348,7 @@ pub fn apply_rules(
         if let Some(class) = rule.ionice_class {
             let target_level = rule.ionice_level.unwrap_or(0);
             if current_ionice != Some((class, target_level))
-                && utils::set_ionice(pid, class, rule.ionice_level)
+                && utils::set_ionice(pid, class, rule.ionice_level).is_ok()
             {
                 current_ionice = Some((class, target_level));
                 let msg = format!(

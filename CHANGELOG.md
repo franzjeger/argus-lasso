@@ -100,6 +100,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   autostart entry and the unit.
 - The HUD's connection states read "Telemetry disconnected" and "Telemetry stale"
   like the rest of the English interface, instead of Norwegian.
+- Failed priority and affinity changes report the system's reason (for example
+  "Operation not permitted") in the notification, the rule log and the CLI,
+  instead of guessing "needs root?".
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
