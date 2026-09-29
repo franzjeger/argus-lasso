@@ -5,7 +5,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Control {
@@ -24,14 +24,47 @@ pub fn directory() -> PathBuf {
     std::env::var_os("ARGUS_CAPTURE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            // An empty HOME would make this relative to the working directory.
+            std::env::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/nonexistent"))
                 .join(".local/share/argus-lasso/benchmarks")
         })
 }
+
+/// Read at most `limit` bytes of `path`, which must be a regular file.
+///
+/// Everything in this directory is written by the other side of the
+/// boundary — the game or the app — so it is untrusted in shape: a FIFO in
+/// place of a file would block a plain open forever, waiting for a writer,
+/// and a huge file must not be loaded whole. `Ok(None)` if the file is larger
+/// than `limit`.
+pub fn read_regular_capped(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    open_regular(path)?.take(limit + 1).read_to_end(&mut buf)?;
+    Ok((buf.len() as u64 <= limit).then_some(buf))
+}
+
+/// Open `path` for reading only if it is a regular file, without blocking.
+pub fn open_regular(path: &Path) -> io::Result<File> {
+    // O_NONBLOCK makes opening a FIFO return at once instead of waiting for a
+    // writer; it has no effect on reading a regular file.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
 pub fn read_control() -> Control {
-    fs::read(directory().join("control.json"))
+    read_regular_capped(&directory().join("control.json"), 4096)
         .ok()
-        .filter(|b| b.len() < 4096)
+        .flatten()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
@@ -128,13 +161,8 @@ pub fn statistics(intervals_ns: &mut [u64]) -> (Option<f64>, Option<f64>, Option
 /// reject, not an attempt to load the whole thing into memory.
 const MAX_SUMMARY_BYTES: u64 = 64 * 1024;
 
-fn read_summary_capped(path: &std::path::Path) -> Option<Summary> {
-    let mut buf = Vec::new();
-    File::open(path)
-        .ok()?
-        .take(MAX_SUMMARY_BYTES)
-        .read_to_end(&mut buf)
-        .ok()?;
+fn read_summary_capped(path: &Path) -> Option<Summary> {
+    let buf = read_regular_capped(path, MAX_SUMMARY_BYTES).ok()??;
     serde_json::from_slice(&buf).ok()
 }
 
@@ -204,6 +232,39 @@ mod tests {
         let huge = format!("{{\"metric\":\"{}", "x".repeat(200_000));
         std::fs::write(&path, &huge).unwrap();
         assert_eq!(read_summary_capped(&path), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A FIFO in place of a recording file used to block the reader until
+    /// something wrote to it — forever, stalling every later scan.
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let path = temp_path("argus-ipc-fifo");
+        let _ = std::fs::remove_file(&path);
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path and a plain mode.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_regular_capped(&reader_path, 16).is_err());
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a FIFO blocked");
+        assert!(refused);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn capped_reads_accept_the_limit_and_refuse_beyond_it() {
+        let path = temp_path("argus-ipc-capped");
+        std::fs::write(&path, b"12345").unwrap();
+        assert_eq!(
+            read_regular_capped(&path, 5).unwrap(),
+            Some(b"12345".to_vec())
+        );
+        assert_eq!(read_regular_capped(&path, 4).unwrap(), None);
         std::fs::remove_file(&path).ok();
     }
 

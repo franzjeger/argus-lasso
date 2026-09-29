@@ -79,6 +79,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   such rather than as "already running".
 - Affinity, nice and I/O priority reach threads that a single `/proc` thread
   listing skips while a program starts or ends other threads.
+- Recording files are read only if they are regular files, opened without
+  blocking: a FIFO left in their place by a game no longer hangs the recordings
+  list for good. The recording control file is read with a size cap.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
