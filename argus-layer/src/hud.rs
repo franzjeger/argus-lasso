@@ -145,13 +145,21 @@ impl HudWorker {
         )>(1);
         let result = std::sync::Arc::new(std::sync::Mutex::new(None));
         let output = result.clone();
-        std::thread::spawn(move || {
-            let mut raster = Rasterizer::default();
-            for (tel, status, config, stats) in rx {
-                let image = raster.rasterize(tel.as_ref(), &status, &config, &stats);
-                *output.lock().unwrap() = Some(std::sync::Arc::new(image));
-            }
-        });
+        // Builder rather than thread::spawn, which panics when the game has
+        // exhausted its threads. Without a worker the HUD simply stays blank.
+        let spawned = std::thread::Builder::new()
+            .name("argus-hud".into())
+            .spawn(move || {
+                let mut raster = Rasterizer::default();
+                for (tel, status, config, stats) in rx {
+                    let image = raster.rasterize(tel.as_ref(), &status, &config, &stats);
+                    *output.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(std::sync::Arc::new(image));
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!("[Argus-Layer] HUD worker thread unavailable: {e}");
+        }
         Self { tx, result }
     }
     pub fn request(
@@ -166,7 +174,10 @@ impl HudWorker {
             .try_send((tel.cloned(), status.into(), config.clone(), stats.clone()));
     }
     pub fn image(&self) -> Option<std::sync::Arc<HudImage>> {
-        self.result.lock().unwrap().clone()
+        self.result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 #[derive(Default)]

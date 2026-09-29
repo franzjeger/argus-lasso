@@ -65,6 +65,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - The launcher only accepts a game process started after its own launch, and
   never shells or launch wrappers (sh, reaper, pressure-vessel, Wine, Proton):
   a long-running `sh` no longer matches "Shadow of the Tomb Raider".
+- HUD setup that fails part-way (for example out of video memory on a resize)
+  frees what it created instead of leaking it on every attempt. A game that has
+  run out of threads gets a blank HUD instead of a panic.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
