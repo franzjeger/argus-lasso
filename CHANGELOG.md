@@ -103,6 +103,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Failed priority and affinity changes report the system's reason (for example
   "Operation not permitted") in the notification, the rule log and the CLI,
   instead of guessing "needs root?".
+- The HUD shows CPU temperature on Intel (coretemp's "Package id 0"), and AMD
+  graphics temperature, clocks, load and video memory, which it looked up under
+  labels those drivers never use. With an integrated and a discrete GPU, every
+  GPU value comes from the card with the most video memory instead of a mix.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
