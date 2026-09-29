@@ -22,6 +22,23 @@ pub enum GamingEvent {
 
 // ── Launcher watch phase ──────────────────────────────────────────────────────
 
+/// The game process the launcher is watching, held through a pidfd: a PID
+/// recycled after the game exits can never be mistaken for it, or be sent
+/// its "Force quit".
+pub(crate) struct LaunchedGame {
+    pub pid: u32,
+    handle: crate::process_control::ProcessHandle,
+}
+
+impl LaunchedGame {
+    /// None if the process is already gone.
+    fn open(pid: u32) -> Option<Self> {
+        let start = crate::fast_proc::read_stat(pid, &mut [0; 1024])?.starttime;
+        let handle = crate::process_control::ProcessHandle::open(pid, start).ok()?;
+        Some(Self { pid, handle })
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum WatchPhase {
     Idle,
@@ -75,7 +92,7 @@ pub struct GamingModeTab {
     pub command: String,
     pub auto_restore: bool,
     pub watch_phase: WatchPhase,
-    pub launched_pid: Option<u32>,
+    pub(crate) launched: Option<LaunchedGame>,
     pub watch_status: String,
     launch_error: bool,
     pub last_poll: std::time::Instant,
@@ -146,7 +163,7 @@ impl GamingModeTab {
             command: String::new(),
             auto_restore: true,
             watch_phase: WatchPhase::Idle,
-            launched_pid: None,
+            launched: None,
             watch_status: String::new(),
             launch_error: false,
             last_poll: std::time::Instant::now(),
@@ -343,23 +360,22 @@ impl GamingModeTab {
         }
         self.last_poll = std::time::Instant::now();
 
-        let pids: Vec<u32> = std::fs::read_dir("/proc")
-            .ok()
-            .map(|d| {
-                d.filter_map(|e| {
-                    e.ok()
-                        .and_then(|e| e.file_name().to_str().and_then(|s| s.parse().ok()))
-                })
-                .collect()
-            })
-            .unwrap_or_default();
-
         let name = self.game_name.clone();
+        // The first candidate that is still alive by the time it is opened.
+        let find_game = || -> Option<LaunchedGame> {
+            std::fs::read_dir("/proc")
+                .ok()?
+                .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+                .filter(|&pid| proc_name_matches(&name, pid))
+                .find_map(LaunchedGame::open)
+        };
 
-        if self.watch_phase == WatchPhase::Waiting {
-            for &pid in &pids {
-                if proc_name_matches(&name, pid) {
-                    self.launched_pid = Some(pid);
+        match self.watch_phase {
+            WatchPhase::Idle => {}
+            WatchPhase::Waiting => {
+                if let Some(game) = find_game() {
+                    let pid = game.pid;
+                    self.launched = Some(game);
                     self.events.push(GamingEvent::GameLaunched {
                         pid,
                         profile: self.selected_profile.clone(),
@@ -367,31 +383,34 @@ impl GamingModeTab {
                     self.watch_phase = WatchPhase::Running;
                     self.watch_status = format!("Game running (PID {pid})");
                     self.append_log(format!("[Launcher] Game process found: PID {pid}"));
-                    return;
                 }
             }
-        } else if self.watch_phase == WatchPhase::Running {
-            if let Some(pid) = self.launched_pid {
-                if !pids.contains(&pid) {
-                    // Check for replacement
-                    if let Some(new_pid) =
-                        pids.iter().find(|&&p| proc_name_matches(&name, p)).copied()
-                    {
-                        self.launched_pid = Some(new_pid);
-                        self.events.push(GamingEvent::GameLaunched {
-                            pid: new_pid,
-                            profile: self.selected_profile.clone(),
-                        });
-                        self.append_log(format!("[Launcher] Game PID changed → {new_pid}"));
-                    } else {
-                        self.append_log(format!("[Launcher] Game (PID {pid}) exited."));
-                        if self.auto_restore && self.parked {
-                            self.disable_gaming_mode();
-                        }
-                        self.watch_phase = WatchPhase::Idle;
-                        self.launched_pid = None;
-                        self.watch_status = String::new();
+            WatchPhase::Running => {
+                let Some(old_pid) = self
+                    .launched
+                    .as_ref()
+                    .filter(|g| g.handle.has_exited())
+                    .map(|g| g.pid)
+                else {
+                    return;
+                };
+                // Check for replacement
+                if let Some(game) = find_game() {
+                    let pid = game.pid;
+                    self.launched = Some(game);
+                    self.events.push(GamingEvent::GameLaunched {
+                        pid,
+                        profile: self.selected_profile.clone(),
+                    });
+                    self.append_log(format!("[Launcher] Game PID changed → {pid}"));
+                } else {
+                    self.append_log(format!("[Launcher] Game (PID {old_pid}) exited."));
+                    if self.auto_restore && self.parked {
+                        self.disable_gaming_mode();
                     }
+                    self.watch_phase = WatchPhase::Idle;
+                    self.launched = None;
+                    self.watch_status = String::new();
                 }
             }
         }
@@ -750,13 +769,14 @@ impl GamingModeTab {
                             .add_enabled(can_kill, egui::Button::new("Force quit game"))
                             .clicked()
                         {
-                            if let Some(pid) = self.launched_pid {
-                                match nix::sys::signal::kill(
-                                    nix::unistd::Pid::from_raw(pid as i32),
-                                    nix::sys::signal::Signal::SIGTERM,
-                                ) {
+                            if let Some(game) = self.launched.take() {
+                                let pid = game.pid;
+                                match game.handle.signal(nix::sys::signal::Signal::SIGTERM) {
                                     Ok(()) => self.append_log(format!(
                                         "[Launcher] Sent SIGTERM to PID {pid}"
+                                    )),
+                                    Err(nix::errno::Errno::ESRCH) => self.append_log(format!(
+                                        "[Launcher] Game (PID {pid}) had already exited"
                                     )),
                                     Err(e) => self.append_log(format!(
                                         "[Launcher] SIGTERM to PID {pid} failed: {e}"
@@ -767,7 +787,6 @@ impl GamingModeTab {
                                 self.disable_gaming_mode();
                             }
                             self.watch_phase = WatchPhase::Idle;
-                            self.launched_pid = None;
                             self.watch_status = String::new();
                         }
                         ui.checkbox(&mut self.auto_restore, "Disable Gaming Mode when the game exits");
@@ -1172,9 +1191,14 @@ fn proc_name_matches(game_name: &str, pid: u32) -> bool {
             .collect()
     };
     let name_n = norm(game_name);
+    // Every string contains "", so an empty side would match any process —
+    // including one that exited between the /proc listing and this read.
+    if name_n.is_empty() {
+        return false;
+    }
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
     let comm_n = norm(comm.trim());
-    if name_n.contains(&comm_n) || comm_n.contains(&name_n) {
+    if !comm_n.is_empty() && (name_n.contains(&comm_n) || comm_n.contains(&name_n)) {
         return true;
     }
     // Fallback: cmdline

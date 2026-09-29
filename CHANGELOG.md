@@ -48,6 +48,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Nice and I/O priority now reach every thread of a process, as affinity already
   did. Rules, ProBalance and the Gaming Mode boost previously changed only the
   main thread. The renice helper is updated (v5) and asks to be reinstalled.
+- The launcher tracks the game through a pidfd, so "Force quit game" cannot signal
+  a process that reused the game's PID. An unreadable process name no longer
+  matches every game name.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

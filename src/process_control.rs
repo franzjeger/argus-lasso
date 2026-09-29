@@ -28,6 +28,18 @@ impl ProcessHandle {
         }
         Ok(handle)
     }
+    /// True once the process has exited, reaped or not. A pidfd polls
+    /// readable from that moment, so this never blocks.
+    pub fn has_exited(&self) -> bool {
+        let mut pfd = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd that lives across the call; a zero timeout
+        // returns immediately.
+        unsafe { libc::poll(&mut pfd, 1, 0) > 0 }
+    }
     pub fn signal(&self, signal: Signal) -> Result<(), Errno> {
         // SAFETY: the descriptor remains owned; null siginfo requests a standard signal.
         let result = unsafe {
@@ -77,8 +89,10 @@ mod tests {
             Err(Errno::ESRCH)
         ));
         let handle = ProcessHandle::open(pid, ticks).unwrap();
+        assert!(!handle.has_exited());
         handle.signal(Signal::SIGTERM).unwrap();
         child.wait().unwrap();
+        assert!(handle.has_exited());
         assert_eq!(handle.signal(Signal::SIGKILL), Err(Errno::ESRCH));
     }
 }
