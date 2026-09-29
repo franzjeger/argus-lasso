@@ -163,6 +163,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Changed
 
+- "Enable in-game overlay" is a checkbox like the setting below it; while off it
+  used to look like plain text. The process filter's hint fits its field, with
+  the details in its tooltip.
+
 - A rule's match type is a closed set (contains, exact, regex) stored as the same
   words as before. An unknown value is reported instead of silently matching as
   "contains"; an imported rule file with one names it in the error.
