@@ -51,6 +51,13 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - The launcher tracks the game through a pidfd, so "Force quit game" cannot signal
   a process that reused the game's PID. An unreadable process name no longer
   matches every game name.
+- The Vulkan layer passes the game's call through whenever its own bookkeeping is
+  missing, presents the frame unchanged when the HUD submission fails, and never
+  presents twice after a panic. Loader negotiation no longer reads NULL outputs as
+  function pointers. Swapchain teardown waits only for the layer's own GPU work
+  instead of `vkDeviceWaitIdle`, outside the shared lock. New
+  `vkDestroyDevice`/`vkDestroyInstance` hooks drop state for recycled handles,
+  and the library stays mapped while its threads run.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

@@ -8,6 +8,8 @@ pub const MAX_HUD_H: u32 = 1024;
 
 pub struct OverlayState {
     pub swapchain: vk::SwapchainKHR,
+    /// The device every resource below belongs to.
+    pub device: vk::Device,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
 
@@ -42,6 +44,9 @@ pub struct OverlayState {
     pub draw_queue: Option<vk::Queue>,
     pub complete: Vec<vk::Semaphore>,
     pub disabled: bool,
+    /// A fence that was reset but never submitted, so it will never signal.
+    /// Set together with `disabled`, after which nothing more is submitted.
+    pub abandoned_fence: Option<usize>,
     last_config: Option<OverlayConfig>,
     initialized: bool,
     last_update: Option<std::time::Instant>,
@@ -377,7 +382,7 @@ impl OverlayState {
         let command_buffers = device.allocate_command_buffers(&cb_alloc).ok()?;
         if let Some(callback) = crate::LOADER_DATA
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&device.handle())
             .copied()
         {
@@ -408,6 +413,7 @@ impl OverlayState {
             .ok()?;
         Some(Self {
             swapchain: vk::SwapchainKHR::null(),
+            device: device.handle(),
             format,
             extent,
             command_pool,
@@ -432,6 +438,7 @@ impl OverlayState {
             draw_queue: None,
             complete,
             disabled: false,
+            abandoned_fence: None,
             last_config: None,
             initialized: false,
             last_update: None,
@@ -446,10 +453,19 @@ impl OverlayState {
     }
 
     /// # Safety
-    /// All uses of these resources must have completed on the GPU. Call exactly
-    /// once, with the device that created this state, before destroying that device.
+    /// Call exactly once, with the device that created this state, before
+    /// destroying that device.
     pub unsafe fn destroy(&self, device: &ash::Device) {
-        let _ = device.device_wait_idle();
+        // Wait for our own submissions only. vkDeviceWaitIdle would need every
+        // queue of the device externally synchronized, and the game (DXVK and
+        // vkd3d-proton submit from their own threads) never promised us that.
+        let pending: Vec<vk::Fence> = (0..self.fences.len())
+            .filter(|&i| self.abandoned_fence != Some(i))
+            .map(|i| self.fences[i])
+            .collect();
+        if !pending.is_empty() {
+            let _ = device.wait_for_fences(&pending, true, u64::MAX);
+        }
         for &s in &self.complete {
             device.destroy_semaphore(s, None);
         }

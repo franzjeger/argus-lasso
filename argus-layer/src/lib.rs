@@ -1,7 +1,8 @@
 //! Argus-Layer: Vulkan implicit layer that draws a telemetry HUD.
 //!
-//! Hooks: vkCreateInstance, vkEnumeratePhysicalDevices, vkCreateDevice,
-//!        vkGetDeviceQueue, vkCreateSwapchainKHR, vkQueuePresentKHR.
+//! Hooks: vkCreateInstance/vkDestroyInstance, vkEnumeratePhysicalDevices,
+//!        vkCreateDevice/vkDestroyDevice, vkGetDeviceQueue(2),
+//!        vkCreateSwapchainKHR/vkDestroySwapchainKHR, vkQueuePresentKHR.
 
 mod activation;
 mod capture;
@@ -12,6 +13,7 @@ pub mod renderer;
 use argus_ipc::{IpcMessage, OverlayConfig, TelemetryFrame};
 use ash::vk;
 use renderer::OverlayState;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
@@ -66,35 +68,40 @@ fn guard<R>(
     }
 }
 
-// ── Global function pointers (set once during negotiation) ──────────────────
+// ── Next-layer entry points ─────────────────────────────────────────────────
 //
-// Atomics rather than `static mut`: vkCreateInstance has no Vulkan external-
-// synchronization requirement, so two threads can legitimately create
-// instances concurrently, and both read and write these on every call.
+// Each instance's next vkGetInstanceProcAddr is kept in INSTANCE_GIPA. The most
+// recently recorded one is also kept process-wide for calls that name no
+// instance we know, such as vkGetInstanceProcAddr(NULL, …). An atomic rather
+// than `static mut`: vkCreateInstance has no Vulkan external-synchronization
+// requirement, so two threads can legitimately create instances concurrently.
 static NEXT_GET_INSTANCE_PROC_ADDR: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
-static NEXT_GET_DEVICE_PROC_ADDR: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 fn get_next_gipa() -> Option<vk::PFN_vkGetInstanceProcAddr> {
     let p = NEXT_GET_INSTANCE_PROC_ADDR.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        Some(unsafe { std::mem::transmute::<*mut c_void, vk::PFN_vkGetInstanceProcAddr>(p) })
-    }
+    // SAFETY: set_next_gipa is the only writer, and it stores a valid fn pointer.
+    (!p.is_null())
+        .then(|| unsafe { std::mem::transmute::<*mut c_void, vk::PFN_vkGetInstanceProcAddr>(p) })
 }
 fn set_next_gipa(f: vk::PFN_vkGetInstanceProcAddr) {
     NEXT_GET_INSTANCE_PROC_ADDR.store(f as *mut c_void, Ordering::Release);
 }
-fn get_next_gdpa() -> Option<vk::PFN_vkGetDeviceProcAddr> {
-    let p = NEXT_GET_DEVICE_PROC_ADDR.load(Ordering::Acquire);
-    if p.is_null() {
-        None
-    } else {
-        Some(unsafe { std::mem::transmute::<*mut c_void, vk::PFN_vkGetDeviceProcAddr>(p) })
-    }
+
+/// The next layer's vkGetInstanceProcAddr for `instance`, or the most recent
+/// one when the instance is unknown or null.
+fn instance_gipa(instance: vk::Instance) -> Option<vk::PFN_vkGetInstanceProcAddr> {
+    INSTANCE_GIPA
+        .read_or_recover()
+        .get(&instance)
+        .copied()
+        .or_else(get_next_gipa)
 }
-fn set_next_gdpa(f: vk::PFN_vkGetDeviceProcAddr) {
-    NEXT_GET_DEVICE_PROC_ADDR.store(f as *mut c_void, Ordering::Release);
+
+/// Resolve a device command through the layer below us. None when the device
+/// is unknown or the layer below does not provide the command.
+unsafe fn next_device_fn(device: vk::Device, name: &CStr) -> vk::PFN_vkVoidFunction {
+    let gdpa = DEVICE_GDPA.read_or_recover().get(&device).copied()?;
+    gdpa(device, name.as_ptr())
 }
 
 // ── Lookup tables ───────────────────────────────────────────────────────────
@@ -109,6 +116,9 @@ lazy_static::lazy_static! {
 
     // Configuration for the overlay (received via IPC)
     pub static ref OVERLAY_CONFIG: RwLock<OverlayConfig> = RwLock::new(OverlayConfig::default());
+
+    // Instance → the next layer's vkGetInstanceProcAddr it was created with
+    static ref INSTANCE_GIPA: RwLock<HashMap<vk::Instance, vk::PFN_vkGetInstanceProcAddr>> = RwLock::new(HashMap::new());
 
     // Instance → ash::Instance (we need this to call instance-level functions)
     static ref ASH_INSTANCES: RwLock<HashMap<vk::Instance, ash::Instance>> = RwLock::new(HashMap::new());
@@ -281,15 +291,28 @@ fn game_telemetry(host_pid: u32, frame: &TelemetryFrame) -> argus_ipc::GameTelem
 
 // ── Helper: build ash::StaticFn from our intercepted function pointer ───────
 
-unsafe fn make_static_fn() -> ash::StaticFn {
+fn make_static_fn(next_gipa: vk::PFN_vkGetInstanceProcAddr) -> ash::StaticFn {
     ash::StaticFn {
-        get_instance_proc_addr: get_next_gipa().expect(
-            "make_static_fn is only called after argus_vkCreateInstance has recorded next_gipa",
-        ),
+        get_instance_proc_addr: next_gipa,
     }
 }
 
 // ── Hooked Vulkan entry points ──────────────────────────────────────────────
+//
+// The rule for every hook: the game's call reaches the layer below us whenever
+// that is at all possible. Missing bookkeeping of ours costs the HUD, never
+// the game's call.
+
+/// Panic fallback for the create hooks. Once the real object exists it is the
+/// game's: report it as created, and the other hooks pass calls through for
+/// whatever bookkeeping the panic cut short. Before that, nothing exists.
+fn created_result(created: &Cell<bool>) -> vk::Result {
+    if created.get() {
+        vk::Result::SUCCESS
+    } else {
+        vk::Result::ERROR_INITIALIZATION_FAILED
+    }
+}
 
 // ---------- vkCreateInstance ----------
 
@@ -346,6 +369,7 @@ pub unsafe extern "system" fn argus_vkCreateInstance(
     p_allocator: *const vk::AllocationCallbacks,
     p_instance: *mut vk::Instance,
 ) -> vk::Result {
+    let created = Cell::new(false);
     guard(
         "vkCreateInstance",
         std::panic::AssertUnwindSafe(|| {
@@ -366,36 +390,25 @@ pub unsafe extern "system" fn argus_vkCreateInstance(
             *layer_link_ptr = (*layer_link).p_next as *mut VkLayerInstanceLink;
 
             // Get the real vkCreateInstance via the next layer's GetInstanceProcAddr
-            let ptr = next_gipa(
-                vk::Instance::null(),
-                c"vkCreateInstance".as_ptr() as *const c_char,
-            );
-            let real_create_instance: vk::PFN_vkCreateInstance = match ptr {
-                Some(p) => std::mem::transmute::<
-                    unsafe extern "system" fn(),
-                    for<'a, 'b> unsafe extern "system" fn(
-                        *const ash::vk::InstanceCreateInfo<'a>,
-                        *const ash::vk::AllocationCallbacks<'b>,
-                        *mut ash::vk::Instance,
-                    ) -> ash::vk::Result,
-                >(p),
-                None => return vk::Result::ERROR_INITIALIZATION_FAILED,
+            let Some(p) = next_gipa(vk::Instance::null(), c"vkCreateInstance".as_ptr()) else {
+                return vk::Result::ERROR_INITIALIZATION_FAILED;
             };
+            let real_create_instance: vk::PFN_vkCreateInstance = std::mem::transmute(p);
 
-            // Update our stored NEXT pointer
             set_next_gipa(next_gipa);
 
             let res = real_create_instance(p_create_info, p_allocator, p_instance);
             if res != vk::Result::SUCCESS {
                 return res;
             }
+            created.set(true);
 
             let instance = *p_instance;
             eprintln!("[Argus-Layer] Instance created: {:?}", instance);
+            INSTANCE_GIPA.write_or_recover().insert(instance, next_gipa);
 
             // Build an ash::Instance so we can call Vulkan functions through it later
-            let static_fn = make_static_fn();
-            let ash_inst = ash::Instance::load(&static_fn, instance);
+            let ash_inst = ash::Instance::load(&make_static_fn(next_gipa), instance);
             if let Ok(devices) = ash_inst.enumerate_physical_devices() {
                 let mut map = PHYS_TO_INST.write_or_recover();
                 for device in devices {
@@ -406,13 +419,45 @@ pub unsafe extern "system" fn argus_vkCreateInstance(
 
             vk::Result::SUCCESS
         }),
-        // The real instance may already exist by the time we panic (e.g.
-        // while indexing its physical devices) — we can't undo that from
-        // here, but reporting failure instead of aborting at least lets the
-        // game's own error handling run instead of taking the whole process
-        // down.
-        || vk::Result::ERROR_INITIALIZATION_FAILED,
+        || created_result(&created),
     )
+}
+
+/// # Safety
+/// As for `argus_vkCreateInstance`.
+#[no_mangle]
+pub unsafe extern "system" fn argus_vkDestroyInstance(
+    instance: vk::Instance,
+    p_allocator: *const vk::AllocationCallbacks,
+) {
+    // Resolve before forgetting the instance: its next layer is recorded with
+    // it. The real destroy runs even if our own cleanup panics.
+    let real = guard(
+        "vkDestroyInstance",
+        std::panic::AssertUnwindSafe(|| {
+            instance_gipa(instance)?(instance, c"vkDestroyInstance".as_ptr())
+        }),
+        || None,
+    );
+    guard(
+        "vkDestroyInstance",
+        std::panic::AssertUnwindSafe(|| forget_instance(instance)),
+        || (),
+    );
+    if let Some(real) = real {
+        let real: vk::PFN_vkDestroyInstance = std::mem::transmute(real);
+        real(instance, p_allocator);
+    }
+}
+
+/// Drop everything recorded for `instance`. Handles are recycled addresses: a
+/// stale entry would hand the next instance this one's function tables.
+fn forget_instance(instance: vk::Instance) {
+    ASH_INSTANCES.write_or_recover().remove(&instance);
+    PHYS_TO_INST
+        .write_or_recover()
+        .retain(|_, owner| *owner != instance);
+    INSTANCE_GIPA.write_or_recover().remove(&instance);
 }
 
 // ---------- vkEnumeratePhysicalDevices ----------
@@ -431,29 +476,19 @@ pub unsafe extern "system" fn argus_vkEnumeratePhysicalDevices(
     guard(
         "vkEnumeratePhysicalDevices",
         std::panic::AssertUnwindSafe(|| {
-            // Call the real function via raw pointer
-            let next = match get_next_gipa() {
-                Some(f) => f,
-                None => return vk::Result::ERROR_INITIALIZATION_FAILED,
+            let Some(next) = instance_gipa(instance) else {
+                return vk::Result::ERROR_INITIALIZATION_FAILED;
             };
-            let ptr = next(
-                instance,
-                c"vkEnumeratePhysicalDevices".as_ptr() as *const c_char,
-            );
-            let real_fn: vk::PFN_vkEnumeratePhysicalDevices = match ptr {
-                Some(p) => std::mem::transmute::<
-                    unsafe extern "system" fn(),
-                    unsafe extern "system" fn(
-                        ash::vk::Instance,
-                        *mut u32,
-                        *mut ash::vk::PhysicalDevice,
-                    ) -> ash::vk::Result,
-                >(p),
-                None => return vk::Result::ERROR_INITIALIZATION_FAILED,
+            let Some(p) = next(instance, c"vkEnumeratePhysicalDevices".as_ptr()) else {
+                return vk::Result::ERROR_INITIALIZATION_FAILED;
             };
+            let real_fn: vk::PFN_vkEnumeratePhysicalDevices = std::mem::transmute(p);
 
             let res = real_fn(instance, p_count, p_physical_devices);
-            if res == vk::Result::SUCCESS && !p_physical_devices.is_null() {
+            // INCOMPLETE still fills the array it was given.
+            if matches!(res, vk::Result::SUCCESS | vk::Result::INCOMPLETE)
+                && !p_physical_devices.is_null()
+            {
                 let count = *p_count as usize;
                 let devices = std::slice::from_raw_parts(p_physical_devices, count);
                 let mut map = PHYS_TO_INST.write_or_recover();
@@ -510,26 +545,25 @@ unsafe fn find_device_layer_link(
     None
 }
 
+type SetDeviceLoaderData = unsafe extern "system" fn(vk::Device, *mut c_void) -> vk::Result;
+
 /// Walk the pNext chain for the loader's VK_LOADER_DATA_CALLBACK entry
 /// (function == 1) — a separate entry from the layer link (function == 0)
 /// `find_device_layer_link` looks for, and present independently of it. The
 /// loader requires this callback to be invoked for every dispatchable handle
 /// a layer allocates on its own initiative (the command buffers OverlayState
 /// creates for HUD drawing); skipping it leaves those handles without a
-/// loader-recognised dispatch table. Shared by both the normal path and the
-/// "no layer link" fallback below, which used to only check for function==0
-/// and silently skip this entirely.
+/// loader-recognised dispatch table.
 unsafe fn find_loader_data_callback(
     p_create_info: *const vk::DeviceCreateInfo,
-) -> Option<unsafe extern "system" fn(vk::Device, *mut c_void) -> vk::Result> {
+) -> Option<SetDeviceLoaderData> {
     let mut chain = (*p_create_info).p_next as *const VkLayerDeviceCreateInfo;
     while !chain.is_null() {
         if (*chain).s_type == vk::StructureType::LOADER_DEVICE_CREATE_INFO && (*chain).function == 1
         {
-            return Some(std::mem::transmute::<
-                *const c_void,
-                unsafe extern "system" fn(vk::Device, *mut c_void) -> vk::Result,
-            >((*chain).u.pfn_set_device_loader_data));
+            return Some(std::mem::transmute::<*const c_void, SetDeviceLoaderData>(
+                (*chain).u.pfn_set_device_loader_data,
+            ));
         }
         chain = (*chain).p_next as *const VkLayerDeviceCreateInfo;
     }
@@ -554,150 +588,178 @@ pub unsafe extern "system" fn argus_vkCreateDevice(
     p_allocator: *const vk::AllocationCallbacks,
     p_device: *mut vk::Device,
 ) -> vk::Result {
+    let created = Cell::new(false);
     guard(
         "vkCreateDevice",
         std::panic::AssertUnwindSafe(|| {
-            let instance = match PHYS_TO_INST
+            // Unknown only if the handle bypassed both enumerate paths. That
+            // costs the HUD, not the device: a null instance still resolves
+            // vkCreateDevice further down the chain.
+            let instance = PHYS_TO_INST
                 .read_or_recover()
                 .get(&physical_device)
                 .copied()
-            {
-                Some(i) => i,
-                None => return vk::Result::ERROR_INITIALIZATION_FAILED,
-            };
+                .unwrap_or(vk::Instance::null());
 
-            // Find layer link in pNext chain
-            let layer_link_ptr = match find_device_layer_link(p_create_info) {
-                Some(ptr) => ptr,
+            // The loader hands us the next layer's entry points in the pNext
+            // chain. Without them, go through the instance chain instead.
+            let (next_gipa, next_gdpa) = match find_device_layer_link(p_create_info) {
+                Some(layer_link_ptr) => {
+                    let layer_link = *layer_link_ptr;
+                    let next = (
+                        (*layer_link).pfn_next_get_instance_proc_addr,
+                        Some((*layer_link).pfn_next_get_device_proc_addr),
+                    );
+                    // Advance the chain for the next layer
+                    *layer_link_ptr = (*layer_link).p_next as *mut VkLayerDeviceLink;
+                    next
+                }
                 None => {
-                    // Fallback: call through instance proc addr
                     eprintln!("[Argus-Layer] WARNING: No device layer link, falling back");
-                    let next = match get_next_gipa() {
-                        Some(f) => f,
-                        None => return vk::Result::ERROR_INITIALIZATION_FAILED,
+                    let Some(next_gipa) = instance_gipa(instance) else {
+                        return vk::Result::ERROR_INITIALIZATION_FAILED;
                     };
-                    let ptr = next(instance, c"vkCreateDevice".as_ptr() as *const c_char);
-                    let real_fn: vk::PFN_vkCreateDevice = match ptr {
-                        Some(p) => std::mem::transmute::<
-                            unsafe extern "system" fn(),
-                            for<'a, 'b> unsafe extern "system" fn(
-                                ash::vk::PhysicalDevice,
-                                *const ash::vk::DeviceCreateInfo<'a>,
-                                *const ash::vk::AllocationCallbacks<'b>,
-                                *mut ash::vk::Device,
-                            )
-                                -> ash::vk::Result,
-                        >(p),
-                        None => return vk::Result::ERROR_INITIALIZATION_FAILED,
-                    };
-                    // Same VK_LOADER_DATA_CALLBACK the normal path below
-                    // captures — this fallback used to skip it entirely,
-                    // leaving OverlayState's own command buffers without a
-                    // loader-recognised dispatch table.
-                    let set_loader_data = find_loader_data_callback(p_create_info);
-                    let res = real_fn(physical_device, p_create_info, p_allocator, p_device);
-                    if res == vk::Result::SUCCESS {
-                        let device = *p_device;
-                        eprintln!("[Argus-Layer] Device created (fallback): {:?}", device);
-                        if let Some(callback) = set_loader_data {
-                            LOADER_DATA.write_or_recover().insert(device, callback);
-                        }
-
-                        // For fallback, use the instance's get_device_proc_addr
-                        let Some(ash_inst) =
-                            ASH_INSTANCES.read_or_recover().get(&instance).cloned()
-                        else {
-                            eprintln!(
-                                "[Argus-Layer] ERROR: no ash::Instance recorded for {:?} \
-                                 in vkCreateDevice fallback — overlay disabled for this device",
-                                instance
-                            );
-                            return res;
-                        };
-                        let gipa = ash_inst.fp_v1_0().get_device_proc_addr;
-                        let ash_dev = ash::Device::load_with(
-                            |name| {
-                                let ptr = gipa(device, name.as_ptr());
-                                std::mem::transmute(ptr)
-                            },
-                            device,
-                        );
-                        DEVICE_MAP
-                            .write_or_recover()
-                            .insert(device, (physical_device, ash_dev));
-                        // We should also store it in DEVICE_GDPA so vkGetDeviceQueue etc work!
-                        DEVICE_GDPA.write_or_recover().insert(device, gipa);
-                    }
-                    return res;
+                    (next_gipa, None)
                 }
             };
 
-            let layer_link = *layer_link_ptr;
-            // Get the next layer's proc addrs from the chain
-            let next_gipa = (*layer_link).pfn_next_get_instance_proc_addr;
-            let next_gdpa = (*layer_link).pfn_next_get_device_proc_addr;
-
-            // Advance the chain for the next layer
-            *layer_link_ptr = (*layer_link).p_next as *mut VkLayerDeviceLink;
-
-            // Get the real vkCreateDevice via the next layer's GetInstanceProcAddr
-            let ptr = next_gipa(instance, c"vkCreateDevice".as_ptr() as *const c_char);
-            let real_fn: vk::PFN_vkCreateDevice = match ptr {
-                Some(p) => std::mem::transmute::<
-                    unsafe extern "system" fn(),
-                    for<'a, 'b> unsafe extern "system" fn(
-                        ash::vk::PhysicalDevice,
-                        *const ash::vk::DeviceCreateInfo<'a>,
-                        *const ash::vk::AllocationCallbacks<'b>,
-                        *mut ash::vk::Device,
-                    ) -> ash::vk::Result,
-                >(p),
-                None => return vk::Result::ERROR_INITIALIZATION_FAILED,
+            let Some(p) = next_gipa(instance, c"vkCreateDevice".as_ptr()) else {
+                return vk::Result::ERROR_INITIALIZATION_FAILED;
             };
+            let real_fn: vk::PFN_vkCreateDevice = std::mem::transmute(p);
 
             let set_loader_data = find_loader_data_callback(p_create_info);
             let res = real_fn(physical_device, p_create_info, p_allocator, p_device);
             if res != vk::Result::SUCCESS {
                 return res;
             }
+            created.set(true);
 
             let device = *p_device;
             eprintln!("[Argus-Layer] Device created: {:?}", device);
-            if let Some(callback) = set_loader_data {
-                LOADER_DATA.write_or_recover().insert(device, callback);
-            }
-
-            // Store the next layer's GDPA for this device so we can resolve device
-            // functions without going through our own hooks
-            DEVICE_GDPA.write_or_recover().insert(device, next_gdpa);
-
-            // Build ash::Device using the NEXT layer's function table (not ours!)
-            let ash_dev = ash::Device::load_with(
-                |name| {
-                    let ptr = next_gdpa(device, name.as_ptr());
-                    std::mem::transmute(ptr)
-                },
-                device,
-            );
-            DEVICE_MAP
-                .write_or_recover()
-                .insert(device, (physical_device, ash_dev));
-
-            // Record the first queue family requested
-            if !p_create_info.is_null() {
-                let ci = &*p_create_info;
-                if ci.queue_create_info_count > 0 && !ci.p_queue_create_infos.is_null() {
-                    let qci = &*ci.p_queue_create_infos;
-                    DEVICE_QUEUE_FAMILY
-                        .write_or_recover()
-                        .insert(device, qci.queue_family_index);
+            let next_gdpa = next_gdpa.or_else(|| {
+                let gdpa: vk::PFN_vkGetDeviceProcAddr =
+                    std::mem::transmute(next_gipa(instance, c"vkGetDeviceProcAddr".as_ptr())?);
+                Some(gdpa)
+            });
+            match next_gdpa {
+                Some(gdpa) => record_device(
+                    physical_device,
+                    device,
+                    gdpa,
+                    p_create_info,
+                    set_loader_data,
+                ),
+                None => {
+                    eprintln!("[Argus-Layer] ERROR: no vkGetDeviceProcAddr below us for {device:?}")
                 }
             }
-
             vk::Result::SUCCESS
         }),
-        || vk::Result::ERROR_INITIALIZATION_FAILED,
+        || created_result(&created),
     )
+}
+
+/// Record what the other hooks need to know about a device the game created.
+unsafe fn record_device(
+    physical_device: vk::PhysicalDevice,
+    device: vk::Device,
+    next_gdpa: vk::PFN_vkGetDeviceProcAddr,
+    p_create_info: *const vk::DeviceCreateInfo,
+    set_loader_data: Option<SetDeviceLoaderData>,
+) {
+    if let Some(callback) = set_loader_data {
+        LOADER_DATA.write_or_recover().insert(device, callback);
+    }
+    // Store the next layer's GDPA for this device so we can resolve device
+    // functions without going through our own hooks
+    DEVICE_GDPA.write_or_recover().insert(device, next_gdpa);
+
+    // Build ash::Device using the NEXT layer's function table (not ours!)
+    let ash_dev = ash::Device::load_with(
+        |name| {
+            let ptr = next_gdpa(device, name.as_ptr());
+            std::mem::transmute(ptr)
+        },
+        device,
+    );
+    DEVICE_MAP
+        .write_or_recover()
+        .insert(device, (physical_device, ash_dev));
+
+    // Record the first queue family requested
+    let ci = &*p_create_info;
+    if ci.queue_create_info_count > 0 && !ci.p_queue_create_infos.is_null() {
+        DEVICE_QUEUE_FAMILY
+            .write_or_recover()
+            .insert(device, (*ci.p_queue_create_infos).queue_family_index);
+    }
+}
+
+/// # Safety
+/// As for `argus_vkCreateDevice`.
+#[no_mangle]
+pub unsafe extern "system" fn argus_vkDestroyDevice(
+    device: vk::Device,
+    p_allocator: *const vk::AllocationCallbacks,
+) {
+    // Resolve before forgetting the device: its next layer is recorded with
+    // it. The real destroy runs even if our own cleanup panics.
+    let real = guard(
+        "vkDestroyDevice",
+        std::panic::AssertUnwindSafe(|| next_device_fn(device, c"vkDestroyDevice")),
+        || None,
+    );
+    guard(
+        "vkDestroyDevice",
+        std::panic::AssertUnwindSafe(|| forget_device(device)),
+        || (),
+    );
+    if let Some(real) = real {
+        let real: vk::PFN_vkDestroyDevice = std::mem::transmute(real);
+        real(device, p_allocator);
+    }
+}
+
+/// Drop everything recorded for `device` and its queues, destroying any HUD
+/// resources a swapchain the game never destroyed left behind. Handles are
+/// recycled addresses: a stale entry would hand the next device this one's
+/// function table and HUD state.
+unsafe fn forget_device(device: vk::Device) {
+    let leftovers: Vec<OverlayState> = {
+        let mut states = OVERLAY_STATES.lock_or_recover();
+        let swapchains: Vec<_> = states
+            .iter()
+            .filter(|(_, state)| state.device == device)
+            .map(|(&swapchain, _)| swapchain)
+            .collect();
+        swapchains
+            .iter()
+            .filter_map(|swapchain| states.remove(swapchain))
+            .collect()
+    };
+    if let Some((_, dev)) = DEVICE_MAP.write_or_recover().remove(&device) {
+        for state in &leftovers {
+            state.destroy(&dev);
+        }
+    }
+
+    let mut queues = Vec::new();
+    QUEUE_TO_DEVICE.write_or_recover().retain(|&queue, owner| {
+        let ours = *owner == device;
+        if ours {
+            queues.push(queue);
+        }
+        !ours
+    });
+    for queue in &queues {
+        QUEUE_FAMILIES.write_or_recover().remove(queue);
+        GRAPHICS_QUEUES.write_or_recover().remove(queue);
+        REAL_QUEUE_PRESENT.write_or_recover().remove(queue);
+    }
+    DEVICE_QUEUE_FAMILY.write_or_recover().remove(&device);
+    LOADER_DATA.write_or_recover().remove(&device);
+    DEVICE_GDPA.write_or_recover().remove(&device);
 }
 
 unsafe fn register_graphics_queue(device: vk::Device, queue: vk::Queue, family: u32) {
@@ -714,7 +776,22 @@ unsafe fn register_graphics_queue(device: vk::Device, queue: vk::Queue, family: 
     }
 }
 
-// ---------- vkGetDeviceQueue ----------
+// ---------- vkGetDeviceQueue / vkGetDeviceQueue2 ----------
+
+/// Record a queue the game just obtained, and the next layer's present for it.
+unsafe fn record_queue(device: vk::Device, queue: vk::Queue, family: u32) {
+    if queue == vk::Queue::null() {
+        return;
+    }
+    QUEUE_TO_DEVICE.write_or_recover().insert(queue, device);
+    QUEUE_FAMILIES.write_or_recover().insert(queue, family);
+    register_graphics_queue(device, queue, family);
+    if let Some(ptr) = next_device_fn(device, c"vkQueuePresentKHR") {
+        let real: vk::PFN_vkQueuePresentKHR = std::mem::transmute(ptr);
+        REAL_QUEUE_PRESENT.write_or_recover().insert(queue, real);
+    }
+    eprintln!("[Argus-Layer] Queue obtained: {:?}", queue);
+}
 
 /// # Safety
 /// The Vulkan loader/caller must supply valid handles, pointer ranges and
@@ -731,48 +808,56 @@ pub unsafe extern "system" fn argus_vkGetDeviceQueue(
     guard(
         "vkGetDeviceQueue",
         std::panic::AssertUnwindSafe(|| {
-            eprintln!(
-                "[Argus-Layer] vkGetDeviceQueue called (device={:?}, family={}, idx={})",
-                device, queue_family_index, queue_index
-            );
-
-            // Call the real vkGetDeviceQueue via raw pointer
-            let next = match DEVICE_GDPA.read_or_recover().get(&device).copied() {
-                Some(f) => f,
-                None => {
-                    eprintln!("[Argus-Layer] ERROR: No DEVICE_GDPA for device in vkGetDeviceQueue");
-                    return;
-                }
-            };
-            let ptr = next(device, c"vkGetDeviceQueue".as_ptr() as *const c_char);
-            let real_fn: vk::PFN_vkGetDeviceQueue = match ptr {
-                Some(p) => std::mem::transmute::<
-                    unsafe extern "system" fn(),
-                    unsafe extern "system" fn(ash::vk::Device, u32, u32, *mut ash::vk::Queue),
-                >(p),
-                None => {
-                    eprintln!("[Argus-Layer] ERROR: Could not get real vkGetDeviceQueue");
-                    return;
-                }
-            };
-
-            real_fn(device, queue_family_index, queue_index, p_queue);
-            let queue = *p_queue;
-
-            QUEUE_TO_DEVICE.write_or_recover().insert(queue, device);
-            QUEUE_FAMILIES
-                .write_or_recover()
-                .insert(queue, queue_family_index);
-            register_graphics_queue(device, queue, queue_family_index);
-
-            // Capture the real vkQueuePresentKHR for this device
-            let present_ptr = next(device, c"vkQueuePresentKHR".as_ptr() as *const c_char);
-            if let Some(present_ptr) = present_ptr {
-                let real: vk::PFN_vkQueuePresentKHR = std::mem::transmute(present_ptr);
-                REAL_QUEUE_PRESENT.write_or_recover().insert(queue, real);
+            if p_queue.is_null() {
+                return;
             }
+            let Some(ptr) = next_device_fn(device, c"vkGetDeviceQueue") else {
+                // Nothing below us to ask. A null handle is at least
+                // deterministic, unlike the uninitialized memory the caller
+                // would otherwise read back.
+                eprintln!("[Argus-Layer] ERROR: Could not get real vkGetDeviceQueue");
+                *p_queue = vk::Queue::null();
+                return;
+            };
+            let real_fn: vk::PFN_vkGetDeviceQueue = std::mem::transmute(ptr);
+            real_fn(device, queue_family_index, queue_index, p_queue);
+            record_queue(device, *p_queue, queue_family_index);
+        }),
+        || (),
+    )
+}
 
-            eprintln!("[Argus-Layer] Queue obtained: {:?}", queue);
+/// # Safety
+/// The Vulkan loader/caller must supply valid handles, pointer ranges and
+/// allocation callbacks for this entry point, and satisfy Vulkan external
+/// synchronization requirements. Returned function pointers must be called
+/// with the corresponding Vulkan command signature.
+#[no_mangle]
+pub unsafe extern "system" fn argus_vkGetDeviceQueue2(
+    device: vk::Device,
+    info: *const vk::DeviceQueueInfo2,
+    queue: *mut vk::Queue,
+) {
+    guard(
+        "vkGetDeviceQueue2",
+        std::panic::AssertUnwindSafe(|| {
+            // Per spec both must be non-null; guarding it turns a malformed
+            // call from a layer below us into a no-op instead of a null
+            // deref (UB, not something catch_unwind can catch).
+            if info.is_null() || queue.is_null() {
+                return;
+            }
+            // Through the raw pointer, not ash's table: ash fills a command
+            // the driver lacks with a stub that panics across an
+            // `extern "system"` boundary, which aborts before `guard` sees it.
+            let Some(ptr) = next_device_fn(device, c"vkGetDeviceQueue2") else {
+                eprintln!("[Argus-Layer] ERROR: Could not get real vkGetDeviceQueue2");
+                *queue = vk::Queue::null();
+                return;
+            };
+            let real_fn: vk::PFN_vkGetDeviceQueue2 = std::mem::transmute(ptr);
+            real_fn(device, info, queue);
+            record_queue(device, *queue, (*info).queue_family_index);
         }),
         || (),
     )
@@ -792,129 +877,103 @@ pub unsafe extern "system" fn argus_vkCreateSwapchainKHR(
     p_allocator: *const vk::AllocationCallbacks,
     p_swapchain: *mut vk::SwapchainKHR,
 ) -> vk::Result {
+    let created = Cell::new(false);
     guard(
         "vkCreateSwapchainKHR",
         std::panic::AssertUnwindSafe(|| {
-            let (physical_device, ash_dev) = {
-                let map = DEVICE_MAP.read_or_recover();
-                match map.get(&device) {
-                    Some((pd, dev)) => (*pd, dev.clone()),
-                    None => return vk::Result::ERROR_INITIALIZATION_FAILED,
-                }
+            let Some(ptr) = next_device_fn(device, c"vkCreateSwapchainKHR") else {
+                return vk::Result::ERROR_INITIALIZATION_FAILED;
             };
-
-            let instance = match PHYS_TO_INST
-                .read_or_recover()
-                .get(&physical_device)
-                .copied()
-            {
-                Some(i) => i,
-                None => return vk::Result::ERROR_INITIALIZATION_FAILED,
-            };
-
-            // Call real vkCreateSwapchainKHR via raw pointer
-            let real_fn: vk::PFN_vkCreateSwapchainKHR = {
-                match DEVICE_GDPA.read_or_recover().get(&device).copied() {
-                    Some(next) => {
-                        let ptr = next(device, c"vkCreateSwapchainKHR".as_ptr() as *const c_char);
-                        match ptr {
-                            Some(p) => std::mem::transmute::<
-                                unsafe extern "system" fn(),
-                                for<'a, 'b> unsafe extern "system" fn(
-                                    ash::vk::Device,
-                                    *const ash::vk::SwapchainCreateInfoKHR<'a>,
-                                    *const ash::vk::AllocationCallbacks<'b>,
-                                    *mut ash::vk::SwapchainKHR,
-                                )
-                                    -> ash::vk::Result,
-                            >(p),
-                            None => return vk::Result::ERROR_INITIALIZATION_FAILED,
-                        }
-                    }
-                    None => return vk::Result::ERROR_INITIALIZATION_FAILED,
-                }
-            };
-
+            let real_fn: vk::PFN_vkCreateSwapchainKHR = std::mem::transmute(ptr);
             let res = real_fn(device, p_create_info, p_allocator, p_swapchain);
             if res != vk::Result::SUCCESS {
                 return res;
             }
+            created.set(true);
 
             let swapchain = *p_swapchain;
             let ci = &*p_create_info;
-            let format = ci.image_format;
-            let extent = ci.image_extent;
-
             eprintln!(
                 "[Argus-Layer] Swapchain created: {:?} ({}x{}, format {:?})",
-                swapchain, extent.width, extent.height, format
+                swapchain, ci.image_extent.width, ci.image_extent.height, ci.image_format
             );
-
-            if *PASSTHROUGH {
-                return vk::Result::SUCCESS;
+            if !*PASSTHROUGH {
+                init_overlay(device, ci, swapchain);
             }
-            if !ci
-                .image_usage
-                .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                || ci.image_array_layers != 1
-                || ci.flags.contains(vk::SwapchainCreateFlagsKHR::PROTECTED)
-            {
-                eprintln!(
-                    "[Argus-Layer] HUD skipped: unsupported swapchain usage/layers/protection"
-                );
-                return vk::Result::SUCCESS;
-            }
-            // Get swapchain images
-            let ash_instances = ASH_INSTANCES.read_or_recover();
-            let ash_inst = match ash_instances.get(&instance) {
-                Some(i) => i,
-                None => return vk::Result::SUCCESS,
-            };
-            let swapchain_fn = ash::khr::swapchain::Device::new(ash_inst, &ash_dev);
-            let images = match swapchain_fn.get_swapchain_images(swapchain) {
-                Ok(imgs) => imgs,
-                Err(_) => return vk::Result::SUCCESS,
-            };
-
-            // Get queue family for command pool
-            let qf = DEVICE_QUEUE_FAMILY
-                .read_or_recover()
-                .get(&device)
-                .copied()
-                .unwrap_or(0);
-
-            // Create overlay state
-            match renderer::OverlayState::new(
-                ash_inst,
-                physical_device,
-                &ash_dev,
-                qf,
-                &images,
-                format,
-                extent,
-                ci.pre_transform,
-            ) {
-                Some(mut state) => {
-                    state.swapchain = swapchain;
-                    OVERLAY_STATES.lock_or_recover().insert(swapchain, state);
-                    eprintln!(
-                        "[Argus-Layer] Overlay initialised for swapchain ({} images)",
-                        images.len()
-                    );
-                }
-                None => {
-                    eprintln!("[Argus-Layer] WARNING: Could not create overlay resources");
-                }
-            }
-
             vk::Result::SUCCESS
         }),
-        // The real swapchain may already be created by the time a panic hits
-        // (e.g. while building our own overlay resources for it) — we can't
-        // undo that, but the game still gets a real swapchain back; it just
-        // won't have our HUD drawn on it, which beats losing the process.
-        || vk::Result::ERROR_INITIALIZATION_FAILED,
+        || created_result(&created),
     )
+}
+
+/// Build the HUD resources for a swapchain the game just created. Any gap in
+/// what we know about the device leaves the swapchain without a HUD.
+unsafe fn init_overlay(
+    device: vk::Device,
+    ci: &vk::SwapchainCreateInfoKHR,
+    swapchain: vk::SwapchainKHR,
+) {
+    if !ci
+        .image_usage
+        .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        || ci.image_array_layers != 1
+        || ci.flags.contains(vk::SwapchainCreateFlagsKHR::PROTECTED)
+    {
+        eprintln!("[Argus-Layer] HUD skipped: unsupported swapchain usage/layers/protection");
+        return;
+    }
+    let Some((physical_device, ash_dev)) = DEVICE_MAP
+        .read_or_recover()
+        .get(&device)
+        .map(|(pd, dev)| (*pd, dev.clone()))
+    else {
+        return;
+    };
+    let Some(instance) = PHYS_TO_INST
+        .read_or_recover()
+        .get(&physical_device)
+        .copied()
+    else {
+        return;
+    };
+    let ash_instances = ASH_INSTANCES.read_or_recover();
+    let Some(ash_inst) = ash_instances.get(&instance) else {
+        return;
+    };
+    let swapchain_fn = ash::khr::swapchain::Device::new(ash_inst, &ash_dev);
+    let Ok(images) = swapchain_fn.get_swapchain_images(swapchain) else {
+        return;
+    };
+
+    // Get queue family for command pool
+    let qf = DEVICE_QUEUE_FAMILY
+        .read_or_recover()
+        .get(&device)
+        .copied()
+        .unwrap_or(0);
+
+    match renderer::OverlayState::new(
+        ash_inst,
+        physical_device,
+        &ash_dev,
+        qf,
+        &images,
+        ci.image_format,
+        ci.image_extent,
+        ci.pre_transform,
+    ) {
+        Some(mut state) => {
+            state.swapchain = swapchain;
+            OVERLAY_STATES.lock_or_recover().insert(swapchain, state);
+            eprintln!(
+                "[Argus-Layer] Overlay initialised for swapchain ({} images)",
+                images.len()
+            );
+        }
+        None => {
+            eprintln!("[Argus-Layer] WARNING: Could not create overlay resources");
+        }
+    }
 }
 
 // ---------- vkQueuePresentKHR (the main drawing hook) ----------
@@ -929,12 +988,14 @@ pub unsafe extern "system" fn argus_vkQueuePresentKHR(
     queue: vk::Queue,
     info: *const vk::PresentInfoKHR,
 ) -> vk::Result {
+    let presented = Cell::new(None);
     guard(
         "vkQueuePresentKHR",
         std::panic::AssertUnwindSafe(|| {
             let ticket = if *ACTIVE { capture::ticket() } else { 0 };
             let begin = (ticket != 0).then(Instant::now);
             let result = present_impl(queue, info);
+            presented.set(Some(result));
             if let Some(at) = begin {
                 use ash::vk::Handle;
                 if !info.is_null() && !(*info).p_swapchains.is_null() {
@@ -956,57 +1017,74 @@ pub unsafe extern "system" fn argus_vkQueuePresentKHR(
             }
             result
         }),
-        // A panic anywhere in our overlay path (recording, capture, the
-        // shared maps) must still let the frame reach the screen: look the
-        // real present function up again and call it directly, skipping the
-        // overlay entirely for this one frame instead of losing the frame
-        // (or the whole game) to an unrelated bug in our drawing code.
+        // A panic in our overlay path must still let the frame reach the
+        // screen, exactly once: if the real present already ran, report its
+        // result; otherwise present the game's frame unchanged.
         || {
-            REAL_QUEUE_PRESENT
-                .read_or_recover()
-                .get(&queue)
-                .copied()
-                .map(|real| real(queue, info))
-                .unwrap_or(vk::Result::ERROR_DEVICE_LOST)
+            presented.get().unwrap_or_else(|| {
+                real_present(queue).map_or(vk::Result::ERROR_DEVICE_LOST, |real| real(queue, info))
+            })
         },
     )
 }
+
+/// The next layer's vkQueuePresentKHR for `queue`: cached when the queue was
+/// obtained, otherwise resolved through the queue's device.
+unsafe fn real_present(queue: vk::Queue) -> Option<vk::PFN_vkQueuePresentKHR> {
+    if let Some(real) = REAL_QUEUE_PRESENT.read_or_recover().get(&queue).copied() {
+        return Some(real);
+    }
+    let device = QUEUE_TO_DEVICE.read_or_recover().get(&queue).copied()?;
+    let real: vk::PFN_vkQueuePresentKHR =
+        std::mem::transmute(next_device_fn(device, c"vkQueuePresentKHR")?);
+    REAL_QUEUE_PRESENT.write_or_recover().insert(queue, real);
+    Some(real)
+}
+
 unsafe fn present_impl(queue: vk::Queue, p_present_info: *const vk::PresentInfoKHR) -> vk::Result {
-    let Some(real) = REAL_QUEUE_PRESENT.read_or_recover().get(&queue).copied() else {
+    let Some(real) = real_present(queue) else {
         return vk::Result::ERROR_DEVICE_LOST;
     };
     if *PASSTHROUGH || p_present_info.is_null() {
         return real(queue, p_present_info);
     }
-    let pi = &*p_present_info;
+    // Every lock of ours is released by now: the real present may block for
+    // vsync, and must not stall other swapchains or the destroy hooks.
+    match submit_overlay(queue, &*p_present_info) {
+        Some(overlay_done) => {
+            // Our submission already waited on the game's semaphores, so the
+            // present waits on ours instead.
+            let mut present = *p_present_info;
+            present.wait_semaphore_count = 1;
+            present.p_wait_semaphores = &overlay_done;
+            real(queue, &present)
+        }
+        None => real(queue, p_present_info),
+    }
+}
+
+/// Record and submit the HUD for this present. Returns the semaphore the
+/// present must wait on, or None to present the game's frame unchanged.
+unsafe fn submit_overlay(queue: vk::Queue, pi: &vk::PresentInfoKHR) -> Option<vk::Semaphore> {
     // Multiple swapchains require a combined submission and semaphore lifetime
     // scheme. Preserve presentation unchanged for this untested route.
     if pi.swapchain_count != 1 {
-        return real(queue, p_present_info);
+        return None;
     }
     // Per spec these are non-null whenever swapchain_count == 1, but a layer
     // stacked below us handing back a malformed PresentInfoKHR would
-    // otherwise be a null deref here (UB, not a catchable panic) rather than
-    // the graceful pass-through every other unmet expectation in this
-    // function falls back to.
+    // otherwise be a null deref here (UB, not a catchable panic).
     if pi.p_swapchains.is_null() || pi.p_image_indices.is_null() {
-        return real(queue, p_present_info);
+        return None;
     }
-    let Some(device) = QUEUE_TO_DEVICE.read_or_recover().get(&queue).copied() else {
-        return real(queue, p_present_info);
-    };
+    let device = QUEUE_TO_DEVICE.read_or_recover().get(&queue).copied()?;
     let device_map = DEVICE_MAP.read_or_recover();
-    let Some((_, dev)) = device_map.get(&device) else {
-        return real(queue, p_present_info);
-    };
+    let (_, dev) = device_map.get(&device)?;
     let mut states = OVERLAY_STATES.lock_or_recover();
-    let Some(state) = states.get_mut(&*pi.p_swapchains) else {
-        return real(queue, p_present_info);
-    };
+    let state = states.get_mut(&*pi.p_swapchains)?;
     state.stats.record(Instant::now());
-    let family = QUEUE_FAMILIES.read_or_recover().get(&queue).copied();
-    if family != Some(state.queue_family) {
-        return real(queue, p_present_info);
+    if QUEUE_FAMILIES.read_or_recover().get(&queue).copied() != Some(state.queue_family) {
+        return None;
     }
     if !GRAPHICS_QUEUES
         .read_or_recover()
@@ -1014,10 +1092,10 @@ unsafe fn present_impl(queue: vk::Queue, p_present_info: *const vk::PresentInfoK
         .copied()
         .unwrap_or(false)
     {
-        return real(queue, p_present_info);
+        return None;
     }
     if state.draw_queue.is_some_and(|previous| previous != queue) {
-        return real(queue, p_present_info);
+        return None;
     }
     state.draw_queue = Some(queue);
     let index = *pi.p_image_indices as usize;
@@ -1041,96 +1119,40 @@ unsafe fn present_impl(queue: vk::Queue, p_present_info: *const vk::PresentInfoK
         &config,
     );
     drop(tel);
-    if let Some(cb) = cb {
-        let waits = if pi.wait_semaphore_count == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(pi.p_wait_semaphores, pi.wait_semaphore_count as usize)
-        };
-        let stages = vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT; waits.len()];
-        let signal = [state.complete[index]];
-        let buffers = [cb];
-        let submit = vk::SubmitInfo::default()
-            .wait_semaphores(waits)
-            .wait_dst_stage_mask(&stages)
-            .command_buffers(&buffers)
-            .signal_semaphores(&signal);
-        if let Err(e) = dev.reset_fences(&[state.fences[index]]) {
-            state.disabled = true;
-            eprintln!("[Argus-Layer] reset fence failed: {e:?}");
-            return real(queue, p_present_info);
-        }
-        match dev.queue_submit(queue, &[submit], state.fences[index]) {
-            Ok(()) => {
-                let mut present = *pi;
-                present.wait_semaphore_count = 1;
-                present.p_wait_semaphores = signal.as_ptr();
-                drop(states);
-                drop(device_map);
-                return real(queue, &present);
-            }
-            Err(e) => {
-                state.disabled = true;
-                eprintln!("[Argus-Layer] overlay submit failed: {e:?}");
-                return e;
-            }
-        }
+    let cb = cb?;
+
+    let waits = if pi.wait_semaphore_count == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(pi.p_wait_semaphores, pi.wait_semaphore_count as usize)
+    };
+    let stages = vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT; waits.len()];
+    let signal = [state.complete[index]];
+    let buffers = [cb];
+    let submit = vk::SubmitInfo::default()
+        .wait_semaphores(waits)
+        .wait_dst_stage_mask(&stages)
+        .command_buffers(&buffers)
+        .signal_semaphores(&signal);
+    if let Err(e) = dev.reset_fences(&[state.fences[index]]) {
+        state.disabled = true;
+        state.abandoned_fence = Some(index);
+        eprintln!("[Argus-Layer] reset fence failed: {e:?}");
+        return None;
     }
-    drop(states);
-    drop(device_map);
-    real(queue, p_present_info)
+    // A failed vkQueueSubmit leaves the semaphores it names untouched (spec),
+    // so the game's frame can still be presented as it was.
+    if let Err(e) = dev.queue_submit(queue, &[submit], state.fences[index]) {
+        state.disabled = true;
+        state.abandoned_fence = Some(index);
+        eprintln!("[Argus-Layer] overlay submit failed: {e:?}");
+        return None;
+    }
+    Some(state.complete[index])
 }
 
-/// # Safety
-/// The Vulkan loader/caller must supply valid handles, pointer ranges and
-/// allocation callbacks for this entry point, and satisfy Vulkan external
-/// synchronization requirements. Returned function pointers must be called
-/// with the corresponding Vulkan command signature.
-#[no_mangle]
-pub unsafe extern "system" fn argus_vkGetDeviceQueue2(
-    device: vk::Device,
-    info: *const vk::DeviceQueueInfo2,
-    queue: *mut vk::Queue,
-) {
-    guard(
-        "vkGetDeviceQueue2",
-        std::panic::AssertUnwindSafe(|| {
-            // Per spec both must be non-null; guarding it turns a malformed
-            // call from a layer below us into a no-op instead of a null
-            // deref (UB, not something catch_unwind can catch).
-            if info.is_null() || queue.is_null() {
-                return;
-            }
-            let map = DEVICE_MAP.read_or_recover();
-            let Some((_, dev)) = map.get(&device) else {
-                return;
-            };
-            *queue = dev.get_device_queue2(&*info);
-            QUEUE_TO_DEVICE.write_or_recover().insert(*queue, device);
-            QUEUE_FAMILIES
-                .write_or_recover()
-                .insert(*queue, (*info).queue_family_index);
-            drop(map);
-            register_graphics_queue(device, *queue, (*info).queue_family_index);
-            if let Some(next) = DEVICE_GDPA.read_or_recover().get(&device).copied() {
-                if let Some(ptr) = next(device, c"vkQueuePresentKHR".as_ptr()) {
-                    REAL_QUEUE_PRESENT.write_or_recover().insert(
-                        *queue,
-                        std::mem::transmute::<
-                            unsafe extern "system" fn(),
-                            for<'a> unsafe extern "system" fn(
-                                ash::vk::Queue,
-                                *const ash::vk::PresentInfoKHR<'a>,
-                            )
-                                -> ash::vk::Result,
-                        >(ptr),
-                    );
-                }
-            }
-        }),
-        || (),
-    )
-}
+// ---------- vkDestroySwapchainKHR ----------
+
 /// # Safety
 /// The Vulkan loader/caller must supply valid handles, pointer ranges and
 /// allocation callbacks for this entry point, and satisfy Vulkan external
@@ -1142,38 +1164,60 @@ pub unsafe extern "system" fn argus_vkDestroySwapchainKHR(
     swapchain: vk::SwapchainKHR,
     allocator: *const vk::AllocationCallbacks,
 ) {
+    // Resolved first so the real destroy runs even if our own cleanup panics:
+    // losing it would leak the swapchain for the rest of the process.
+    let real = guard(
+        "vkDestroySwapchainKHR",
+        std::panic::AssertUnwindSafe(|| next_device_fn(device, c"vkDestroySwapchainKHR")),
+        || None,
+    );
     guard(
         "vkDestroySwapchainKHR",
         std::panic::AssertUnwindSafe(|| {
             use ash::vk::Handle;
             capture::end(swapchain.as_raw());
-            if let Some(state) = OVERLAY_STATES.lock_or_recover().remove(&swapchain) {
-                if let Some((_, dev)) = DEVICE_MAP.read_or_recover().get(&device) {
-                    state.destroy(dev);
-                }
-            }
-            if let Some(next) = DEVICE_GDPA.read_or_recover().get(&device).copied() {
-                if let Some(ptr) = next(device, c"vkDestroySwapchainKHR".as_ptr()) {
-                    let real: vk::PFN_vkDestroySwapchainKHR = std::mem::transmute(ptr);
-                    real(device, swapchain, allocator);
+            // Out of the map first, and its lock released: destroying waits
+            // for our GPU work, which must not stall other swapchains' presents.
+            let state = OVERLAY_STATES.lock_or_recover().remove(&swapchain);
+            if let Some(state) = state {
+                let dev = DEVICE_MAP
+                    .read_or_recover()
+                    .get(&device)
+                    .map(|(_, dev)| dev.clone());
+                if let Some(dev) = dev {
+                    state.destroy(&dev);
                 }
             }
         }),
-        // Even on panic, still try to call the real destroy so the driver
-        // frees the swapchain — losing this call would leak the resource
-        // for the rest of the process's life, on top of whatever bug panicked.
-        || {
-            if let Some(next) = DEVICE_GDPA.read_or_recover().get(&device).copied() {
-                if let Some(ptr) = next(device, c"vkDestroySwapchainKHR".as_ptr()) {
-                    let real: vk::PFN_vkDestroySwapchainKHR = std::mem::transmute(ptr);
-                    real(device, swapchain, allocator);
-                }
-            }
-        },
-    )
+        || (),
+    );
+    if let Some(real) = real {
+        let real: vk::PFN_vkDestroySwapchainKHR = std::mem::transmute(real);
+        real(device, swapchain, allocator);
+    }
 }
 
-// ── Dispatch: vkGetInstanceProcAddr ─────────────────────────────────────────
+// ── Dispatch ────────────────────────────────────────────────────────────────
+
+/// One of our entry points as the loader's generic `PFN_vkVoidFunction`.
+macro_rules! hook {
+    ($f:expr) => {
+        Some(std::mem::transmute::<*const (), unsafe extern "system" fn()>($f as *const ()))
+    };
+}
+
+/// Our device-level hooks, reachable through either GetProcAddr.
+unsafe fn device_hook(name: &[u8]) -> vk::PFN_vkVoidFunction {
+    match name {
+        b"vkDestroyDevice" => hook!(argus_vkDestroyDevice),
+        b"vkGetDeviceQueue" => hook!(argus_vkGetDeviceQueue),
+        b"vkGetDeviceQueue2" => hook!(argus_vkGetDeviceQueue2),
+        b"vkCreateSwapchainKHR" => hook!(argus_vkCreateSwapchainKHR),
+        b"vkDestroySwapchainKHR" => hook!(argus_vkDestroySwapchainKHR),
+        b"vkQueuePresentKHR" => hook!(argus_vkQueuePresentKHR),
+        _ => None,
+    }
+}
 
 /// # Safety
 /// The Vulkan loader/caller must supply valid handles, pointer ranges and
@@ -1191,75 +1235,19 @@ pub unsafe extern "system" fn vkGetInstanceProcAddr(
             if p_name.is_null() {
                 return None;
             }
-            let name = CStr::from_ptr(p_name);
-
-            match name.to_bytes() {
-                b"vkGetInstanceProcAddr" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(
-                    vkGetInstanceProcAddr as *const ()
-                )),
-                b"vkGetDeviceProcAddr" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(vkGetDeviceProcAddr as *const ())),
-                b"vkGetDeviceQueue2" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(
-                    argus_vkGetDeviceQueue2 as *const ()
-                )),
-                b"vkDestroySwapchainKHR" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(
-                    argus_vkDestroySwapchainKHR as *const ()
-                )),
-                b"vkCreateInstance" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(argus_vkCreateInstance as *const ())),
-                b"vkEnumeratePhysicalDevices" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(
-                    argus_vkEnumeratePhysicalDevices as *const (),
-                )),
-                b"vkGetDeviceQueue" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(argus_vkGetDeviceQueue as *const ())),
-                b"vkCreateSwapchainKHR" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(
-                    argus_vkCreateSwapchainKHR as *const ()
-                )),
-                b"vkQueuePresentKHR" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(
-                    argus_vkQueuePresentKHR as *const ()
-                )),
-                b"vkCreateDevice" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(argus_vkCreateDevice as *const ())),
-                _ => {
-                    if let Some(next) = get_next_gipa() {
-                        next(instance, p_name)
-                    } else {
-                        None
-                    }
-                }
+            match CStr::from_ptr(p_name).to_bytes() {
+                b"vkGetInstanceProcAddr" => hook!(vkGetInstanceProcAddr),
+                b"vkGetDeviceProcAddr" => hook!(vkGetDeviceProcAddr),
+                b"vkCreateInstance" => hook!(argus_vkCreateInstance),
+                b"vkDestroyInstance" => hook!(argus_vkDestroyInstance),
+                b"vkEnumeratePhysicalDevices" => hook!(argus_vkEnumeratePhysicalDevices),
+                b"vkCreateDevice" => hook!(argus_vkCreateDevice),
+                name => device_hook(name).or_else(|| instance_gipa(instance)?(instance, p_name)),
             }
         }),
         || None,
     )
 }
-
-// ── Dispatch: vkGetDeviceProcAddr ───────────────────────────────────────────
 
 /// # Safety
 /// The Vulkan loader/caller must supply valid handles, pointer ranges and
@@ -1278,50 +1266,9 @@ pub unsafe extern "system" fn vkGetDeviceProcAddr(
                 return None;
             }
             let name = CStr::from_ptr(p_name);
-
             match name.to_bytes() {
-                b"vkGetDeviceProcAddr" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(vkGetDeviceProcAddr as *const ())),
-                b"vkGetDeviceQueue2" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(
-                    argus_vkGetDeviceQueue2 as *const ()
-                )),
-                b"vkDestroySwapchainKHR" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(
-                    argus_vkDestroySwapchainKHR as *const ()
-                )),
-                b"vkGetDeviceQueue" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(argus_vkGetDeviceQueue as *const ())),
-                b"vkCreateSwapchainKHR" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(
-                    argus_vkCreateSwapchainKHR as *const ()
-                )),
-                b"vkQueuePresentKHR" => Some(std::mem::transmute::<
-                    *const (),
-                    unsafe extern "system" fn(),
-                >(
-                    argus_vkQueuePresentKHR as *const ()
-                )),
-                _ => {
-                    let next_gdpa = DEVICE_GDPA.read_or_recover().get(&device).copied();
-                    if let Some(next) = next_gdpa {
-                        next(device, p_name)
-                    } else if let Some(next) = get_next_gdpa() {
-                        next(device, p_name)
-                    } else {
-                        None
-                    }
-                }
+                b"vkGetDeviceProcAddr" => hook!(vkGetDeviceProcAddr),
+                bytes => device_hook(bytes).or_else(|| next_device_fn(device, name)),
             }
         }),
         || None,
@@ -1335,8 +1282,10 @@ pub struct VkLayerNegotiateStruct {
     pub s_type: u32,
     pub p_next: *const c_void,
     pub loader_layer_interface_version: u32,
-    pub pfn_get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
-    pub pfn_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
+    // Outputs only: the loader passes these in as NULL, which a plain
+    // (non-nullable) fn pointer type may not hold.
+    pub pfn_get_instance_proc_addr: Option<vk::PFN_vkGetInstanceProcAddr>,
+    pub pfn_get_device_proc_addr: Option<vk::PFN_vkGetDeviceProcAddr>,
     pub pfn_get_physical_device_proc_addr: *const c_void,
 }
 
@@ -1373,12 +1322,11 @@ pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
                 return vk::Result::ERROR_INITIALIZATION_FAILED;
             }
 
-            set_next_gipa(vs.pfn_get_instance_proc_addr);
-            set_next_gdpa(vs.pfn_get_device_proc_addr);
-
+            // The layer below us arrives through each create call's pNext
+            // chain, never through this struct.
             vs.loader_layer_interface_version = 2;
-            vs.pfn_get_instance_proc_addr = vkGetInstanceProcAddr;
-            vs.pfn_get_device_proc_addr = vkGetDeviceProcAddr;
+            vs.pfn_get_instance_proc_addr = Some(vkGetInstanceProcAddr);
+            vs.pfn_get_device_proc_addr = Some(vkGetDeviceProcAddr);
 
             vk::Result::SUCCESS
         }),
@@ -1464,6 +1412,68 @@ mod tests {
         for lp in &frame.launch_profiles {
             assert!(lp.profile.len() <= MAX_TELEMETRY_STRING_LEN);
         }
+    }
+
+    /// The loader passes the negotiation outputs in as NULL. They must only
+    /// ever be written — reading them as fn pointers was undefined behaviour.
+    #[test]
+    fn negotiation_fills_its_outputs() {
+        let mut vs = VkLayerNegotiateStruct {
+            s_type: 0,
+            p_next: std::ptr::null(),
+            loader_layer_interface_version: 2,
+            pfn_get_instance_proc_addr: None,
+            pfn_get_device_proc_addr: None,
+            pfn_get_physical_device_proc_addr: std::ptr::null(),
+        };
+        let res = unsafe { vkNegotiateLoaderLayerInterfaceVersion(&mut vs) };
+        assert_eq!(res, vk::Result::SUCCESS);
+        assert!(vs.pfn_get_instance_proc_addr.is_some());
+        assert!(vs.pfn_get_device_proc_addr.is_some());
+    }
+
+    /// Handles are recycled addresses, so a destroyed device's entries must
+    /// go with it — and only its entries.
+    #[test]
+    fn forgetting_a_device_drops_its_queues_and_nothing_else() {
+        use ash::vk::Handle;
+        let (gone, kept) = (vk::Device::from_raw(0xde01), vk::Device::from_raw(0xde02));
+        let (gone_q, kept_q) = (vk::Queue::from_raw(0xde11), vk::Queue::from_raw(0xde12));
+        for (queue, device) in [(gone_q, gone), (kept_q, kept)] {
+            QUEUE_TO_DEVICE.write_or_recover().insert(queue, device);
+            QUEUE_FAMILIES.write_or_recover().insert(queue, 0);
+            GRAPHICS_QUEUES.write_or_recover().insert(queue, true);
+            DEVICE_QUEUE_FAMILY.write_or_recover().insert(device, 0);
+        }
+
+        unsafe { forget_device(gone) };
+
+        assert!(!QUEUE_TO_DEVICE.read_or_recover().contains_key(&gone_q));
+        assert!(!QUEUE_FAMILIES.read_or_recover().contains_key(&gone_q));
+        assert!(!GRAPHICS_QUEUES.read_or_recover().contains_key(&gone_q));
+        assert!(!DEVICE_QUEUE_FAMILY.read_or_recover().contains_key(&gone));
+        assert_eq!(QUEUE_TO_DEVICE.read_or_recover().get(&kept_q), Some(&kept));
+        assert!(DEVICE_QUEUE_FAMILY.read_or_recover().contains_key(&kept));
+    }
+
+    #[test]
+    fn forgetting_an_instance_drops_its_physical_devices_only() {
+        use ash::vk::Handle;
+        let (gone, kept) = (
+            vk::Instance::from_raw(0xe101),
+            vk::Instance::from_raw(0xe102),
+        );
+        let (gone_pd, kept_pd) = (
+            vk::PhysicalDevice::from_raw(0xe111),
+            vk::PhysicalDevice::from_raw(0xe112),
+        );
+        PHYS_TO_INST.write_or_recover().insert(gone_pd, gone);
+        PHYS_TO_INST.write_or_recover().insert(kept_pd, kept);
+
+        forget_instance(gone);
+
+        assert!(!PHYS_TO_INST.read_or_recover().contains_key(&gone_pd));
+        assert_eq!(PHYS_TO_INST.read_or_recover().get(&kept_pd), Some(&kept));
     }
 
     #[test]
