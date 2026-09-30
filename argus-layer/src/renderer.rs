@@ -42,6 +42,8 @@ pub struct OverlayState {
 
     pub queue_family: u32,
     pub draw_queue: Option<vk::Queue>,
+    /// Set once a present that passed the HUD by has said why.
+    pub present_skip_logged: bool,
     pub complete: Vec<vk::Semaphore>,
     pub disabled: bool,
     /// A fence that was reset but never submitted, so it will never signal.
@@ -132,6 +134,7 @@ impl OverlayState {
             framebuffers: Vec::new(),
             queue_family: queue_family_index,
             draw_queue: None,
+            present_skip_logged: false,
             complete: Vec::new(),
             disabled: false,
             abandoned_fence: None,

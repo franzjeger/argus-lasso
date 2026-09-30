@@ -29,6 +29,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - A ProBalance restore threshold with a fraction, such as 84.5 % under an
   activation at 85 %, is kept on Apply. It was cut to 84 %, a whole point below
   activation, although the form had accepted the value.
+- A game that presents from a queue the HUD cannot draw on (another queue family,
+  a queue without graphics, or more than one queue) gets a log line saying so,
+  once per swapchain. The HUD stayed off there without a word, as if it had never
+  started.
 - `--ui-tour` captures the window opaque. It used the window opacity of whoever
   ran it, and at 80 % every screenshot was drawn over black: dark themes came out
   a muddy brown-grey and light themes grey.
