@@ -10,12 +10,25 @@ pub struct DetailWindow {
     pub detail_pid: Option<u32>,
     pub detail_info: Option<utils::ProcDetails>,
     pub detail_last_gen: u64,
+    /// The start time of the process the window was opened for, so a later
+    /// process given the same PID is not shown as if it were that one.
+    detail_start: Option<u64>,
+}
+
+fn start_ticks(pid: u32) -> Option<u64> {
+    crate::fast_proc::read_stat(pid, &mut [0; 1024]).map(|stat| stat.starttime)
 }
 
 impl DetailWindow {
     pub fn set_pid(&mut self, pid: u32) {
         self.detail_pid = Some(pid);
+        self.detail_start = start_ticks(pid);
         self.detail_info = None; // force immediate refresh
+    }
+
+    /// Whether the PID still belongs to the process the window was opened for.
+    fn same_process(&self, pid: u32) -> bool {
+        start_ticks(pid).is_some_and(|start| Some(start) == self.detail_start)
     }
 
     pub fn show(
@@ -31,9 +44,9 @@ impl DetailWindow {
         // Refresh procfs details only when the daemon emitted a new sample.
         if self.detail_info.is_none() || cpu_gen != self.detail_last_gen {
             self.detail_last_gen = cpu_gen;
-            self.detail_info = utils::read_proc_details(pid);
+            self.detail_info = utils::read_proc_details(pid).filter(|_| self.same_process(pid));
             if self.detail_info.is_none() {
-                // Process is gone — close the window.
+                // The process is gone (or its PID now names another): close.
                 self.detail_pid = None;
                 return;
             }
@@ -186,5 +199,22 @@ impl DetailWindow {
             self.detail_pid = None;
             self.detail_info = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DetailWindow;
+
+    /// The window tracked only the PID, so a process that reused it was
+    /// shown as the one the window had been opened for.
+    #[test]
+    fn a_reused_pid_is_not_the_same_process() {
+        let mut window = DetailWindow::default();
+        let pid = std::process::id();
+        window.set_pid(pid);
+        assert!(window.same_process(pid));
+        window.detail_start = window.detail_start.map(|start| start + 1);
+        assert!(!window.same_process(pid));
     }
 }

@@ -268,6 +268,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Changing the theme no longer resets the zoom or applies the display scale from
   startup, which showed the UI at the wrong size after moving to a monitor with a
   different scale.
+- A process's details window closes when the process exits even if its PID is
+  reused at once, instead of showing the new process under the old one's name.
 
 ### Changed
 
