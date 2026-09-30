@@ -44,6 +44,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- Running the test suite no longer adds made-up lines ("[Rule:x] Set nice=5 on
+  game(42)", "Termination requested for game (42)") to the real log in
+  `~/.local/share/argus-lasso/`, and neither does `--ui-tour`. Only the app itself
+  turns the log file on.
 - A template picked, or "Add rule" chosen in Processes, while the rule editor is
   open is no longer dropped with a note to pick it again. The open editor comes
   to the front, and the new rule opens as soon as it is saved or cancelled. A
