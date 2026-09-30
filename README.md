@@ -156,6 +156,7 @@ under the old `process-lasso-rs` directory is migrated when appropriate.
 argus-lasso --minimized              # start hidden to tray
 argus-lasso --no-tray                # run without the tray
 argus-lasso status --top 10          # JSON snapshot
+argus-lasso install-helpers          # CPU control helpers; asks for authentication
 argus-lasso set-affinity 1234 '0-7'   # Linux logical CPU IDs
 argus-lasso kill 1234                # SIGTERM; --force uses SIGKILL
 RUST_LOG=debug argus-lasso           # diagnostics

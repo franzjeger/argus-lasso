@@ -12,6 +12,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Added
 
+- `argus-lasso install-helpers` installs or updates the CPU control helpers from a
+  terminal, for example over SSH: pkexec asks for authentication in that terminal.
 - Readable game recording history and A/B comparison with average/1% low FPS,
   p99 frametime and a peak-preserving graph loaded off the GUI thread.
 - Live rule effects showing matching processes, overlapping assignments and
