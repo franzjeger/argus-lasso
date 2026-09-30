@@ -319,6 +319,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   no privileged or resource system calls, and no view of other processes. It needs
   none of them, and as root they could reach the system bus if it were ever
   compromised. `systemd-analyze security` rates it 0.7 instead of 3.5.
+- `make uninstall` also removes the update backups, the rollback record and the
+  autostart entry, and prints the commands to remove the system-wide CPU control
+  helpers when they are installed; they still granted their actions afterwards.
 
 ### Changed
 
