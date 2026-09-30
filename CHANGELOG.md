@@ -361,6 +361,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Changed
 
+- The GitHub Actions the workflows use are pinned by commit SHA, and CI fails on
+  one that is not; the release job, which holds the signing key, no longer
+  restores a build cache.
 - Building from source needs Rust **1.95** or newer, the floor of egui 0.36.
   Dependencies are updated: egui, eframe and egui_extras 0.36, nix 0.31, png 0.18
   and nvml-wrapper 0.13.
