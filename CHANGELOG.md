@@ -262,6 +262,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   live but saves the configuration once it settles, and the Activity log records
   only what changed: it got a "Config updated" line, and the file a save, for
   every frame of the drag.
+- Start or Stop recording is no longer undone by a recordings scan that read the
+  state just before the click, which put the button back so a second click
+  restarted the recording.
 
 ### Changed
 
