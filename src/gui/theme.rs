@@ -684,17 +684,33 @@ pub fn kpi_card(
     );
 }
 
-/// Bottom action bar for settings-style tabs: dirty indicator on the left,
-/// Discard + Apply on the right. Returns (discard_clicked, apply_clicked).
-pub fn apply_bar(ui: &mut egui::Ui, dirty: bool) -> (bool, bool) {
+/// A number field for a form. A typed value takes effect when it is
+/// entered, not with each keystroke: egui's default updates the value as
+/// it is typed, so typing "95" would pass through 9 (clamped to the lower
+/// bound) on its way, and a live setting would briefly be that.
+pub fn number<Num: egui::emath::Numeric>(value: &mut Num) -> egui::DragValue<'_> {
+    egui::DragValue::new(value).update_while_editing(false)
+}
+
+/// The bottom bar of a form whose values only take effect together: the
+/// draft's state on the left, Discard and Apply on the right. `problem`
+/// explains why the draft cannot be applied, and disables Apply. Returns
+/// (discard_clicked, apply_clicked).
+pub fn apply_bar(ui: &mut egui::Ui, dirty: bool, problem: Option<&str>) -> (bool, bool) {
     let s = sem(ui);
     let mut discard = false;
     let mut apply = false;
     ui.add_space(tokens::SPACE_S);
     ui.separator();
     ui.horizontal(|ui| {
-        if dirty {
-            ui.colored_label(s.warning, "● Unsaved changes");
+        match problem {
+            Some(problem) => {
+                ui.colored_label(s.negative, problem);
+            }
+            None if dirty => {
+                ui.colored_label(s.warning, "● Unsaved changes");
+            }
+            None => {}
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let apply_btn = egui::Button::new(
@@ -703,7 +719,10 @@ pub fn apply_bar(ui: &mut egui::Ui, dirty: bool) -> (bool, bool) {
                     .font(bold_font(tokens::FONT_BODY)),
             )
             .fill(s.accent);
-            if ui.add_enabled(dirty, apply_btn).clicked() {
+            if ui
+                .add_enabled(dirty && problem.is_none(), apply_btn)
+                .clicked()
+            {
                 apply = true;
             }
             if ui
@@ -1430,5 +1449,57 @@ mod accessibility_tests {
         assert_eq!(node("Performance").toggled(), Some(Toggled::False));
         assert_eq!(node("Balanced").toggled(), Some(Toggled::True));
         assert_eq!(node("Rules").toggled(), Some(Toggled::False));
+    }
+
+    /// Typing "95" into a field used to store 9 on the way, clamped to the
+    /// field's minimum, and settings took effect with each keystroke.
+    #[test]
+    fn a_typed_number_takes_effect_when_entered() {
+        let ctx = egui::Context::default();
+        let mut value = 50.0_f32;
+        let run = |events: Vec<egui::Event>, focus: bool, value: &mut f32| {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show_inside(root, |ui| {
+                        let field = ui.add(super::number(value).range(20.0..=110.0));
+                        if focus {
+                            field.request_focus();
+                        }
+                    });
+                },
+            );
+        };
+        run(vec![], true, &mut value);
+        run(vec![], false, &mut value);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        run(
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text("9".into()),
+            ],
+            false,
+            &mut value,
+        );
+        assert_eq!(value, 50.0, "not while typing");
+        run(vec![egui::Event::Text("5".into())], false, &mut value);
+        run(vec![key(egui::Key::Enter)], false, &mut value);
+        run(vec![], false, &mut value);
+        assert_eq!(value, 95.0);
     }
 }

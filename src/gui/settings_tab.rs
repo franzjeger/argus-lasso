@@ -325,7 +325,7 @@ impl SettingsTab {
 
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Apply rules every", |ui| {
                             changed |= committed(&ui.add(
-                                egui::DragValue::new(&mut self.config.monitor.rule_enforce_interval_ms)
+                                theme::number(&mut self.config.monitor.rule_enforce_interval_ms)
                                     .range(100..=10000)
                                     .suffix(" ms"),
                             ));
@@ -488,7 +488,7 @@ impl SettingsTab {
                             ui.add_enabled_ui(on, |ui| {
                                 ui.label("at");
                                 changed |= committed(&ui.add(
-                                    egui::DragValue::new(
+                                    theme::number(
                                         &mut self.config.hw_alerts.temp_threshold_celsius,
                                     )
                                     .range(50.0..=110.0)
@@ -498,7 +498,7 @@ impl SettingsTab {
                                 ));
                                 ui.colored_label(weak, "·  at least");
                                 changed |= committed(&ui.add(
-                                    egui::DragValue::new(&mut self.config.hw_alerts.cooldown_secs)
+                                    theme::number(&mut self.config.hw_alerts.cooldown_secs)
                                         .range(10..=300)
                                         .speed(5.0)
                                         .suffix(" s"),

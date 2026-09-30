@@ -235,6 +235,11 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - ProBalance uses separate system and process thresholds with consecutive
   activation/recovery windows. Legacy per-core threshold keys are superseded
   without changing exemptions or priority settings.
+- Typed numbers in Settings and ProBalance take effect when entered, not with each
+  keystroke: typing "95" as the temperature alert briefly stored 50 °C, the
+  field's minimum, and could raise a false alert. ProBalance no longer lowers the
+  restore threshold while the activation threshold is being typed; a draft whose
+  restore is not below activation says so and cannot be applied.
 
 ### Changed
 
