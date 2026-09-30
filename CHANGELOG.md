@@ -113,6 +113,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - The process table's "Suspended" badge and Pause/Resume menu follow the kernel's
   process state. A process paused or resumed elsewhere shows correctly, and a new
   process that reuses a paused one's PID is no longer shown as suspended.
+- Ending a process appears in the status bar's Recent events again. The messages
+  had been reworded and no longer matched what the event list looked for.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

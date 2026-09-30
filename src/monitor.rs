@@ -211,6 +211,11 @@ pub fn read_cpu_model() -> String {
         .clone()
 }
 
+/// Tag on the log lines about ending processes, which the notification
+/// center surfaces. Producers and the matcher below share it, so rewording a
+/// message cannot silently drop it from the notification center.
+pub const KILL_TAG: &str = "[Kill]";
+
 impl AppState {
     pub fn append_log(&mut self, msg: String) {
         let ts = chrono_ts();
@@ -224,7 +229,7 @@ impl AppState {
             "[HW Alert]",
             "[Gaming Mode]",
             "[Shutdown]",
-            "illed ", // "Killed" / "Force killed"
+            KILL_TAG,
             "[Park]",
             "[Power]",
         ];
@@ -2130,6 +2135,18 @@ mod cpu_accounting_tests {
 
 #[cfg(test)]
 mod persistence_tests {
+
+    /// Ending a process is a notable event. The old matcher looked for
+    /// "illed " after the messages had been reworded, so none were shown.
+    #[test]
+    fn kill_lines_reach_the_notification_center() {
+        let mut state = AppState::default();
+        state.append_log(format!("{KILL_TAG} Termination requested for game (42)"));
+        state.append_log("[Rule:x] Set nice=5 on game(42)".into());
+        assert_eq!(state.notable_events.len(), 1);
+        assert!(state.notable_events[0].contains("Termination requested"));
+    }
+
     use super::*;
     #[test]
     fn writes_latest_shared_values_and_surfaces_then_clears_failures() {

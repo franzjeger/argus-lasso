@@ -758,7 +758,7 @@ impl ArgusLassoApp {
                         .show();
                 }
                 if let Ok(mut s) = self.state.lock() {
-                    s.append_log(msg);
+                    s.append_log(format!("{} {msg}", crate::monitor::KILL_TAG));
                 }
                 self.pending_kill = None;
             }
@@ -900,12 +900,18 @@ impl ArgusLassoApp {
                 let pid = pk.pid;
                 if let Ok(mut s) = self.state.lock() {
                     match cont {
-                        Ok(()) => {
-                            s.append_log(format!("Kill cancelled — resumed {} ({})", name, pid))
-                        }
+                        Ok(()) => s.append_log(format!(
+                            "{} Kill cancelled — resumed {} ({})",
+                            crate::monitor::KILL_TAG,
+                            name,
+                            pid
+                        )),
                         Err(e) => s.append_log(format!(
-                            "Kill cancelled but resume failed ({}); {} ({}) is still suspended",
-                            e, name, pid
+                            "{} Kill cancelled but resume failed ({}); {} ({}) is still suspended",
+                            crate::monitor::KILL_TAG,
+                            e,
+                            name,
+                            pid
                         )),
                     }
                 }

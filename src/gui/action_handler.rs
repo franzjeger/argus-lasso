@@ -49,7 +49,8 @@ impl ActionHandler {
                     let outcome = old.cancel();
                     if let Ok(mut s) = state.lock() {
                         s.append_log(format!(
-                            "Previous kill cancelled for {} ({}): {}",
+                            "{} Previous kill cancelled for {} ({}): {}",
+                            crate::monitor::KILL_TAG,
                             old.name,
                             old.pid,
                             outcome
@@ -161,7 +162,11 @@ impl ActionHandler {
                     }
                 }
                 if let Ok(mut s) = state.lock() {
-                    s.append_log(format!("Termination requested for {} processes in tree of {name} ({pid}); {failures} failed", targets.len()));
+                    s.append_log(format!(
+                        "{} Termination requested for {} processes in tree of {name} ({pid}); {failures} failed",
+                        crate::monitor::KILL_TAG,
+                        targets.len()
+                    ));
                 }
                 if failures > 0 {
                     notify_error(&format!(
