@@ -141,6 +141,9 @@ impl GameBenchmark {
                 match capture::set_active(!self.active, self.duration.load(Ordering::Relaxed)) {
                     Ok(c) => {
                         self.active = c.active;
+                        // A scan already under way read the state before
+                        // this click and would put the button back.
+                        self.scan = None;
                         self.checked = None;
                         self.status = if c.active {
                             "Recording requested — look for REC in the game"

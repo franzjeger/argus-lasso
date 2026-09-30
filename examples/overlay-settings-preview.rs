@@ -109,7 +109,6 @@ fn main() -> eframe::Result {
                 .set_embed_viewports(std::env::args().any(|a| a == "--embedded"));
             theme::apply_theme(
                 &cc.egui_ctx,
-                1.0,
                 &if std::env::args().any(|a| a == "--light") {
                     theme::AppTheme::AdwaitaLight
                 } else {

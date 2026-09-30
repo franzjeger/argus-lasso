@@ -107,7 +107,7 @@ impl ActionHandler {
                 match DialogTarget::open(snapshot, pid) {
                     Ok(target) => {
                         dialog_manager.affinity_dialog =
-                            Some((target, AffinityDialog::new(&current, &name)))
+                            Some((target, AffinityDialog::new(&current, &name, pid)))
                     }
                     Err(e) => notify_error(&format!("Cannot identify {name} ({pid}): {e}")),
                 }

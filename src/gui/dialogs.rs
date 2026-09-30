@@ -1,5 +1,6 @@
-//! Modal dialogs: affinity picker, nice dialog, ionice dialog, rule edit,
+//! Dialog windows: affinity picker, nice dialog, ionice dialog, rule edit,
 //! process picker, Steam game picker, Lutris game picker, rule presets.
+//! None is modal; each is a window of its own next to the main one.
 
 use egui::{Context, Ui, ViewportBuilder, ViewportId};
 use std::collections::HashSet;
@@ -311,10 +312,16 @@ pub struct AffinityDialog {
     pub non_preferred: HashSet<u32>,
     pub smt_siblings: HashSet<u32>,
     pub result: Option<String>,
+    /// Each dialog is a window of its own. Two sharing one (a process's
+    /// and Settings' default affinity) drew into the same native window,
+    /// and the clicks meant for the visible one went to the other.
+    viewport: ViewportId,
 }
 
 impl AffinityDialog {
-    pub fn new(current_affinity: &str, title: &str) -> Self {
+    /// `owner` tells this dialog's window apart from another one open at
+    /// the same time.
+    pub fn new(current_affinity: &str, title: &str, owner: impl std::hash::Hash) -> Self {
         let cpu_count = get_cpu_count();
         let offline = get_offline_cpus();
         let topo = detect_topology();
@@ -351,6 +358,7 @@ impl AffinityDialog {
             },
             smt_siblings,
             result: None,
+            viewport: ViewportId::from_hash_of(("affinity_dialog", owner)),
         }
     }
 
@@ -372,7 +380,7 @@ impl AffinityDialog {
             let cpu_count = self.cpu_count;
 
             ctx.show_viewport_immediate(
-                ViewportId::from_hash_of("affinity_dialog"),
+                self.viewport,
                 ViewportBuilder::default()
                     .with_title(title_str)
                     .with_app_id("argus-lasso")
@@ -1713,5 +1721,21 @@ impl LutrisGamePickerDialog {
             return Some(None);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AffinityDialog;
+
+    /// A process's affinity dialog and Settings' default one used to share
+    /// a window, so clicks meant for one reached the other.
+    #[test]
+    fn affinity_dialogs_open_together_get_windows_of_their_own() {
+        let default = AffinityDialog::new("", "Default", "default");
+        let process = AffinityDialog::new("", "firefox", 4242u32);
+        let other = AffinityDialog::new("", "firefox", 4243u32);
+        assert_ne!(default.viewport, process.viewport);
+        assert_ne!(process.viewport, other.viewport);
     }
 }

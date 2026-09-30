@@ -186,10 +186,8 @@ impl ArgusLassoApp {
         config: Config,
         tour_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        // native_pixels_per_point is set by the platform integration before new() is called.
-        let native_ppp = cc.egui_ctx.pixels_per_point();
         let startup_theme = crate::gui::theme::AppTheme::from_str(&config.ui.theme);
-        crate::gui::theme::apply_theme(&cc.egui_ctx, native_ppp, &startup_theme);
+        crate::gui::theme::apply_theme(&cc.egui_ctx, &startup_theme);
         // Child dialogs are native windows so they can be moved to another
         // monitor. Ordinary tooltips/popups retain egui's normal popup behavior.
         cc.egui_ctx.set_embed_viewports(false);
@@ -201,8 +199,7 @@ impl ArgusLassoApp {
 
         let probalance_tab = ProBalanceTab::new(config.probalance.clone());
         let gaming_mode_tab = GamingModeTab::new(config.clone());
-        let mut settings_tab = SettingsTab::new(config.clone());
-        settings_tab.native_ppp = native_ppp;
+        let settings_tab = SettingsTab::new(config.clone());
 
         // Initialise Wayland compositor-side opacity via wp_alpha_modifier_v1.
         // Extract the raw wl_display* and wl_surface* that eframe already holds.
@@ -434,6 +431,7 @@ impl eframe::App for ArgusLassoApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Resume any process awaiting Undo before the GUI disappears.
         self.pending_kill = None;
+        self.finish_settings_edit();
         // Flush settings before stopping the single configuration writer.
         if self.pending_config_save.dirty {
             self.save_config();
@@ -448,8 +446,8 @@ impl eframe::App for ArgusLassoApp {
         let ctx = &root_ui.ctx().clone();
         // Without the compositor's alpha modifier, opacity is the alpha of
         // the root UI's fills, which is rebuilt from the theme every frame,
-        // so it is set every frame too: at startup, and after a theme change
-        // or Apply, as well as while the slider moves.
+        // so it is set every frame too: at startup and after a theme change
+        // as well as while the slider moves.
         if self.wayland_opacity.is_none() {
             crate::gui::theme::apply_viewport_opacity(root_ui, self.opacity);
         }
@@ -650,7 +648,7 @@ impl ArgusLassoApp {
                         c.gaming_mode.overlay.show_overlay = shown;
                         c.ui.global_overlay = cfg.ui.global_overlay;
                     });
-                    self.save_config();
+                    self.pending_config_save.dirty = true;
                 }
             }
         }
@@ -662,7 +660,9 @@ impl ArgusLassoApp {
                     tab.overlay_shown(overlay.show_overlay, c.gaming_mode.overlay.show_overlay);
                 c.gaming_mode.overlay = overlay;
             });
-            self.save_config();
+            // The HUD follows every frame of a slider or colour drag through
+            // the ConfigChanged above; the file is saved once it settles.
+            self.pending_config_save.dirty = true;
         }
     }
 
@@ -1204,6 +1204,9 @@ impl ArgusLassoApp {
         frame: &FrameData,
         notify_error: &impl Fn(&str),
     ) {
+        if self.active_tab != Tab::Settings {
+            self.finish_settings_edit();
+        }
         let FrameData {
             ref snapshot,
             ref throttle_infos,
@@ -1368,6 +1371,37 @@ impl ArgusLassoApp {
         }
     }
 
+    /// Put a setting changed on the Settings page into effect and save it.
+    fn store_settings(&mut self, updated: Config) {
+        let affinity_changed = self.state.lock().map_or(true, |s| {
+            s.config.cpu.default_affinity != updated.cpu.default_affinity
+        });
+        self.update_config(|c| {
+            c.cpu.default_affinity = updated.cpu.default_affinity;
+            c.monitor = updated.monitor;
+            c.hw_alerts = updated.hw_alerts;
+            c.ui.notifications_enabled = updated.ui.notifications_enabled;
+            c.ui.check_updates_on_start = updated.ui.check_updates_on_start;
+        });
+        // Only a new default affinity has anything to reapply. Reapplying
+        // also gives failed rule changes another try, which would log
+        // their failures again on every settings click.
+        if affinity_changed {
+            self.send(DaemonCmd::ReapplyDefaults);
+        }
+        self.save_config();
+    }
+
+    /// A CPU list typed on the Settings page but not entered is finished
+    /// when the page is left, by tab or by closing the window, as it is when
+    /// its field loses focus: egui drops the focus of a field it no longer
+    /// draws without reporting it.
+    fn finish_settings_edit(&mut self) {
+        if let Some(updated) = self.settings_tab.finish_editing() {
+            self.store_settings(updated);
+        }
+    }
+
     fn show_settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let config_changed = self
             .settings_tab
@@ -1383,23 +1417,7 @@ impl ArgusLassoApp {
         }
 
         if let Some(updated) = config_changed {
-            let affinity_changed = self.state.lock().map_or(true, |s| {
-                s.config.cpu.default_affinity != updated.cpu.default_affinity
-            });
-            self.update_config(|c| {
-                c.cpu.default_affinity = updated.cpu.default_affinity;
-                c.monitor = updated.monitor;
-                c.hw_alerts = updated.hw_alerts;
-                c.ui.notifications_enabled = updated.ui.notifications_enabled;
-                c.ui.check_updates_on_start = updated.ui.check_updates_on_start;
-            });
-            // Only a new default affinity has anything to reapply. Reapplying
-            // also gives failed rule changes another try, which would log
-            // their failures again on every settings click.
-            if affinity_changed {
-                self.send(DaemonCmd::ReapplyDefaults);
-            }
-            self.save_config();
+            self.store_settings(updated);
         }
 
         // Theme and opacity are stored as they change.
@@ -1410,9 +1428,8 @@ impl ArgusLassoApp {
         {
             self.last_saved_opacity = cur_opacity;
             self.last_saved_theme = cur_theme.clone();
-            // Through update_config like the Apply handler above:
-            // without ConfigChanged the daemon's own config
-            // mirror never learns about the change.
+            // Through update_config: without ConfigChanged the daemon's
+            // own config mirror never learns about the change.
             self.update_config(|c| {
                 c.ui.opacity = cur_opacity;
                 c.ui.theme = cur_theme;

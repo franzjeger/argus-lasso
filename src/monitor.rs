@@ -602,6 +602,8 @@ struct Daemon {
     rule_engine: Arc<Mutex<RuleEngine>>,
     /// For showing the window when a second launch asks.
     gui_context: crate::gui::SharedContext,
+    /// A launch asked for the window before it existed.
+    show_window_pending: bool,
     config: Config,
     ipc: ipc_server::Broadcaster,
     log: Box<dyn Fn(String) + Send>,
@@ -682,6 +684,7 @@ impl Daemon {
             state,
             rule_engine,
             gui_context,
+            show_window_pending: false,
             config,
             ipc,
             log,
@@ -773,8 +776,11 @@ impl Daemon {
 
     /// Requests left by the CLI and by a second launch.
     fn poll_requests(&mut self) {
-        if crate::overlay_toggle::drain_show_window(&self.toggle_dir) > 0 {
-            crate::gui::show_main_window(&self.gui_context);
+        // A request that arrives before the window exists is kept until it
+        // does, not dropped.
+        self.show_window_pending |= crate::overlay_toggle::drain_show_window(&self.toggle_dir) > 0;
+        if self.show_window_pending && crate::gui::show_main_window(&self.gui_context) {
+            self.show_window_pending = false;
         }
         self.poll_overlay_toggle();
     }
@@ -823,23 +829,13 @@ impl Daemon {
                     return std::ops::ControlFlow::Continue(());
                 };
                 self.probalance.update_config(cfg.probalance.clone());
-                self.config = cfg;
+                let before = std::mem::replace(&mut self.config, cfg);
                 self.ipc.broadcast(&argus_ipc::IpcMessage::Config(
                     self.config.gaming_mode.overlay.clone(),
                 ));
-                (self.log)(format!(
-                    "Config updated — ProBalance: {}  |  Notifications: {}",
-                    if self.config.probalance.enabled {
-                        "on"
-                    } else {
-                        "off"
-                    },
-                    if self.config.ui.notifications_enabled {
-                        "on"
-                    } else {
-                        "off"
-                    },
-                ));
+                for note in config_change_notes(&before, &self.config) {
+                    (self.log)(note);
+                }
             }
             DaemonCmd::SetGamingMode {
                 active,
@@ -1727,6 +1723,27 @@ fn read_ionice(pid: u32) -> String {
     }
 }
 
+/// Log lines for a configuration update: only for what changed. A HUD
+/// slider sends an update on every frame it is dragged, and each one used
+/// to log a line.
+fn config_change_notes(before: &Config, after: &Config) -> Vec<String> {
+    let on_off = |on: bool| if on { "on" } else { "off" };
+    let mut notes = Vec::new();
+    if before.probalance.enabled != after.probalance.enabled {
+        notes.push(format!(
+            "Config updated — ProBalance {}",
+            on_off(after.probalance.enabled)
+        ));
+    }
+    if before.ui.notifications_enabled != after.ui.notifications_enabled {
+        notes.push(format!(
+            "Config updated — Notifications {}",
+            on_off(after.ui.notifications_enabled)
+        ));
+    }
+    notes
+}
+
 // ── New PID handling ──────────────────────────────────────────────────────────
 
 fn apply_new_pid(
@@ -1942,6 +1959,16 @@ mod tests {
             cmdline: std::sync::Arc::new(cmd.to_string()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_config_update_logs_only_what_changed() {
+        let before = Config::default();
+        let mut after = before.clone();
+        after.gaming_mode.overlay.font_px += 1;
+        assert!(super::config_change_notes(&before, &after).is_empty());
+        after.probalance.enabled = !before.probalance.enabled;
+        assert_eq!(super::config_change_notes(&before, &after).len(), 1);
     }
 
     #[test]

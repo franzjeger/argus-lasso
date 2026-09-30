@@ -235,6 +235,41 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - ProBalance uses separate system and process thresholds with consecutive
   activation/recovery windows. Legacy per-core threshold keys are superseded
   without changing exemptions or priority settings.
+- Typed numbers in Settings and ProBalance take effect when entered, not with each
+  keystroke: typing "95" as the temperature alert briefly stored 50 °C, the
+  field's minimum, and could raise a false alert. ProBalance no longer lowers the
+  restore threshold while the activation threshold is being typed; a draft whose
+  restore is not below activation says so and cannot be applied.
+- A default CPU list typed in Settings is used, or put back with a message if it
+  is not valid, when the section or tab is left or the window is closed, not only
+  on Enter. It was lost while still showing, with the presets highlighting it as
+  if it were in effect.
+- The process affinity dialog and Settings' "Pick CPUs…" no longer share one
+  window. With both open, clicks meant for the visible one went to the other, so
+  a process's affinity could be changed from Settings. "Pick CPUs…" also stays
+  open when another Settings section is shown.
+- "Start with session" uses one mechanism: the installed service if there is one,
+  otherwise an XDG autostart entry. Both were set up, so two instances started at
+  login and the window came up. A second `--minimized` launch no longer asks for
+  the window, a request left while Argus was not running is dropped at start, and
+  one that arrives before the window exists is kept until it does. The autostart
+  entry points at the binary on disk, not at the " (deleted)" image after an
+  update, and systemctl runs in the background.
+- "Delete rule?" deletes the rule it names; selecting another row while it was
+  open switched it to that row. "Show all rules" under Live rule effects clears
+  the rule filter again.
+- Dragging a slider or colour in the HUD customization window updates the HUD
+  live but saves the configuration once it settles, and the Activity log records
+  only what changed: it got a "Config updated" line, and the file a save, for
+  every frame of the drag.
+- Start or Stop recording is no longer undone by a recordings scan that read the
+  state just before the click, which put the button back so a second click
+  restarted the recording.
+- Changing the theme no longer resets the zoom or applies the display scale from
+  startup, which showed the UI at the wrong size after moving to a monitor with a
+  different scale.
+- A process's details window closes when the process exits even if its PID is
+  reused at once, instead of showing the new process under the old one's name.
 
 ### Changed
 

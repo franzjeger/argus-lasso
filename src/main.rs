@@ -96,7 +96,9 @@ impl ksni::Tray for ArgusLassoTray {
         vec![
             ksni::MenuItem::Standard(ksni::menu::StandardItem {
                 label: "Open Argus-Lasso".into(),
-                activate: Box::new(|tray: &mut Self| gui::show_main_window(&tray.context)),
+                activate: Box::new(|tray: &mut Self| {
+                    gui::show_main_window(&tray.context);
+                }),
                 ..Default::default()
             }),
             ksni::MenuItem::Separator,
@@ -380,15 +382,27 @@ fn main() {
         None
     } else {
         match acquire_single_instance_lock() {
-            Ok(Some(lock)) => Some(lock),
+            Ok(Some(lock)) => {
+                // Requests left while no instance ran are not for this one:
+                // a --minimized start must not come up showing because of
+                // an old launch.
+                overlay_toggle::drain_show_window(&config::config_dir());
+                Some(lock)
+            }
             Ok(None) => {
                 // Launching from the app menu while the tray service runs
-                // should bring up the existing window, not do nothing.
-                match overlay_toggle::request_show_window(&config::config_dir()) {
-                    Ok(()) => eprintln!("Argus-Lasso is already running; showing its window."),
-                    Err(e) => eprintln!(
-                        "Argus-Lasso is already running, and could not be asked to show its window: {e}"
-                    ),
+                // should bring up the existing window, not do nothing. A
+                // --minimized launch is a session start, which has nothing
+                // to show.
+                if args.minimized {
+                    eprintln!("Argus-Lasso is already running.");
+                } else {
+                    match overlay_toggle::request_show_window(&config::config_dir()) {
+                        Ok(()) => eprintln!("Argus-Lasso is already running; showing its window."),
+                        Err(e) => eprintln!(
+                            "Argus-Lasso is already running, and could not be asked to show its window: {e}"
+                        ),
+                    }
                 }
                 return;
             }

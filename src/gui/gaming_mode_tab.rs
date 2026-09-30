@@ -862,7 +862,8 @@ impl GamingModeTab {
                 });
             }
 
-            // ── Overlay switch and Gaming customization submenu ───────────
+            // ── Recording, sensors, and the overlay switch with its
+            //    customization submenu ─────────────────────────────────
             if self.section == GamingSection::Recording {
                 th::card_untitled(ui, |ui| self.benchmark.show(ui));
             }

@@ -23,13 +23,31 @@ pub type SharedContext = std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>
 
 /// Show, un-minimize and focus the main window, from any thread: the tray's
 /// "Open" and a second launch bring the running window to the front.
-pub fn show_main_window(context: &SharedContext) {
-    if let Ok(context) = context.lock() {
-        if let Some(ctx) = context.as_ref() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            ctx.request_repaint();
-        }
+/// Returns false while eframe has not created the window yet.
+pub fn show_main_window(context: &SharedContext) -> bool {
+    let Ok(context) = context.lock() else {
+        return false;
+    };
+    let Some(ctx) = context.as_ref() else {
+        return false;
+    };
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    ctx.request_repaint();
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    /// A second launch before eframe has made the window used to be
+    /// consumed with nothing shown; the caller keeps it pending instead.
+    #[test]
+    fn showing_before_the_window_exists_reports_it() {
+        let none: super::SharedContext = Default::default();
+        assert!(!super::show_main_window(&none));
+        let some: super::SharedContext =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(egui::Context::default())));
+        assert!(super::show_main_window(&some));
     }
 }

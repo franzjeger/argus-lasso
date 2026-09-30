@@ -33,7 +33,8 @@ impl ProBalanceTab {
         )
     }
 
-    /// Returns Some(updated_config) when Apply is clicked.
+    /// Returns the configuration to put into effect: the draft when Apply
+    /// is clicked, or the saved one with the switch's new state.
     pub fn show(
         &mut self,
         ui: &mut Ui,
@@ -45,10 +46,9 @@ impl ProBalanceTab {
         const LABEL_W: f32 = tokens::FORM_LABEL_W;
         let s = th::sem(ui);
 
-        // The apply bar has to sit on the panel's bottom edge, the same as
-        // Settings — floating it after however tall the content happened to
-        // be put the same control in a different place on each tab. Reserving
-        // the bar's height and scrolling the body is what pins it.
+        // The apply bar has to sit on the panel's bottom edge: floating it
+        // after however tall the content happened to be moved it around.
+        // Reserving the bar's height and scrolling the body is what pins it.
         let bar_h = 44.0;
         let body_h = (ui.available_height() - bar_h).max(120.0);
         let mut switched = false;
@@ -198,13 +198,13 @@ impl ProBalanceTab {
                         form_label(ui, LABEL_W, "System CPU above");
                         ui.horizontal(|ui| {
                             ui.add(
-                                egui::DragValue::new(&mut self.cfg.system_cpu_threshold_percent)
+                                th::number(&mut self.cfg.system_cpu_threshold_percent)
                                     .range(1.0f32..=100.0)
                                     .suffix(" %"),
                             );
                             weak(ui, "for");
                             ui.add(
-                                egui::DragValue::new(&mut self.cfg.consecutive_seconds)
+                                th::number(&mut self.cfg.consecutive_seconds)
                                     .range(1.0f32..=60.0)
                                     .suffix(" s"),
                             );
@@ -212,32 +212,32 @@ impl ProBalanceTab {
                         ui.end_row();
 
                         form_label(ui, LABEL_W, "Minimum process CPU");
-                        ui.add(egui::DragValue::new(&mut self.cfg.process_min_cpu_percent)
+                        ui.add(th::number(&mut self.cfg.process_min_cpu_percent)
                             .range(0.1..=100.0).speed(0.1).suffix(" % of total"))
                             .on_hover_text("Only processes consuming at least this share are candidates. This does not activate ProBalance by itself.");
                         ui.end_row();
                         form_label(ui, LABEL_W, "Nice adjustment");
                         ui.horizontal(|ui| {
                             ui.add(
-                                egui::DragValue::new(&mut self.cfg.nice_adjustment)
+                                th::number(&mut self.cfg.nice_adjustment)
                                     .range(1..=19)
                                     .prefix("+"),
                             );
                             weak(ui, "capped at");
-                            ui.add(egui::DragValue::new(&mut self.cfg.nice_floor).range(1..=19));
+                            ui.add(th::number(&mut self.cfg.nice_floor).range(1..=19));
                         });
                         ui.end_row();
 
                         form_label(ui, LABEL_W, "System CPU below");
                         ui.horizontal(|ui| {
                             ui.add(
-                                egui::DragValue::new(&mut self.cfg.system_restore_threshold_percent)
+                                th::number(&mut self.cfg.system_restore_threshold_percent)
                                     .range(0.0f32..=99.0)
                                     .suffix(" %"),
                             );
                             weak(ui, "for");
                             ui.add(
-                                egui::DragValue::new(&mut self.cfg.restore_hysteresis_seconds)
+                                th::number(&mut self.cfg.restore_hysteresis_seconds)
                                     .range(1.0f32..=120.0)
                                     .suffix(" s"),
                             );
@@ -248,7 +248,7 @@ impl ProBalanceTab {
                             form_label(ui, LABEL_W, "Throttled CPUWeight");
                             ui.horizontal(|ui| {
                                 ui.add(
-                                    egui::DragValue::new(&mut self.cfg.cgroup_throttle_weight)
+                                    th::number(&mut self.cfg.cgroup_throttle_weight)
                                         .range(1..=100),
                                 );
                                 weak(ui, "kernel default is 100");
@@ -258,7 +258,7 @@ impl ProBalanceTab {
                             form_label(ui, LABEL_W, "Hard CPU quota");
                             ui.horizontal(|ui| {
                                 ui.add(
-                                    egui::DragValue::new(&mut self.cfg.cgroup_quota_percent)
+                                    th::number(&mut self.cfg.cgroup_quota_percent)
                                         .range(0..=800)
                                         .suffix(" %"),
                                 );
@@ -327,13 +327,19 @@ impl ProBalanceTab {
         if switched {
             self.saved.enabled = self.cfg.enabled;
         }
-        self.cfg.normalize();
+        // The draft is checked, not corrected: normalizing it here, every
+        // frame, pushed the restore threshold down to follow an activation
+        // threshold that was only passing through a low value while typed.
+        let problem = (self.cfg.system_restore_threshold_percent
+            >= self.cfg.system_cpu_threshold_percent)
+            .then_some("Restore must be below the activation threshold");
         let dirty = self.cfg != self.saved;
-        let (discard, apply) = th::apply_bar(ui, dirty);
+        let (discard, apply) = th::apply_bar(ui, dirty, problem);
         if discard {
             self.cfg = self.saved.clone();
         }
         if apply {
+            self.cfg.normalize();
             self.saved = self.cfg.clone();
             return Some(self.cfg.clone());
         }
@@ -417,4 +423,77 @@ fn add_chip(ui: &mut Ui, label: &str) -> bool {
     .stroke(egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()))
     .corner_radius(egui::CornerRadius::same(9));
     ui.add(btn).clicked()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Clicks the labelled control in the tab, rendered headless, and
+    /// returns what `show` reported.
+    fn click(tab: &mut ProBalanceTab, label: &str) -> Option<ProBalanceConfig> {
+        let ctx = egui::Context::default();
+        crate::gui::theme::apply_theme(&ctx, &crate::gui::theme::AppTheme::BreezeDark);
+        ctx.enable_accesskit();
+        let mut reported = None;
+        let mut frame = |events: Vec<egui::Event>, tab: &mut ProBalanceTab| {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            ctx.run_ui(input, |root| {
+                egui::CentralPanel::default().show_inside(root, |ui| {
+                    if let Some(cfg) = tab.show(ui, &[], &[], 0.0) {
+                        reported = Some(cfg);
+                    }
+                });
+            })
+        };
+        frame(vec![], tab);
+        let output = frame(vec![], tab);
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("accesskit update");
+        let bounds = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(label))
+            .and_then(|(_, node)| node.bounds())
+            .unwrap_or_else(|| panic!("nothing labelled {label}"));
+        let pos = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(vec![egui::Event::PointerMoved(pos), button(true)], tab);
+        frame(vec![button(false)], tab);
+        reported
+    }
+
+    /// Editing used to normalize the draft every frame, so an activation
+    /// threshold passing through a low value while typed dragged the
+    /// restore threshold down with it, silently.
+    #[test]
+    fn a_draft_that_does_not_fit_together_is_shown_not_corrected() {
+        let mut tab = ProBalanceTab::new(ProBalanceConfig::default());
+        tab.cfg.system_cpu_threshold_percent = 70.0;
+        tab.cfg.system_restore_threshold_percent = 80.0;
+        assert_eq!(click(&mut tab, "Apply changes"), None, "Apply is disabled");
+        assert_eq!(tab.cfg.system_restore_threshold_percent, 80.0);
+
+        tab.cfg.system_restore_threshold_percent = 60.0;
+        let applied = click(&mut tab, "Apply changes").expect("applied");
+        assert_eq!(applied.system_cpu_threshold_percent, 70.0);
+        assert_eq!(applied.system_restore_threshold_percent, 60.0);
+    }
 }

@@ -56,7 +56,7 @@ fn main() -> eframe::Result {
             ..Default::default()
         },
         Box::new(move |cc| {
-            theme::apply_theme(&cc.egui_ctx, 1.0, &theme::AppTheme::AdwaitaDark);
+            theme::apply_theme(&cc.egui_ctx, &theme::AppTheme::AdwaitaDark);
             Ok(Box::new(Preview {
                 bench,
                 sensors: Default::default(),
