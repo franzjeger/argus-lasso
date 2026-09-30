@@ -428,12 +428,6 @@ fn main() {
     // Build rule engine
     let rule_engine = {
         let mut re = rules::RuleEngine::new();
-        let state_clone = state.clone();
-        re.set_log_callback(move |msg| {
-            if let Ok(mut s) = state_clone.lock() {
-                s.append_log(msg);
-            }
-        });
         re.load_rules(&cfg.rules);
         Arc::new(Mutex::new(re))
     };

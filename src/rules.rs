@@ -2,7 +2,7 @@
 //!
 //! Mirrors Python rules.py exactly:
 //!   - match_type: contains (case-insensitive), exact, regex
-//!   - apply_to_process applies ALL matching rules (not first-match-stop)
+//!   - apply_rules applies ALL matching rules (not first-match-stop)
 
 use regex::Regex;
 
@@ -178,37 +178,19 @@ impl Rule {
 
 // ── RuleEngine ────────────────────────────────────────────────────────────────
 
+/// The rule set, shared by the GUI (which edits it) and the monitor thread
+/// (which applies it with `apply_rules`).
 pub struct RuleEngine {
     rules: Vec<Rule>,
-    log_callback: Option<Box<dyn Fn(String) + Send>>,
-    /// (rule_id, pid) pairs whose set_nice already failed — retried/logged once,
-    /// not every enforcement tick (a permission failure never heals by itself).
-    nice_failed: std::collections::HashSet<(String, u32)>,
 }
 
 impl RuleEngine {
     pub fn new() -> Self {
-        Self {
-            rules: Vec::new(),
-            log_callback: None,
-            nice_failed: std::collections::HashSet::new(),
-        }
-    }
-
-    pub fn set_log_callback<F: Fn(String) + Send + 'static>(&mut self, cb: F) {
-        self.log_callback = Some(Box::new(cb));
-    }
-
-    fn log(&self, msg: String) {
-        log::info!("{msg}");
-        if let Some(cb) = &self.log_callback {
-            cb(msg);
-        }
+        Self { rules: Vec::new() }
     }
 
     pub fn load_rules(&mut self, configs: &[RuleConfig]) {
         self.rules = configs.iter().map(Rule::from_config).collect();
-        self.nice_failed.clear();
     }
 
     pub fn get_rules(&self) -> &[Rule] {
@@ -232,8 +214,6 @@ impl RuleEngine {
     }
 
     pub fn update_rule(&mut self, updated: Rule) {
-        // Editing a rule may change its nice target — give it a fresh attempt.
-        self.nice_failed.retain(|(rid, _)| rid != &updated.rule_id);
         if let Some(r) = self.rules.iter_mut().find(|r| r.rule_id == updated.rule_id) {
             *r = updated;
         }
@@ -246,30 +226,11 @@ impl RuleEngine {
     /// Returns true if any enabled rule matches this process name — independent
     /// of whether applying it would change anything right now. Callers deciding
     /// between "rule-managed" and "apply default affinity" must use this, not
-    /// the action list from apply_to_process (an already-correct process yields
-    /// no actions but is still rule-managed).
+    /// the action list from apply_rules (an already-correct process yields no
+    /// actions but is still rule-managed).
     pub fn matches_any(&self, proc_name: &str) -> bool {
         let lower = proc_name.to_lowercase();
         self.rules.iter().any(|r| r.matches(proc_name, &lower))
-    }
-
-    /// Apply all matching rules to a process. Returns list of action descriptions.
-    /// All matching rules are applied (not first-match-stop).
-    pub fn apply_to_process(&mut self, pid: u32, proc_name: &str) -> Vec<String> {
-        let mut nice_failed = std::mem::take(&mut self.nice_failed);
-        let current_nice = utils::get_nice(pid);
-        let current_ionice = utils::get_ionice_raw(pid);
-        let actions = apply_rules(
-            &self.rules,
-            pid,
-            proc_name,
-            current_nice,
-            current_ionice,
-            &mut nice_failed,
-            &|m| self.log(m),
-        );
-        self.nice_failed = nice_failed;
-        actions
     }
 }
 
@@ -506,7 +467,15 @@ mod tests {
         };
         engine.load_rules(&[cfg]);
         // Non-matching name → empty actions, no syscalls attempted
-        let actions = engine.apply_to_process(0, "firefox");
+        let actions = apply_rules(
+            engine.get_rules(),
+            0,
+            "firefox",
+            None,
+            None,
+            &mut std::collections::HashSet::new(),
+            &|_| {},
+        );
         assert!(actions.is_empty());
     }
 

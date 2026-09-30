@@ -107,6 +107,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   graphics temperature, clocks, load and video memory, which it looked up under
   labels those drivers never use. With an integrated and a discrete GPU, every
   GPU value comes from the card with the most video memory instead of a mix.
+- A rule's nice value is no longer skipped for good on a process that reused the
+  PID of an earlier one whose change failed, and a new process's rule is applied
+  and logged once instead of twice.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
