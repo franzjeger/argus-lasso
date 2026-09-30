@@ -38,6 +38,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
   Incomplete: the counters that decide it lived only in the game. The layer now
   keeps them in a checkpoint next to the rows, and recovery uses it. Recordings
   made by an older layer, which writes no checkpoint, stay Incomplete.
+- CI builds, tests and lints every pull request, including one stacked on another
+  branch, which got no checks until it was retargeted to master ([#61]).
 - `--ui-tour` captures the window opaque. It used the window opacity of whoever
   ran it, and at 80 % every screenshot was drawn over black: dark themes came out
   a muddy brown-grey and light themes grey.
@@ -813,3 +815,4 @@ when the app asks, and the sensor service if you use it
 [#47]: https://github.com/franzjeger/argus-lasso/pull/47
 [#53]: https://github.com/franzjeger/argus-lasso/pull/53
 [#54]: https://github.com/franzjeger/argus-lasso/pull/54
+[#61]: https://github.com/franzjeger/argus-lasso/issues/61

@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [master]
+  # Every pull request, whatever its base: a filter on master left a PR
+  # stacked on another branch with no build, test or lint until it was
+  # retargeted (#61).
   pull_request:
-    branches: [master]
   # Manual trigger, so CI can be run against a branch when GitHub does not
   # create a run for the pull_request event (which it intermittently does not).
   workflow_dispatch:
