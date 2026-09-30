@@ -244,6 +244,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   is not valid, when the section or tab is left or the window is closed, not only
   on Enter. It was lost while still showing, with the presets highlighting it as
   if it were in effect.
+- The process affinity dialog and Settings' "Pick CPUs…" no longer share one
+  window. With both open, clicks meant for the visible one went to the other, so
+  a process's affinity could be changed from Settings. "Pick CPUs…" also stays
+  open when another Settings section is shown.
 
 ### Changed
 

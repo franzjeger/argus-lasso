@@ -287,7 +287,7 @@ impl SettingsTab {
                                 .clicked()
                             {
                                 self.cpu_dialog =
-                                    Some(AffinityDialog::new(&self.default_affinity_text, "Default"));
+                                    Some(AffinityDialog::new(&self.default_affinity_text, "Default", "default"));
                             }
                         });
 
@@ -330,17 +330,6 @@ impl SettingsTab {
                             ui.colored_label(theme::sem(ui).negative, e);
                         }
                     });
-
-                    // Handle Pick CPUs dialog
-                    if let Some(ref mut dlg) = self.cpu_dialog {
-                        if let Some(result) = dlg.show(ctx, opacity) {
-                            if !result.is_empty() {
-                                self.default_affinity_text = result;
-                                changed |= self.commit_affinity();
-                            }
-                            self.cpu_dialog = None;
-                        }
-                    }
 
                     ui.add_space(tokens::SPACE_M);
 
@@ -651,6 +640,18 @@ impl SettingsTab {
                     ui.colored_label(ui.visuals().weak_text_color(), &self.status);
                 }
             });
+
+        // Drawn whichever section is open: it is a window of its own, and
+        // tied to the Processes section it vanished and came back with it.
+        if let Some(ref mut dlg) = self.cpu_dialog {
+            if let Some(result) = dlg.show(ctx, opacity) {
+                if !result.is_empty() {
+                    self.default_affinity_text = result;
+                    changed |= self.commit_affinity();
+                }
+                self.cpu_dialog = None;
+            }
+        }
 
         changed.then(|| self.config.clone())
     }
