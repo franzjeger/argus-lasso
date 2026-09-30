@@ -122,6 +122,32 @@ impl SettingsTab {
         true
     }
 
+    /// Finish a CPU list typed but not entered, as leaving its field does:
+    /// use it if it is valid, otherwise put back the one in effect and say
+    /// so. For when the Processes section is no longer shown. Returns the
+    /// settings if they changed.
+    pub fn finish_editing(&mut self) -> Option<Config> {
+        let pending = match self.edited_affinity() {
+            Ok(affinity) => affinity != self.config.cpu.default_affinity,
+            Err(_) => true,
+        };
+        if !pending {
+            return None;
+        }
+        if self.commit_affinity() {
+            return Some(self.config.clone());
+        }
+        let kept = self.config.cpu.default_affinity.clone();
+        self.status = format!(
+            "{} — kept {}",
+            self.affinity_error.take().unwrap_or_default(),
+            kept.as_deref().unwrap_or("all CPUs")
+        );
+        self.default_affinity_enabled = kept.is_some();
+        self.default_affinity_text = kept.unwrap_or_default();
+        None
+    }
+
     /// Register or remove autostart as the checkbox now says, then show
     /// what is actually in place.
     fn commit_autostart(&mut self) {
@@ -191,6 +217,9 @@ impl SettingsTab {
         updates: &mut crate::updater::UpdateState,
     ) -> Option<Config> {
         let mut changed = false;
+        if self.section != SettingsSection::Processes {
+            changed |= self.finish_editing().is_some();
+        }
         self.poll_power(ctx);
         let stale = self
             .power_synced
@@ -235,8 +264,9 @@ impl SettingsTab {
                             if ui.checkbox(&mut self.default_affinity_enabled, "Enabled").changed() {
                                 changed |= self.commit_affinity();
                             }
-                            // Typed lists take effect on Enter or leaving the
-                            // field, not with every keystroke.
+                            // Typed lists take effect on Enter, leaving the
+                            // field or leaving the page (finish_editing), not
+                            // with every keystroke.
                             let typed = ui.add(
                                 egui::TextEdit::singleline(&mut self.default_affinity_text)
                                     .hint_text("e.g. 8-15,24-31")
@@ -1085,5 +1115,27 @@ mod tests {
         tab.default_affinity_enabled = false;
         assert!(tab.commit_affinity());
         assert_eq!(tab.config.cpu.default_affinity, None);
+    }
+
+    /// A CPU list typed but not entered used to be lost, still showing, when
+    /// the section or tab changed: egui drops the focus of a field it no
+    /// longer draws without reporting it.
+    #[test]
+    fn a_typed_cpu_list_is_finished_when_the_page_is_left() {
+        let mut tab = super::SettingsTab::new(crate::config::Config::default());
+        assert!(tab.finish_editing().is_none(), "nothing typed");
+
+        tab.default_affinity_enabled = true;
+        tab.default_affinity_text = "0".into();
+        let stored = tab.finish_editing().expect("a valid list is used");
+        assert_eq!(stored.cpu.default_affinity.as_deref(), Some("0"));
+
+        tab.default_affinity_text = "abc".into();
+        assert!(tab.finish_editing().is_none());
+        assert_eq!(
+            tab.default_affinity_text, "0",
+            "the list in effect is shown again"
+        );
+        assert!(tab.status.contains("kept 0"), "{}", tab.status);
     }
 }

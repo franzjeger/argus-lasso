@@ -240,6 +240,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   field's minimum, and could raise a false alert. ProBalance no longer lowers the
   restore threshold while the activation threshold is being typed; a draft whose
   restore is not below activation says so and cannot be applied.
+- A default CPU list typed in Settings is used, or put back with a message if it
+  is not valid, when the section or tab is left or the window is closed, not only
+  on Enter. It was lost while still showing, with the presets highlighting it as
+  if it were in effect.
 
 ### Changed
 

@@ -434,6 +434,7 @@ impl eframe::App for ArgusLassoApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Resume any process awaiting Undo before the GUI disappears.
         self.pending_kill = None;
+        self.finish_settings_edit();
         // Flush settings before stopping the single configuration writer.
         if self.pending_config_save.dirty {
             self.save_config();
@@ -1204,6 +1205,9 @@ impl ArgusLassoApp {
         frame: &FrameData,
         notify_error: &impl Fn(&str),
     ) {
+        if self.active_tab != Tab::Settings {
+            self.finish_settings_edit();
+        }
         let FrameData {
             ref snapshot,
             ref throttle_infos,
@@ -1368,6 +1372,37 @@ impl ArgusLassoApp {
         }
     }
 
+    /// Put a setting changed on the Settings page into effect and save it.
+    fn store_settings(&mut self, updated: Config) {
+        let affinity_changed = self.state.lock().map_or(true, |s| {
+            s.config.cpu.default_affinity != updated.cpu.default_affinity
+        });
+        self.update_config(|c| {
+            c.cpu.default_affinity = updated.cpu.default_affinity;
+            c.monitor = updated.monitor;
+            c.hw_alerts = updated.hw_alerts;
+            c.ui.notifications_enabled = updated.ui.notifications_enabled;
+            c.ui.check_updates_on_start = updated.ui.check_updates_on_start;
+        });
+        // Only a new default affinity has anything to reapply. Reapplying
+        // also gives failed rule changes another try, which would log
+        // their failures again on every settings click.
+        if affinity_changed {
+            self.send(DaemonCmd::ReapplyDefaults);
+        }
+        self.save_config();
+    }
+
+    /// A CPU list typed on the Settings page but not entered is finished
+    /// when the page is left, by tab or by closing the window, as it is when
+    /// its field loses focus: egui drops the focus of a field it no longer
+    /// draws without reporting it.
+    fn finish_settings_edit(&mut self) {
+        if let Some(updated) = self.settings_tab.finish_editing() {
+            self.store_settings(updated);
+        }
+    }
+
     fn show_settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let config_changed = self
             .settings_tab
@@ -1383,23 +1418,7 @@ impl ArgusLassoApp {
         }
 
         if let Some(updated) = config_changed {
-            let affinity_changed = self.state.lock().map_or(true, |s| {
-                s.config.cpu.default_affinity != updated.cpu.default_affinity
-            });
-            self.update_config(|c| {
-                c.cpu.default_affinity = updated.cpu.default_affinity;
-                c.monitor = updated.monitor;
-                c.hw_alerts = updated.hw_alerts;
-                c.ui.notifications_enabled = updated.ui.notifications_enabled;
-                c.ui.check_updates_on_start = updated.ui.check_updates_on_start;
-            });
-            // Only a new default affinity has anything to reapply. Reapplying
-            // also gives failed rule changes another try, which would log
-            // their failures again on every settings click.
-            if affinity_changed {
-                self.send(DaemonCmd::ReapplyDefaults);
-            }
-            self.save_config();
+            self.store_settings(updated);
         }
 
         // Theme and opacity are stored as they change.
@@ -1410,9 +1429,8 @@ impl ArgusLassoApp {
         {
             self.last_saved_opacity = cur_opacity;
             self.last_saved_theme = cur_theme.clone();
-            // Through update_config like the Apply handler above:
-            // without ConfigChanged the daemon's own config
-            // mirror never learns about the change.
+            // Through update_config: without ConfigChanged the daemon's
+            // own config mirror never learns about the change.
             self.update_config(|c| {
                 c.ui.opacity = cur_opacity;
                 c.ui.theme = cur_theme;
