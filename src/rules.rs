@@ -352,6 +352,10 @@ pub struct Target<'a> {
     pub start_ticks: u64,
     pub name: &'a str,
     pub nice: Option<i32>,
+    /// The nice the process had before another part of Argus (ProBalance)
+    /// changed it. A rule that takes the value over records this as what to
+    /// put back, not the other part's temporary value.
+    pub held_nice: Option<i32>,
 }
 
 /// A value enforcement set, what the process had before, and who set it
@@ -556,7 +560,7 @@ pub fn apply_rules(
                 Ok(()) => {
                     let by = format!("[Rule:{}]", rule.name);
                     report(format!("{by} Set nice={nice} on {name}({pid})"));
-                    if let Some(original) = target.nice {
+                    if let Some(original) = target.held_nice.or(target.nice) {
                         Undo::record(&mut state.changes(target).nice, original, nice, by);
                     }
                 }
@@ -697,6 +701,7 @@ mod tests {
             start_ticks: 0,
             name,
             nice,
+            held_nice: None,
         }
     }
 
@@ -1184,5 +1189,29 @@ mod tests {
         rule.pattern = "ok".into();
         rule.refresh_pattern_caches();
         assert_eq!(rule.pattern_error(), None);
+    }
+
+    /// A rule taking over the nice of a process ProBalance had throttled
+    /// recorded the throttle value as the original, so deleting the rule
+    /// left the process throttled for good.
+    #[test]
+    fn a_rule_puts_back_the_value_from_before_a_throttle() {
+        let sleeper = Sleeper::spawn();
+        let pid = sleeper.0.id();
+        // The throttle; then a rule; all raising, so no privilege is needed.
+        utils::set_nice(pid, 10).unwrap();
+        let mut rule = rule_with("argus-undo-test", MatchType::Exact);
+        rule.nice = Some(12);
+        let mut rules = [rule];
+        let mut state = RuleState::default();
+        let mut target = sleeper.target();
+        target.held_nice = Some(13);
+        let read = || None;
+        apply_rules(&only(&rules), target, read, &mut state, &|_| {});
+        assert_eq!(utils::get_nice(pid), Some(12));
+
+        rules[0].enabled = false;
+        sleeper.enforce(&only(&rules), &mut state);
+        assert_eq!(utils::get_nice(pid), Some(13), "not the throttle's 10");
     }
 }

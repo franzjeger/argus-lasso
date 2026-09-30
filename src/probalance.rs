@@ -659,6 +659,18 @@ impl ProBalance {
         }
     }
 
+    /// The nice value each process throttled through nice had before, for a
+    /// rule that takes the value over: what it should put back later is this,
+    /// not the throttle.
+    pub fn held_nices(&self) -> HashMap<u32, i32> {
+        self.states
+            .iter()
+            .filter(|(_, e)| e.state == ProcState::Throttled)
+            .filter(|(_, e)| !matches!(e.applied, Some(Applied::Cgroup { .. })))
+            .filter_map(|(&pid, e)| Some((pid, e.original_nice?)))
+            .collect()
+    }
+
     /// Return the set of currently throttled PIDs (for UI display).
     pub fn throttled_pids(&self) -> std::collections::HashSet<u32> {
         self.states

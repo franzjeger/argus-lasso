@@ -1045,14 +1045,17 @@ impl Daemon {
             rules: &rules,
             default_affinity: default_affinity(&self.config),
         };
+        let held = self.probalance.held_nices();
         for proc in &self.raw_snapshot {
             if self.manual_overrides.contains_key(&proc.pid) || self.fresh_pids.contains(&proc.pid)
             {
                 continue;
             }
+            let mut target = target(proc, Some(proc.nice));
+            target.held_nice = held.get(&proc.pid).copied();
             crate::rules::apply_rules(
                 &policy,
-                target(proc, Some(proc.nice)),
+                target,
                 || utils::get_ionice_raw(proc.pid),
                 &mut self.rule_state,
                 &self.log,
@@ -1079,11 +1082,13 @@ impl Daemon {
             rules: &rules,
             default_affinity: default_affinity(&self.config),
         };
+        let held = self.probalance.held_nices();
         for proc in &self.raw_snapshot {
             if self.manual_overrides.contains_key(&proc.pid) {
                 continue;
             }
-            let target = target(proc, utils::get_nice(proc.pid));
+            let mut target = target(proc, utils::get_nice(proc.pid));
+            target.held_nice = held.get(&proc.pid).copied();
             let ionice = || utils::get_ionice_raw(proc.pid);
             crate::rules::apply_rules(&policy, target, ionice, &mut self.rule_state, &self.log);
             if let Some(affinity) = policy.default_affinity {
@@ -1106,11 +1111,23 @@ impl Daemon {
         if let Some(total) = system_cpu {
             self.avg = total;
         }
-        let protected = protected_processes(
+        let mut protected = protected_processes(
             &self.raw_snapshot,
             &self.gaming.launch_profiles,
             &self.manual_overrides,
         );
+        // A rule that sets a process's nice owns that value; throttling it
+        // would fight the rule every pass. (Children are not covered: the
+        // rule matches by name.)
+        let rules = self.rules();
+        if rules.iter().any(|r| r.enabled && r.nice.is_some()) {
+            protected.extend(
+                self.raw_snapshot
+                    .iter()
+                    .filter(|p| crate::rules::preview_effect(&rules, &p.name).nice.is_some())
+                    .map(|p| p.pid),
+            );
+        }
         self.probalance
             .tick(&pb_snap, pb_tick, system_cpu, &protected);
         self.notify_throttle_changes();
@@ -1799,6 +1816,7 @@ fn target(proc: &ProcInfo, nice: Option<i32>) -> Target<'_> {
         start_ticks: proc.start_ticks,
         name: &proc.name,
         nice,
+        held_nice: None,
     }
 }
 

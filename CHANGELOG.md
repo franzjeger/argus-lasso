@@ -279,6 +279,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   parked CPUs, ProBalance throttles and Gaming Mode nices, as quitting from the
   window or tray does. The process died at once on those signals, leaving CPUs
   offline system-wide. Unparking now comes first and the restore gets up to 10 s.
+- A rule that sets a process's nice value takes it over from ProBalance: the rule
+  now records the value from before ProBalance's throttle as the one to put back,
+  and ProBalance leaves processes whose nice a rule sets alone. Deleting such a
+  rule left the process at the throttle value for good.
 
 ### Changed
 
