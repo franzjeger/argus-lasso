@@ -294,7 +294,7 @@ impl RulesTab {
                                             })
                                             .unwrap_or(false);
                                         let mut on = rule.enabled;
-                                        if theme::toggle(ui, &mut on) {
+                                        if theme::toggle(ui, &mut on, "Rule enabled") {
                                             toggle_rule_id = Some(rule_id.clone());
                                         }
                                     });

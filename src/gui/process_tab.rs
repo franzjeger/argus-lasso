@@ -532,12 +532,24 @@ impl ProcessTab {
             ui.add_space(theme::tokens::SPACE_S);
 
             // Quick-filter chips (§4) — pills, filled when active
-            for (state, label) in [
-                (&mut self.chip_high_cpu, "High CPU"),
-                (&mut self.chip_throttled, "Throttled"),
-                (&mut self.chip_suspended, "Suspended"),
+            for (state, label, hint) in [
+                (
+                    &mut self.chip_high_cpu,
+                    "High CPU",
+                    "Only processes using at least 25% of total CPU capacity",
+                ),
+                (
+                    &mut self.chip_throttled,
+                    "Throttled",
+                    "Only processes ProBalance is currently throttling",
+                ),
+                (
+                    &mut self.chip_suspended,
+                    "Suspended",
+                    "Only paused (stopped) processes",
+                ),
             ] {
-                if theme::chip(ui, label, *state) {
+                if theme::chip_hinted(ui, label, *state, hint) {
                     *state = !*state;
                 }
             }
@@ -1428,6 +1440,44 @@ mod tests {
         pending.record(8, 100, true);
         // PID 8 now belongs to a different process.
         assert!(pending.stopped_pids(&[running(8, 999)]).is_empty());
+    }
+
+    /// The filter chips are painted by hand; without widget info a screen
+    /// reader saw nothing there.
+    #[test]
+    fn filter_chips_are_visible_to_screen_readers() {
+        let ctx = egui::Context::default();
+        theme::apply_theme(&ctx, 1.0, &theme::AppTheme::BreezeDark);
+        ctx.enable_accesskit();
+        let mut tab = ProcessTab::new(&[], &[]);
+        tab.chip_throttled = true;
+        let output = ctx.run_ui(Default::default(), |root| {
+            egui::CentralPanel::default().show_inside(root, |ui| {
+                tab.show(
+                    ui,
+                    &[],
+                    &HashSet::new(),
+                    &HashSet::new(),
+                    false,
+                    &HashMap::new(),
+                );
+            });
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("accesskit update");
+        let chip = |name: &str| {
+            update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(name))
+                .map(|(_, node)| node.toggled())
+                .unwrap_or_else(|| panic!("no accessible node for {name}"))
+        };
+        use egui::accesskit::Toggled;
+        assert_eq!(chip("High CPU"), Some(Toggled::False));
+        assert_eq!(chip("Throttled"), Some(Toggled::True));
     }
 
     #[test]

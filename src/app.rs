@@ -1002,6 +1002,13 @@ impl ArgusLassoApp {
                     galley.size().y + pad.y * 2.0,
                 );
                 let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                resp.widget_info(|| {
+                    let name = match &badge_txt {
+                        Some(count) => format!("{label} ({count})"),
+                        None => label.to_string(),
+                    };
+                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, name)
+                });
                 if ui.is_rect_visible(rect) {
                     if selected {
                         ui.painter().rect_filled(

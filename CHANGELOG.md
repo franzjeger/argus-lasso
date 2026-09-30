@@ -175,6 +175,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Changed
 
+- Screen readers can use the hand-drawn controls: the page tabs, filter chips,
+  on/off switches, segmented choices and CPU thread tiles now report their name
+  and state. The process filter chips explain themselves on hover.
+
 - "Enable in-game overlay" is a checkbox like the setting below it; while off it
   used to look like plain text. The process filter's hint fits its field, with
   the details in its tooltip.

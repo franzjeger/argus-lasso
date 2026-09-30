@@ -398,10 +398,36 @@ pub fn chip(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
     chip_colored(ui, label, active, accent)
 }
 
+/// A `chip` that explains itself on hover.
+pub fn chip_hinted(ui: &mut egui::Ui, label: &str, active: bool, hint: &str) -> bool {
+    let accent = sem(ui).accent;
+    let inactive_text = ui.visuals().weak_text_color();
+    chip_response(ui, label, active, accent, inactive_text)
+        .on_hover_text(hint)
+        .clicked()
+}
+
 /// Pill-shaped filter chip in an explicit colour (log/HW categories carry
 /// their own semantic colour). Returns true when clicked; the active state
 /// gets a filled tint and a trailing × hinting that clicking clears it.
 pub fn chip_colored(ui: &mut egui::Ui, label: &str, active: bool, color: Color32) -> bool {
+    let inactive_text = ui.visuals().weak_text_color();
+    chip_response(ui, label, active, color, inactive_text).clicked()
+}
+
+/// A `chip_colored` whose label keeps its colour while inactive too, so a
+/// category's chip matches the colour code of its rows (activity log).
+pub fn category_chip(ui: &mut egui::Ui, label: &str, active: bool, color: Color32) -> bool {
+    chip_response(ui, label, active, color, color).clicked()
+}
+
+fn chip_response(
+    ui: &mut egui::Ui,
+    label: &str,
+    active: bool,
+    color: Color32,
+    inactive_text: Color32,
+) -> egui::Response {
     let s = Sem {
         accent: color,
         ..sem(ui)
@@ -414,15 +440,15 @@ pub fn chip_colored(ui: &mut egui::Ui, label: &str, active: bool, color: Color32
     let galley = ui.painter().layout_no_wrap(
         text.clone(),
         egui::FontId::proportional(tokens::FONT_LABEL),
-        if active {
-            s.accent
-        } else {
-            ui.visuals().weak_text_color()
-        },
+        if active { s.accent } else { inactive_text },
     );
     let pad = egui::vec2(9.0, 4.0);
     let size = galley.size() + pad * 2.0;
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    // A painted widget has no label or state for screen readers unless told.
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), active, label)
+    });
     if ui.is_rect_visible(rect) {
         let hovered = resp.hovered();
         let fill = if active {
@@ -446,7 +472,7 @@ pub fn chip_colored(ui: &mut egui::Ui, label: &str, active: bool, color: Color32
         );
         ui.painter().galley(rect.min + pad, galley, Color32::WHITE);
     }
-    resp.clicked()
+    resp
 }
 
 /// Paint a badge into an explicit rect (for painter-driven tables).
@@ -494,11 +520,15 @@ pub fn badge_outline_colored(ui: &mut egui::Ui, label: &str, col: Color32) {
     }
 }
 
-/// iOS-style toggle switch (26×14 pill). Returns true when toggled.
-pub fn toggle(ui: &mut egui::Ui, on: &mut bool) -> bool {
+/// iOS-style toggle switch (26×14 pill). Returns true when toggled. `label`
+/// is what a screen reader announces; the switch itself draws no text.
+pub fn toggle(ui: &mut egui::Ui, on: &mut bool, label: &str) -> bool {
     let s = sem(ui);
     let size = egui::vec2(26.0, 14.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    resp.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label)
+    });
     if resp.clicked() {
         *on = !*on;
     }
@@ -553,6 +583,14 @@ pub fn segmented(ui: &mut egui::Ui, options: &[&str], selected: usize) -> Option
             let pad = egui::vec2(10.0, 4.0);
             let size = galley.size() + pad * 2.0;
             let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::RadioButton,
+                    ui.is_enabled(),
+                    is_sel,
+                    *opt,
+                )
+            });
             if ui.is_rect_visible(rect) {
                 // Round only the outer corners of the group
                 let r = 3;
@@ -1365,5 +1403,42 @@ mod viewport_opacity_tests {
                 assert_eq!(ctx.global_style().visuals.panel_fill, original);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod accessibility_tests {
+    use super::*;
+    use egui::accesskit::{Role, Toggled};
+
+    /// Hand-painted controls report a name and state, or a screen reader
+    /// finds nothing where they are drawn.
+    #[test]
+    fn painted_controls_have_names_and_states() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx, 1.0, &AppTheme::BreezeDark);
+        ctx.enable_accesskit();
+        let output = ctx.run_ui(Default::default(), |root| {
+            egui::CentralPanel::default().show_inside(root, |ui| {
+                toggle(ui, &mut true, "Rule enabled");
+                segmented(ui, &["Performance", "Balanced"], 1);
+                category_chip(ui, "Rules", false, Color32::RED);
+            });
+        });
+        let update = output.platform_output.accesskit_update.unwrap();
+        let node = |name: &str| {
+            update
+                .nodes
+                .iter()
+                .map(|(_, node)| node)
+                .find(|node| node.label() == Some(name))
+                .unwrap_or_else(|| panic!("no accessible node for {name}"))
+        };
+        assert_eq!(node("Rule enabled").role(), Role::CheckBox);
+        assert_eq!(node("Rule enabled").toggled(), Some(Toggled::True));
+        assert_eq!(node("Performance").role(), Role::RadioButton);
+        assert_eq!(node("Performance").toggled(), Some(Toggled::False));
+        assert_eq!(node("Balanced").toggled(), Some(Toggled::True));
+        assert_eq!(node("Rules").toggled(), Some(Toggled::False));
     }
 }

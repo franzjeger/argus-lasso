@@ -1119,6 +1119,16 @@ fn core_map(
                 egui::Sense::hover()
             },
         );
+        if clickable {
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Checkbox,
+                    true,
+                    kept,
+                    format!("Keep CPU {cpu} online"),
+                )
+            });
+        }
         if resp.clicked() {
             let v = checks.entry(cpu).or_insert(true);
             *v = !*v;

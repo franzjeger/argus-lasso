@@ -60,7 +60,7 @@ impl ProBalanceTab {
             // ── Status card: state, plain-language summary, live count ────────
             crate::gui::theme::card_untitled(ui, |ui| {
                 ui.horizontal(|ui| {
-                    th::toggle(ui, &mut self.cfg.enabled);
+                    th::toggle(ui, &mut self.cfg.enabled, "ProBalance enabled");
                     ui.add_space(tokens::SPACE_S);
                     ui.vertical(|ui| {
                         ui.label(
