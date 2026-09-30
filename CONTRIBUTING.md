@@ -15,7 +15,10 @@ The CI workflow is configured to check Rust 1.95 and build/test on x86_64 and
 aarch64. An architecture build is not proof of game/driver compatibility. Shader compilation requires
 `glslangValidator` (Debian/Ubuntu package `glslang-tools`).
 
-For screenshots, run `argus-lasso --ui-tour <output-directory>`. This isolated
+For screenshots, run `argus-lasso --ui-tour <output-directory>`; add
+`--tour-theme BreezeDark` (or another theme's name in the configuration) to
+capture a theme other than your own. Captures are opaque and ignore the pointer,
+whatever your window opacity. This isolated
 preview uses read-only collection: it must never enforce policies, bind the
 production overlay socket or save configuration. Root captures do not include
 native child windows; photograph those separately. Review images for private

@@ -13,6 +13,10 @@ pub enum AppTheme {
 }
 
 impl AppTheme {
+    /// Every theme's key in config.toml, as [`AppTheme::to_str`] writes it.
+    pub const NAMES: [&'static str; 4] =
+        ["BreezeDark", "BreezeLight", "AdwaitaDark", "AdwaitaLight"];
+
     pub fn label(&self) -> &'static str {
         match self {
             AppTheme::BreezeDark => "Breeze Dark",

@@ -102,9 +102,16 @@ pub const STEPS: &[Step] = &[
 /// Screenshots show the window as it looks opaque, whatever opacity the person
 /// running the tour chose for their own window. At 80 % every capture was
 /// composited over black: the dark themes came out a muddy brown-grey and the
-/// light ones grey. The tour never saves, so this stays in the throwaway copy.
-pub fn prepare_config(config: &mut crate::config::Config) {
+/// light ones grey. `theme`, a key from [`AppTheme::NAMES`], takes the place
+/// of the configured theme, so one configuration yields every theme's set.
+/// The tour never saves, so both stay in the throwaway copy.
+///
+/// [`AppTheme::NAMES`]: crate::gui::theme::AppTheme::NAMES
+pub fn prepare_config(config: &mut crate::config::Config, theme: Option<&str>) {
     config.ui.opacity = 1.0;
+    if let Some(theme) = theme {
+        config.ui.theme = theme.to_string();
+    }
 }
 
 /// Drop pointer input for the tour.
@@ -351,8 +358,21 @@ mod tests {
     fn captures_are_opaque_whatever_the_window_opacity() {
         let mut config = crate::config::Config::default();
         config.ui.opacity = 0.8;
-        prepare_config(&mut config);
+        prepare_config(&mut config, None);
         assert_eq!(config.ui.opacity, 1.0);
+    }
+
+    #[test]
+    fn a_tour_theme_replaces_the_configured_one() {
+        use crate::gui::theme::AppTheme;
+        for name in AppTheme::NAMES {
+            let mut config = crate::config::Config::default();
+            config.ui.theme = "AdwaitaDark".into();
+            prepare_config(&mut config, Some(name));
+            // A name the app did not know would fall back to the desktop's
+            // default theme instead of the one asked for.
+            assert_eq!(AppTheme::from_str(&config.ui.theme).to_str(), name);
+        }
     }
 
     #[test]

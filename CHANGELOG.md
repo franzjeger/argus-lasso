@@ -10,6 +10,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ## [Unreleased]
 
+### Added
+
+- `--tour-theme <THEME>` picks the theme of the `--ui-tour` captures (for example
+  `BreezeDark` or `BreezeLight`), so every theme's screenshots come from one
+  configuration without changing it.
+
 ### Fixed
 
 - `--ui-tour` captures the window opaque. It used the window opacity of whoever
