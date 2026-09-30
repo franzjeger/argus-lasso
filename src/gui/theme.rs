@@ -65,16 +65,6 @@ pub fn default_theme() -> AppTheme {
     }
 }
 
-/// Returns the WINDOW_BG (r, g, b) for the active theme (used by opacity fallback).
-pub fn window_bg_rgb(theme: &AppTheme) -> (u8, u8, u8) {
-    match theme {
-        AppTheme::BreezeDark => (0x31, 0x36, 0x3b),
-        AppTheme::BreezeLight => (0xef, 0xf0, 0xf1),
-        AppTheme::AdwaitaDark => (0x24, 0x24, 0x24),
-        AppTheme::AdwaitaLight => (0xfa, 0xfa, 0xfa),
-    }
-}
-
 /// Set the background alpha on this viewport's UI, without mutating the shared
 /// Context style. Native root UIs already cloned that style before the callback.
 /// Requires a transparent native surface and a transparent renderer clear color.

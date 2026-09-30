@@ -449,6 +449,13 @@ impl eframe::App for ArgusLassoApp {
     /// thing that had to change — so it is taken from the `Ui` we are given.
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root_ui.ctx().clone();
+        // Without the compositor's alpha modifier, opacity is the alpha of
+        // the root UI's fills, which is rebuilt from the theme every frame,
+        // so it is set every frame too: at startup, and after a theme change
+        // or Apply, as well as while the slider moves.
+        if self.wayland_opacity.is_none() {
+            crate::gui::theme::apply_viewport_opacity(root_ui, self.opacity);
+        }
         if self.state.lock().is_ok_and(|s| s.quit_requested) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -526,12 +533,11 @@ impl eframe::App for ArgusLassoApp {
         self.show_kill_toast(ctx);
         self.show_error_banners(root_ui);
 
+        // The root UI's fill carries the opacity fallback; the global
+        // style's does not.
+        let panel_fill = root_ui.visuals().panel_fill;
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(ctx.global_style().visuals.panel_fill)
-                    .inner_margin(16),
-            )
+            .frame(egui::Frame::new().fill(panel_fill).inner_margin(16))
             .show_inside(root_ui, |ui| {
                 // Tab bar: five primary workflow tabs on the left; the occasional
                 // tools live behind a "Tools ▾" menu and Settings behind the gear,
@@ -1362,20 +1368,8 @@ impl ArgusLassoApp {
         let new_opacity = self.settings_tab.opacity;
         if (new_opacity - self.opacity).abs() > 0.001 {
             self.opacity = new_opacity;
-            eprintln!("[opacity] applying opacity={new_opacity:.3}");
             if let Some(ref wo) = self.wayland_opacity {
                 wo.set(new_opacity);
-            } else {
-                // Fallback: control opacity via window_fill alpha so the
-                // compositor sees a semi-transparent clear colour.
-                let alpha = (new_opacity * 255.0) as u8;
-                let theme = &self.settings_tab.theme;
-                ctx.global_style_mut(|s| {
-                    let (r, g, b) = crate::gui::theme::window_bg_rgb(theme);
-                    let col = egui::Color32::from_rgba_unmultiplied(r, g, b, alpha);
-                    s.visuals.window_fill = col;
-                    s.visuals.panel_fill = col;
-                });
             }
         }
 

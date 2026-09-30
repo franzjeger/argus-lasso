@@ -158,6 +158,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   Checking from the old process offered the just-installed release again and
   hid "Restart now", and installing it a second time saved the new binary as
   the previous one, so "Restore previous app and overlay" restored the update.
+- Window opacity without the compositor's alpha modifier (X11, or compositors
+  without `wp_alpha_modifier_v1`) is applied at startup and kept through theme
+  changes and Apply, instead of only while the slider moves.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
