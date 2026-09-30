@@ -11,11 +11,12 @@
 //! in the file is the framebuffer, so there are no window shadows, no
 //! decorations and no pointer.
 //!
-//! Not covered: the affinity, nice and I/O-priority dialogs. Those open as
-//! separate OS windows via `show_viewport_immediate`, and eframe's glow
-//! backend does not deliver `Event::Screenshot` for an immediate child
-//! viewport — a capture addressed to one simply never replies. They have to
-//! be captured by hand until that changes.
+//! Dialogs open as separate OS windows via `show_viewport_immediate`, and a
+//! capture of the root framebuffer never contains one (nor does eframe's glow
+//! backend answer a capture addressed to a child viewport). During the tour
+//! the app embeds them as windows inside the main one instead, so the process
+//! details step shows its dialog. The affinity, nice and I/O-priority dialogs
+//! have no step yet.
 
 use std::path::{Path, PathBuf};
 
