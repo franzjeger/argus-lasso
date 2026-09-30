@@ -4,6 +4,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # bincode 3.0.0 is a tombstone: its lib.rs is only a compile_error!
+      # (the project is no longer developed). 1.3.3 is the last working one.
+      - dependency-name: bincode
+        versions: [">= 3"]
     groups:
       # Batch minor/patch bumps into one PR to keep noise down;
       # major (potentially breaking) bumps still get individual PRs.
