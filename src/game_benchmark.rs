@@ -197,7 +197,7 @@ impl GameBenchmark {
         egui::CollapsingHeader::new("Measurement details & files").show(ui, |ui| {
         theme::help_text(ui, "CPU present intervals, not GPU time or displayed / generated frames. 1% low = reciprocal of the mean slowest 1%; p99 = nearest-rank frametime. No data is uploaded.");
 
-            ui.label("Every Vulkan present interval is recorded. Each application and swapchain has a separate result.");
+            ui.label("Every interval between successful Vulkan presents is recorded; a failed present and the interval after it are counted as failures, not timed. Each application and swapchain has a separate result.");
             ui.monospace(capture::directory().display().to_string());
         });
         ui.add_space(8.0);
