@@ -299,6 +299,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   boost ending) restores each thread to its own value. All threads were set to the
   main thread's, raising the priority of threads a process had lowered itself,
   such as a browser's background threads.
+- Clearing the default affinity also releases processes that inherited it from a
+  process it had pinned; they had the mask from the start, so nothing recorded
+  them and they stayed pinned.
 
 ### Changed
 

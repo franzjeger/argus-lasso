@@ -1872,6 +1872,7 @@ fn target(proc: &ProcInfo, nice: Option<i32>) -> Target<'_> {
         pid: proc.pid,
         start_ticks: proc.start_ticks,
         name: &proc.name,
+        ppid: proc.ppid,
         nice,
         held_nice: None,
     }

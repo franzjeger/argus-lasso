@@ -347,6 +347,8 @@ pub struct Target<'a> {
     /// Tells the process a change was made to from a later one given its PID.
     pub start_ticks: u64,
     pub name: &'a str,
+    /// The parent's PID, whose affinity a new process starts with.
+    pub ppid: u32,
     pub nice: Option<i32>,
     /// The nice the process's threads had before another part of Argus
     /// (ProBalance) changed it. A rule that takes the value over records
@@ -563,7 +565,29 @@ impl RuleState {
                 "[Default] affinity={affinity} → {}({})",
                 target.name, target.pid
             ));
+        } else if let Some(original) = self.inherited(target, affinity) {
+            // Started by a process Argus pinned, it has the mask already;
+            // without a record, clearing the default would leave it pinned.
+            let slot = &mut self.changes(target).affinity;
+            Undo::record(
+                slot,
+                original,
+                affinity.to_string(),
+                "[Default]".into(),
+                Owner::Rules,
+            );
         }
+    }
+
+    /// The parent's original affinity, when a process without a record of
+    /// its own has `affinity` because its parent was given it.
+    fn inherited(&self, target: Target, affinity: &str) -> Option<String> {
+        if self.recorded(target).is_some_and(|c| c.affinity.is_some()) {
+            return None;
+        }
+        let parent = self.changes.get(&target.ppid)?.affinity.as_ref()?;
+        (parent.applied == affinity && utils::affinity_matches(target.pid, affinity))
+            .then(|| parent.original.clone())
     }
 
     /// Drop a process's record once nothing is left to undo.
@@ -785,6 +809,7 @@ mod tests {
             pid,
             start_ticks: 0,
             name,
+            ppid: 0,
             nice,
             held_nice: None,
         }
@@ -1426,5 +1451,31 @@ mod tests {
         if after != [12, 12] {
             assert_eq!(after, before);
         }
+    }
+
+    /// A process started by one the default affinity had pinned has the mask
+    /// already, so nothing was recorded and clearing the default left it
+    /// pinned.
+    #[test]
+    fn an_inherited_default_affinity_is_released_with_the_default() {
+        let parent = Sleeper::spawn();
+        let child = Sleeper::spawn();
+        let affinity = utils::get_affinity_str(parent.0.id());
+        let cpus = utils::cpulist_to_set(&affinity).unwrap();
+        let Some(cpu) = cpus.iter().min().filter(|_| cpus.len() > 1) else {
+            eprintln!("needs two CPUs to change affinity");
+            return;
+        };
+        let cpu = cpu.to_string();
+        let mut state = RuleState::default();
+        state.apply_default_affinity(parent.target(), &cpu, &|_| {});
+        // As if inherited from the pinned parent.
+        utils::set_affinity(child.0.id(), &cpu).unwrap();
+        let mut target = child.target();
+        target.ppid = parent.0.id();
+        state.apply_default_affinity(target, &cpu, &|_| {});
+
+        child.enforce(&only(&[]), &mut state);
+        assert_eq!(utils::get_affinity_str(child.0.id()), affinity);
     }
 }
