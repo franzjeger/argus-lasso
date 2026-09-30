@@ -150,8 +150,6 @@ pub struct ArgusLassoApp {
     wayland_opacity: Option<crate::wayland_opacity::WaylandOpacity>,
     // Current window opacity (0.1–1.0); tracked so we only call set() when it changes
     opacity: f32,
-    // Native pixels-per-point at startup (for HiDPI scaling)
-    native_ppp: f32,
 
     // Repaint rate diagnostics
     repaint_count: u32,
@@ -274,7 +272,6 @@ impl ArgusLassoApp {
             last_cpu_gen: 0,
             wayland_opacity,
             opacity: saved_opacity,
-            native_ppp,
             repaint_count: 0,
             last_repaint_log: std::time::Instant::now(),
             last_saved_opacity,
@@ -605,7 +602,7 @@ impl Tab {
                 Tab::GamingMode => ("Gaming", "CPU control, game profiles, overlay and performance recordings."),
                 Tab::HwMonitor => ("Hardware sensors", "Live readings grouped by component, with session minimums, maximums and averages."),
                 Tab::Benchmark => ("Memory benchmarks", "Measure memory latency and bandwidth. Game recordings are in Gaming → Recording."),
-                Tab::Settings => ("Settings", "Customize Argus and its defaults. Changes that need applying are collected in the bottom bar."),
+                Tab::Settings => ("Settings", "Customize Argus and its defaults. Changes take effect immediately."),
                 Tab::Log => ("Activity log", "Review process actions, rule changes and hardware alerts."),
         }
     }
@@ -1376,8 +1373,7 @@ impl ArgusLassoApp {
             .settings_tab
             .show(ui, ctx, self.opacity, &mut self.updates);
 
-        // Live opacity preview — apply every frame the slider moves,
-        // regardless of whether the Apply button was clicked.
+        // Opacity follows the slider on every frame it moves.
         let new_opacity = self.settings_tab.opacity;
         if (new_opacity - self.opacity).abs() > 0.001 {
             self.opacity = new_opacity;
@@ -1387,28 +1383,26 @@ impl ArgusLassoApp {
         }
 
         if let Some(updated) = config_changed {
+            let affinity_changed = self.state.lock().map_or(true, |s| {
+                s.config.cpu.default_affinity != updated.cpu.default_affinity
+            });
             self.update_config(|c| {
                 c.cpu.default_affinity = updated.cpu.default_affinity;
                 c.monitor = updated.monitor;
                 c.hw_alerts = updated.hw_alerts;
                 c.ui.notifications_enabled = updated.ui.notifications_enabled;
                 c.ui.check_updates_on_start = updated.ui.check_updates_on_start;
-                c.ui.theme = updated.ui.theme;
-                c.ui.opacity = updated.ui.opacity;
             });
-            // Re-apply full theme (resets window_fill to opaque if needed)
-            crate::gui::theme::apply_theme(ctx, self.native_ppp, &self.settings_tab.theme);
-            // Then re-apply opacity on top of the fresh theme
-            if let Some(ref wo) = self.wayland_opacity {
-                wo.set(self.opacity);
+            // Only a new default affinity has anything to reapply. Reapplying
+            // also gives failed rule changes another try, which would log
+            // their failures again on every settings click.
+            if affinity_changed {
+                self.send(DaemonCmd::ReapplyDefaults);
             }
-            self.send(DaemonCmd::ReapplyDefaults);
-            self.last_saved_opacity = self.settings_tab.opacity;
-            self.last_saved_theme = self.settings_tab.theme.to_str().to_string();
             self.save_config();
         }
 
-        // Detect live theme/opacity changes and persist immediately (no Apply needed)
+        // Theme and opacity are stored as they change.
         let cur_opacity = self.settings_tab.opacity;
         let cur_theme = self.settings_tab.theme.to_str().to_string();
         if (cur_opacity - self.last_saved_opacity).abs() > 0.001

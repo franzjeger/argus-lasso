@@ -147,9 +147,10 @@ candidate processes. [Calculation and policy details](docs/user-guide.md#probala
 
 ## Configuration and CLI
 
-Configuration: `~/.config/argus-lasso/config.toml`. Overlay choices and appearance
-save live; other forms use **Apply changes**. Existing configuration under the
-old `process-lasso-rs` directory is migrated when appropriate.
+Configuration: `~/.config/argus-lasso/config.toml`. Settings, overlay choices and
+appearance take effect and save as they change. Only ProBalance's thresholds, which
+have to make sense together, wait for **Apply changes**. Existing configuration
+under the old `process-lasso-rs` directory is migrated when appropriate.
 
 ```bash
 argus-lasso --minimized              # start hidden to tray
