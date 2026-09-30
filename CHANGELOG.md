@@ -146,6 +146,14 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Cancelling a profile load leaves the previous profile selected, so "Delete
   profile" no longer targets the one that was not loaded. The current profile
   can be picked again to reload it.
+- Governor and EPP changes the kernel refuses are reported as failures with its
+  reason, instead of as success: the power helper (v6, asks to be reinstalled)
+  no longer ignores refused writes, and Settings checks what the kernel reports
+  afterwards. Settings follows governor and EPP changed elsewhere (Gaming → Power
+  profile, or EPP following a governor change) instead of showing and comparing
+  against the values from startup, and keeps a choice not yet applied. Power
+  changes in Settings and Gaming run in the background, so the window keeps
+  responding while an authentication dialog is open.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

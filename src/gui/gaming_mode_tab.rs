@@ -129,6 +129,10 @@ pub struct GamingModeTab {
     /// auth dialog can stay open for minutes, so installing synchronously
     /// would freeze the whole UI.
     install_result_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// A power profile change in progress; pkexec runs off the UI thread.
+    power_profile_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// When the governor/EPP shown was read; Settings can change them too.
+    power_read_at: std::time::Instant,
     steam_picker: Option<crate::gui::dialogs::SteamGamePickerDialog>,
     lutris_picker: Option<crate::gui::dialogs::LutrisGamePickerDialog>,
 
@@ -191,6 +195,8 @@ impl GamingModeTab {
             power_status_text: String::new(),
             power_governor: String::new(),
             install_result_rx: None,
+            power_profile_rx: None,
+            power_read_at: std::time::Instant::now(),
             steam_picker: None,
             lutris_picker: None,
             section: GamingSection::default(),
@@ -227,6 +233,7 @@ impl GamingModeTab {
     }
 
     fn refresh_power_status(&mut self) {
+        self.power_read_at = std::time::Instant::now();
         let gov = cpu_park::current_governor().unwrap_or_else(|| "?".into());
         self.power_status_text = match cpu_park::current_epp() {
             Some(epp) => format!("current: {gov} / {epp}"),
@@ -458,6 +465,27 @@ impl GamingModeTab {
             }
         }
 
+        if self.power_profile_rx.is_none()
+            && self.power_read_at.elapsed() >= std::time::Duration::from_secs(2)
+        {
+            self.refresh_power_status();
+        }
+        if let Some(rx) = &self.power_profile_rx {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    self.append_log(msg);
+                    self.refresh_power_status();
+                    self.power_profile_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.power_profile_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+
         crate::gui::theme::section_nav(
             ui,
             &mut self.section,
@@ -667,13 +695,17 @@ impl GamingModeTab {
                             "powersave" => 2,
                             _ => 1,
                         };
-                        ui.add_enabled_ui(self.helper_ok, |ui| {
+                        let idle = self.power_profile_rx.is_none();
+                        ui.add_enabled_ui(self.helper_ok && idle, |ui| {
                             if let Some(i) =
                                 th::segmented(ui, &["Performance", "Balanced", "Power save"], sel)
                             {
-                                let (_ok, msg) = cpu_park::apply_power_profile(profiles[i]);
-                                self.append_log(msg);
-                                self.refresh_power_status();
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                self.power_profile_rx = Some(rx);
+                                let profile = profiles[i];
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(cpu_park::apply_power_profile(profile).1);
+                                });
                             }
                         });
                         ui.add_space(tokens::SPACE_S);
