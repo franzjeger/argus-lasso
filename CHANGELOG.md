@@ -468,7 +468,7 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - **Gaming Mode "Kill game" reports SIGTERM failures.** A failed signal is
   logged as an error instead of "Sent SIGTERM".
 
-## [1.2.0] — 2026-08-04
+## [1.2.0] — 2026-08-15
 
 ### Security
 
@@ -499,10 +499,16 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
-- **The Settings scroll bar is visible**, so the last card stops looking cut
-  off. The content is taller than the panel at the default window size, so it
-  scrolls correctly — but egui's default bar floats in colours close to the
-  page, so nothing signalled that scrolling was possible. ([#41])
+- **Scroll bars are visible without hovering them.** egui's `solid()` preset
+  leaves the handle fully transparent until the pointer enters the area, so
+  any panel whose content overflows looked truncated rather than scrollable —
+  the Settings tab's last card, and the rule dialog's Nice and I/O priority
+  rows. Fixed in the theme, so it covers every scroll area including the
+  dialogs. ([#41], [#47])
+- **The rule dialog fits its own content.** At 560x400 the affinity picker's
+  quick-select row was clipped horizontally — that row is sized from the CPU
+  topology, so a 32-core machine overflows it — and Nice and I/O priority sat
+  below the fold whenever the picker was expanded. ([#47])
 - The window opacity slider was short and low-contrast, reading as an empty
   box followed by a number in the dark theme, and showed `1.000` where it
   means `100%`. ([#41])
@@ -720,5 +726,6 @@ current source, release and verification status, see [docs/status.md](docs/statu
 [#38]: https://github.com/franzjeger/argus-lasso/pull/38
 [#40]: https://github.com/franzjeger/argus-lasso/pull/40
 [#41]: https://github.com/franzjeger/argus-lasso/pull/41
+[#47]: https://github.com/franzjeger/argus-lasso/pull/47
 [#53]: https://github.com/franzjeger/argus-lasso/pull/53
 [#54]: https://github.com/franzjeger/argus-lasso/pull/54
