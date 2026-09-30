@@ -44,6 +44,11 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- The sensor service's CPU package power is readable by the installing user's group
+  only, not by every local user; the kernel keeps it root-only for a reason
+  (CVE-2020-8694). `install-sensors.sh` hands the program to root on stdin and
+  installs it only if its SHA-256 still matches, instead of having root copy it
+  from a user-writable build directory. Reinstall the sensor service to apply.
 - The launcher no longer takes an exited, unreaped process of the game's name for
   the running game, and when several processes carry the name it watches the one
   started first instead of whichever `/proc` listed first.

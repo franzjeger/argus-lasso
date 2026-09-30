@@ -118,6 +118,7 @@ The system sensor service is a separate optional installation. To remove it:
 ```bash
 sudo systemctl disable --now argus-sensors.service
 sudo rm -f /etc/systemd/system/argus-sensors.service /usr/local/libexec/argus-sensors
+sudo rm -rf /etc/systemd/system/argus-sensors.service.d
 sudo systemctl daemon-reload
 ```
 
