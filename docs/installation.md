@@ -127,4 +127,9 @@ This does not remove the distinct CPU control helpers or your recorded data.
 ```bash
 sudo rm -rf /usr/local/lib/argus-lasso
 sudo rm -f /usr/share/polkit-1/actions/io.github.franzjeger.argus-lasso.policy
+sudo rm -f /etc/polkit-1/rules.d/50-argus-lasso.rules
 ```
+
+The helpers' polkit actions ask for an administrator's password by default. The
+polkit rule installed with them lets the user who installed them run them without
+a password from an active local session; other local users are asked.

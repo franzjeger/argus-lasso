@@ -68,9 +68,10 @@ uninstall:
 	@echo "Uninstalled."
 	@if [ -e /usr/local/lib/argus-lasso ] || [ -e /usr/share/polkit-1/actions/io.github.franzjeger.argus-lasso.policy ]; then \
 		echo "The CPU control helpers are installed system-wide and still grant their"; \
-		echo "actions to local users. Remove them with:"; \
+		echo "actions. Remove them with:"; \
 		echo "  sudo rm -rf /usr/local/lib/argus-lasso"; \
 		echo "  sudo rm -f /usr/share/polkit-1/actions/io.github.franzjeger.argus-lasso.policy"; \
+		echo "  sudo rm -f /etc/polkit-1/rules.d/50-argus-lasso.rules"; \
 	fi
 
 enable:

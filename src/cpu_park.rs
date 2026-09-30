@@ -28,6 +28,13 @@ pub const HELPER_DIR: &str = match option_env!("ARGUS_HELPER_DIR") {
     None => "/usr/local/lib/argus-lasso",
 };
 
+/// The polkit rule that lets the installing user run the helpers without a
+/// password; see `polkit_rules`.
+pub const RULES_PATH: &str = match option_env!("ARGUS_POLKIT_RULES_PATH") {
+    Some(path) => path,
+    None => "/etc/polkit-1/rules.d/50-argus-lasso.rules",
+};
+
 pub const POLICY_PATH: &str = match option_env!("ARGUS_POLICY_PATH") {
     Some(path) => path,
     None => "/usr/share/polkit-1/actions/io.github.franzjeger.argus-lasso.policy",
@@ -40,7 +47,7 @@ pub const LEGACY_SUDOERS: &str = "/etc/sudoers.d/argus-lasso";
 
 /// Bumped whenever a helper script changes, so the app can tell an outdated
 /// install from a missing one. Substring-matched in the installed files.
-const HELPER_VERSION: &str = "argus-lasso-helper v6";
+const HELPER_VERSION: &str = "argus-lasso-helper v7";
 
 /// The three privileged operations, and the file each one lives in.
 const OP_PARK: &str = "cpu-park";
@@ -52,7 +59,7 @@ fn helper_path(op: &str) -> String {
 }
 
 const PARK_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v6 — CPU parking. Managed by argus-lasso; do not edit.
+# argus-lasso-helper v7 — CPU parking. Managed by argus-lasso; do not edit.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 case "${1-}" in
@@ -100,7 +107,7 @@ esac
 "#;
 
 const POWER_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v6 — CPU governor and energy preference.
+# argus-lasso-helper v7 — CPU governor and energy preference.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 # Write $2 to cpufreq/$1 on every online CPU. Fails, naming the CPUs and the
@@ -161,7 +168,7 @@ esac
 /// re-check and the renice call; Linux has no pidfd-based setpriority to
 /// close it entirely.
 const RENICE_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v6 — renice, restricted to the caller's own processes.
+# argus-lasso-helper v7 — renice, restricted to the caller's own processes.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 [[ "${1-}" =~ ^-?[0-9]+$ ]] || exit 2
@@ -201,11 +208,40 @@ done
 "#;
 
 /// Three separate actions so an administrator can tighten one without losing
-/// the others. All default to `allow_active=yes`: no prompt for whoever is
-/// logged in at the physical seat, which is any local user, not only the one
-/// who installed the helpers (the sudoers rule this replaced was per-user).
-/// The grant is per operation, and renice is confined to the caller's own
-/// processes by the helper itself.
+/// the others. Each asks for an administrator's password by default;
+/// `polkit_rules` lets the user who installed the helpers run them without
+/// one, from an active local session. (`allow_active=yes` let every local
+/// user do that.) Renice is confined to the caller's own processes by the
+/// helper itself.
+/// The polkit rule, with `@USER@` for the user who installs the helpers: that
+/// user, in an active local session, runs them without a password.
+fn polkit_rules() -> String {
+    format!(
+        r#"// Managed by argus-lasso ({HELPER_VERSION}); reinstalled with the helpers.
+// The user who installed Argus-Lasso's CPU control helpers runs them without
+// a password from an active local session. Anyone else is asked for an
+// administrator's password (the actions' default).
+polkit.addRule(function(action, subject) {{
+    if (action.id.indexOf("io.github.franzjeger.argus-lasso.") === 0 &&
+        subject.user === "@USER@" && subject.local && subject.active) {{
+        return polkit.Result.YES;
+    }}
+}});
+"#
+    )
+}
+
+/// Root-side shell writing the polkit rule for the user pkexec was called
+/// by (PKEXEC_UID, which pkexec sets and the caller cannot) from the
+/// verified template in "$t".
+fn rules_script() -> String {
+    String::from(
+        "user=$(id -nu \"${PKEXEC_UID:?not run through pkexec}\")\n\
+         case \"$user\" in ''|*[!a-z0-9_.-]*) echo \"unusable user name: $user\" >&2; exit 1;; esac\n\
+         sed \"s/@USER@/$user/\" \"$t/rules.in\" > \"$t/rules\"\n",
+    )
+}
+
 fn policy_xml() -> String {
     let action = |id: &str, desc: &str, msg: &str, path: String| {
         format!(
@@ -215,7 +251,7 @@ fn policy_xml() -> String {
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
-      <allow_active>yes</allow_active>
+      <allow_active>auth_admin_keep</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">{path}</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
@@ -796,6 +832,7 @@ fn helper_files() -> Vec<(&'static str, String)> {
         (OP_POWER, POWER_SCRIPT.to_string()),
         (OP_RENICE, RENICE_SCRIPT.to_string()),
         ("policy.xml", policy_xml()),
+        ("rules.in", polkit_rules()),
     ]
     .into_iter()
     .map(|(name, mut body)| {
@@ -818,15 +855,17 @@ fn root_install_command(files: &[(&str, String)]) -> String {
     // and keeps this command safe even if a packager ever bakes in a path
     // containing a space.
     format!(
-        "set -e\n{verify}\
+        "set -e\n{verify}{rules}\
          install -d -m 755 -o root -g root '{HELPER_DIR}'\n\
          install -m 755 -o root -g root \"$t/{OP_PARK}\" '{HELPER_DIR}/{OP_PARK}'\n\
          install -m 755 -o root -g root \"$t/{OP_POWER}\" '{HELPER_DIR}/{OP_POWER}'\n\
          install -m 755 -o root -g root \"$t/{OP_RENICE}\" '{HELPER_DIR}/{OP_RENICE}'\n\
          install -D -m 644 -o root -g root \"$t/policy.xml\" '{POLICY_PATH}'\n\
+         install -D -m 644 -o root -g root \"$t/rules\" '{RULES_PATH}'\n\
          rm -f '{LEGACY_SUDOERS}' '{LEGACY_HELPER}'\n\
          echo INSTALL_OK\n",
         verify = embed_and_verify_script(files),
+        rules = rules_script(),
     )
 }
 
@@ -1277,6 +1316,48 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     }
 
+    /// The rule names the user pkexec was called by, and only that user:
+    /// allow_active=yes let every local user run the helpers without a
+    /// password.
+    #[test]
+    fn the_polkit_rule_is_for_the_installing_user() {
+        let run = |uid: Option<String>| {
+            let script = format!(
+                "set -e\n{}{}cat \"$t/rules\"\n",
+                embed_and_verify_script(&helper_files()),
+                rules_script()
+            );
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script).env_remove("PKEXEC_UID");
+            if let Some(uid) = uid {
+                cmd.env("PKEXEC_UID", uid);
+            }
+            cmd.output().unwrap()
+        };
+        use std::os::unix::fs::MetadataExt;
+        let uid = fs::metadata("/proc/self").unwrap().uid().to_string();
+        let me = String::from_utf8(
+            Command::new("id")
+                .args(["-nu", &uid])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let out = run(Some(uid));
+        assert!(out.status.success(), "{out:?}");
+        let rules = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            rules.contains(&format!("subject.user === \"{}\"", me.trim())),
+            "{rules}"
+        );
+        assert!(!rules.contains("@USER@"));
+        assert!(policy_xml().contains("<allow_active>auth_admin_keep</allow_active>"));
+        assert!(!policy_xml().contains("<allow_active>yes</allow_active>"));
+
+        assert!(!run(None).status.success(), "not through pkexec: no rule");
+    }
+
     /// A file that does not match its digest stops the install.
     #[test]
     fn a_damaged_embedded_file_stops_the_install() {
@@ -1299,7 +1380,7 @@ mod tests {
     fn root_installs_only_the_verified_copies() {
         let cmd = root_install_command(&helper_files());
         let installs: Vec<_> = cmd.lines().filter(|l| l.starts_with("install ")).collect();
-        assert_eq!(installs.len(), 5, "{cmd}");
+        assert_eq!(installs.len(), 6, "{cmd}");
         for line in installs.iter().skip(1) {
             assert!(line.contains("\"$t/"), "installs from outside $t: {line}");
         }
