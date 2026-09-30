@@ -500,6 +500,19 @@ fn main() {
             .with_transparent(true)
             .with_visible(!args.minimized)
             .with_icon(window_icon),
+        // The tour renders into the X server in $DISPLAY — Xvfb under
+        // xvfb-run. winit prefers Wayland whenever $WAYLAND_DISPLAY is set,
+        // which put the tour window on the user's desktop instead, where a
+        // hidden window gets no frames and the tour waits forever.
+        event_loop_builder: args
+            .ui_tour
+            .is_some()
+            .then(|| -> eframe::EventLoopBuilderHook {
+                Box::new(|builder| {
+                    use winit::platform::x11::EventLoopBuilderExtX11;
+                    builder.with_x11();
+                })
+            }),
         ..Default::default()
     };
 
