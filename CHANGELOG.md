@@ -322,6 +322,11 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - `make uninstall` also removes the update backups, the rollback record and the
   autostart entry, and prints the commands to remove the system-wide CPU control
   helpers when they are installed; they still granted their actions afterwards.
+- Installing the CPU control helpers no longer has root read a staging directory
+  in the user's configuration: the files travel in the root command itself. A
+  process of the user could replace a staged file with a FIFO that hung root or a
+  device node; home directories with spaces or non-ASCII characters no longer stop
+  the install.
 
 ### Changed
 

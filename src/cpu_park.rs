@@ -755,93 +755,60 @@ pub fn is_pkexec_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Allowlist a path for unquoted-adjacent interpolation into a shell command
-/// that `pkexec` runs as root. Every caller still single-quotes the value on
-/// top of this — belt and suspenders, since either one alone has a history
-/// of missed edge cases in shell-command construction.
-fn validate_shell_safe_path(s: &str) -> Result<&str, String> {
-    if !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
-    {
-        Ok(s)
-    } else {
-        Err("Staging path contains unsafe characters.".into())
-    }
-}
+/// Ends each file embedded in the root command; no helper may contain it.
+const EMBED_END: &str = "ARGUS_LASSO_HELPER_FILE_END";
 
-/// Largest file root copies out of the staging directory. The real files are
-/// a few KiB; the cap only stops a swapped-in symlink to `/dev/zero` from
-/// filling root's `/tmp` before the digest check gets to reject it.
-const STAGED_FILE_MAX: usize = 64 * 1024;
+/// Printed by the root command when an embedded file does not match its
+/// digest. Matched in `install_outcome`.
+const EMBEDDED_FILES_DAMAGED: &str = "EMBEDDED_FILES_DAMAGED";
 
-/// Printed by the root command when a staged file no longer matches what this
-/// process wrote. Matched in `install_outcome`.
-const STAGED_FILES_CHANGED: &str = "STAGED_FILES_CHANGED";
-
-/// Root-side shell that copies each staged file out of the user-writable
-/// `dir` into a private `mktemp -d` directory and checks the copies against
-/// the SHA-256 digests in `files`. On success `$t` holds the verified copies,
-/// and only those may be installed.
+/// Root-side shell that writes each file into a private `mktemp -d`
+/// directory from a quoted here-document in the command itself, and checks
+/// the result against its SHA-256 digest. On success `$t` holds the files,
+/// and only those are installed.
 ///
-/// Copy first, then verify, then install from the copy: verifying in place
-/// and installing from `dir` would leave a swap window between the two.
-fn copy_and_verify_script(dir: &str, files: &[(&str, String)]) -> String {
+/// Root reads nothing the user can touch: the command is fixed once pkexec
+/// runs it. It used to copy the files out of a staging directory in the
+/// user's config, which any of the user's processes (a Wine game included)
+/// could replace while the polkit prompt was open, with a FIFO that hung
+/// root or a device whose open() has effects.
+fn embed_and_verify_script(files: &[(&str, String)]) -> String {
     let mut script = String::from("t=$(mktemp -d)\ntrap 'rm -rf \"$t\"' EXIT\n");
-    for (name, _) in files {
-        script += &format!("head -c {STAGED_FILE_MAX} -- '{dir}/{name}' > \"$t/{name}\"\n");
+    for (name, body) in files {
+        script += &format!("cat > \"$t/{name}\" <<'{EMBED_END}'\n{body}{EMBED_END}\n");
     }
     script += "if ! (cd \"$t\" && printf '%s\\n'";
-    for (name, digest) in files {
+    for (name, body) in files {
+        let digest = crate::updater::sha256_hex(body.as_bytes());
         script += &format!(" '{digest}  {name}'");
     }
     script += &format!(
-        " | sha256sum -c >/dev/null 2>&1); then\n    echo {STAGED_FILES_CHANGED} >&2\n    exit 1\nfi\n"
+        " | sha256sum -c >/dev/null 2>&1); then\n    echo {EMBEDDED_FILES_DAMAGED} >&2\n    exit 1\nfi\n"
     );
     script
 }
 
-/// Stage the helper scripts and the polkit policy in the user's own config
-/// directory, and build the root command that installs them.
-///
-/// The staging directory is private from other users only. Any process
-/// running as this user — a Wine game included — can rewrite it while the
-/// polkit prompt is open, and root would then install that file as a
-/// passwordless-root helper or policy. So root never installs what it finds
-/// there: it installs copies that match SHA-256 digests carried in its own
-/// command line, which pkexec keeps out of this user's reach.
-fn stage_install() -> Result<(String, std::path::PathBuf), String> {
-    let stage = crate::config::config_dir().join("helper-stage");
-    let _ = fs::remove_dir_all(&stage);
-    fs::create_dir_all(&stage).map_err(|e| format!("Failed to create staging dir: {e}"))?;
-
-    // `dir` is interpolated into a string that pkexec runs via `sh -c`, so it
-    // is as good as attacker input: it comes from $HOME (config_dir()), which
-    // isn't necessarily trustworthy just because we're running as our own
-    // uid. An allowlist (rather than blocking a few known-bad characters) and
-    // single-quoting every use below are both required — either alone has a
-    // history of missed edge cases in shell-command construction.
-    let dir = match stage.to_str() {
-        Some(s) => validate_shell_safe_path(s)?.to_string(),
-        None => return Err("Staging path is not valid UTF-8.".into()),
-    };
-
-    let policy = policy_xml();
-    let mut files = Vec::new();
-    for (name, body) in [
-        (OP_PARK, PARK_SCRIPT),
-        (OP_POWER, POWER_SCRIPT),
-        (OP_RENICE, RENICE_SCRIPT),
-        ("policy.xml", policy.as_str()),
-    ] {
-        fs::write(stage.join(name), body).map_err(|e| format!("Failed to stage {name}: {e}"))?;
-        files.push((name, crate::updater::sha256_hex(body.as_bytes())));
-    }
-    Ok((root_install_command(&dir, &files), stage))
+/// The helper scripts and the polkit policy, each ending in a newline as a
+/// here-document reproduces it.
+fn helper_files() -> Vec<(&'static str, String)> {
+    [
+        (OP_PARK, PARK_SCRIPT.to_string()),
+        (OP_POWER, POWER_SCRIPT.to_string()),
+        (OP_RENICE, RENICE_SCRIPT.to_string()),
+        ("policy.xml", policy_xml()),
+    ]
+    .into_iter()
+    .map(|(name, mut body)| {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        (name, body)
+    })
+    .collect()
 }
 
-/// The command pkexec runs as root to install the staged `files` from `dir`.
-fn root_install_command(dir: &str, files: &[(&str, String)]) -> String {
+/// The command pkexec runs as root to install `files`.
+fn root_install_command(files: &[(&str, String)]) -> String {
     // Removing the predecessor is part of the install, not a separate step:
     // leaving the old NOPASSWD sudoers rule in place would keep the very hole
     // this replaces open.
@@ -859,7 +826,7 @@ fn root_install_command(dir: &str, files: &[(&str, String)]) -> String {
          install -D -m 644 -o root -g root \"$t/policy.xml\" '{POLICY_PATH}'\n\
          rm -f '{LEGACY_SUDOERS}' '{LEGACY_HELPER}'\n\
          echo INSTALL_OK\n",
-        verify = copy_and_verify_script(dir, files),
+        verify = embed_and_verify_script(files),
     )
 }
 
@@ -872,11 +839,10 @@ fn install_outcome(o: &std::process::Output) -> (bool, String) {
             true,
             "Helpers and polkit policy installed; the old sudoers rule was removed.".into(),
         )
-    } else if combined.contains(STAGED_FILES_CHANGED) {
+    } else if combined.contains(EMBEDDED_FILES_DAMAGED) {
         (
             false,
-            "Install aborted: the staged helper files were changed by another \
-             program while waiting for authentication. Nothing was installed."
+            "Install aborted: the helper files did not arrive intact. Nothing was installed."
                 .into(),
         )
     } else {
@@ -906,14 +872,12 @@ pub fn install_helper_via_pkexec() -> (bool, String) {
                 .into(),
         );
     }
-    let (cmd, stage) = match stage_install() {
-        Ok(v) => v,
-        Err(e) => return (false, e),
-    };
+    // Left by versions that staged the files in the user's config.
+    let _ = fs::remove_dir_all(crate::config::config_dir().join("helper-stage"));
+    let cmd = root_install_command(&helper_files());
     let result = Command::new("pkexec")
         .args(["/bin/sh", "-c", &cmd])
         .output();
-    let _ = fs::remove_dir_all(&stage);
     match result {
         Ok(o) if matches!(o.status.code(), Some(126) | Some(127)) => {
             (false, "Authentication cancelled or failed.".into())
@@ -1290,95 +1254,54 @@ mod tests {
         }
     }
 
-    /// stage_install() interpolates this value into a string that pkexec
-    /// runs as root via `sh -c`. It comes from $HOME (config_dir()), which
-    /// is not inherently trustworthy — each of these must be rejected, not
-    /// just the literal single-quote the old blocklist-only check caught.
+    /// Root writes the helpers from its own command: exactly the bytes the
+    /// app carries, whatever is in the user's directories.
     #[test]
-    fn staging_path_validation_rejects_shell_metacharacters() {
-        for bad in [
-            "",
-            "/home/user;rm -rf /",
-            "/home/user$(whoami)",
-            "/home/user`whoami`",
-            "/home/user|cat /etc/shadow",
-            "/home/user&background",
-            "/home/user name/with space",
-            "/home/user'quote",
-            "/home/user\"quote",
-            "/home/user\nnewline",
-        ] {
+    fn the_root_command_carries_the_helpers_themselves() {
+        let files = helper_files();
+        for (name, body) in &files {
             assert!(
-                validate_shell_safe_path(bad).is_err(),
-                "expected rejection for {bad:?}"
+                !body.contains(EMBED_END),
+                "{name} contains the here-document end"
             );
         }
-    }
-
-    fn staged_fixture(
-        name: &str,
-        bodies: &[(&'static str, &str)],
-    ) -> (std::path::PathBuf, Vec<(&'static str, String)>) {
-        let dir = std::env::temp_dir().join(format!("argus-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let files = bodies
-            .iter()
-            .map(|(file, body)| {
-                fs::write(dir.join(file), body).unwrap();
-                (*file, crate::updater::sha256_hex(body.as_bytes()))
-            })
-            .collect();
-        (dir, files)
-    }
-
-    /// The staging directory is writable by every process this user runs,
-    /// and root reads it only after the polkit prompt is answered. A file
-    /// swapped in during that window must be refused, not installed.
-    #[test]
-    fn root_refuses_staged_files_that_changed_after_staging() {
-        let (dir, files) = staged_fixture("stage-verify", &[("a", "first\n"), ("b", "second\n")]);
-        let run = || {
-            let script = format!(
-                "set -e\n{}cat \"$t/a\" \"$t/b\"\n",
-                copy_and_verify_script(dir.to_str().unwrap(), &files)
-            );
-            Command::new("sh").arg("-c").arg(script).output().unwrap()
-        };
-
-        let intact = run();
-        assert!(intact.status.success(), "{intact:?}");
-        assert_eq!(String::from_utf8_lossy(&intact.stdout), "first\nsecond\n");
-
-        fs::write(dir.join("b"), "swapped\n").unwrap();
-        let swapped = run();
-        assert!(!swapped.status.success());
-        assert!(String::from_utf8_lossy(&swapped.stderr).contains(STAGED_FILES_CHANGED));
-        assert!(
-            swapped.stdout.is_empty(),
-            "nothing may be used after a mismatch"
+        let names: Vec<&str> = files.iter().map(|(name, _)| *name).collect();
+        let script = format!(
+            "set -e\n{}cd \"$t\" && cat {}\n",
+            embed_and_verify_script(&files),
+            names.join(" ")
         );
+        let out = Command::new("sh").arg("-c").arg(script).output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let expected: String = files.iter().map(|(_, body)| body.as_str()).collect();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    }
 
-        fs::remove_dir_all(&dir).ok();
+    /// A file that does not match its digest stops the install.
+    #[test]
+    fn a_damaged_embedded_file_stops_the_install() {
+        let files = vec![("a", "first\n".to_string())];
+        let mut script = embed_and_verify_script(&files);
+        script = script.replacen("first", "other", 1);
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("set -e\n{script}echo INSTALLED\n"))
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains(EMBEDDED_FILES_DAMAGED));
+        assert!(out.stdout.is_empty());
     }
 
     /// Verifying copies is pointless if root then installs from the staging
     /// directory itself: every install must read the verified copy in "$t".
     #[test]
     fn root_installs_only_the_verified_copies() {
-        let dir = "/home/user/.config/argus-lasso/helper-stage";
-        let files: Vec<_> = [OP_PARK, OP_POWER, OP_RENICE, "policy.xml"]
-            .into_iter()
-            .map(|f| (f, "0".repeat(64)))
-            .collect();
-        let cmd = root_install_command(dir, &files);
+        let cmd = root_install_command(&helper_files());
         let installs: Vec<_> = cmd.lines().filter(|l| l.starts_with("install ")).collect();
         assert_eq!(installs.len(), 5, "{cmd}");
-        for line in installs {
-            assert!(
-                !line.contains(dir),
-                "installs straight from staging: {line}"
-            );
+        for line in installs.iter().skip(1) {
+            assert!(line.contains("\"$t/"), "installs from outside $t: {line}");
         }
         let verify = cmd.find("sha256sum -c").expect("no digest check");
         assert!(
@@ -1390,11 +1313,5 @@ mod tests {
             .output()
             .unwrap();
         assert!(syntax.status.success(), "not valid sh: {syntax:?}\n{cmd}");
-    }
-
-    #[test]
-    fn staging_path_validation_accepts_normal_paths() {
-        let good = "/home/user/.config/argus-lasso/helper-stage";
-        assert_eq!(validate_shell_safe_path(good), Ok(good));
     }
 }
