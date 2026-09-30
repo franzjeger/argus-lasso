@@ -126,9 +126,12 @@ jobs:
       - name: Publish the CHANGELOG section for this tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through the environment, not spliced into the script: a
+          # workflow_dispatch tag is free text and would run as shell.
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="$RELEASE_TAG"
           version="${tag#v}"
 
           # Everything between this version's heading and the next one.
