@@ -3,15 +3,20 @@ use std::io::{self, Read, Write};
 
 /// Bump this on any field addition/removal/reorder in a type sent over the
 /// wire (IpcMessage and anything it contains, e.g. OverlayConfig,
-/// TelemetryFrame). bincode's struct decoding is purely positional — unlike
-/// this crate's TOML config-file path, `#[serde(default)]` on a wire struct
-/// cannot fill in a missing trailing field, because bincode has no per-field
-/// wire tag to detect "missing" in the first place; the reader's own struct
-/// definition dictates exactly how many bytes it consumes regardless of what
-/// the writer actually sent. Some structs here carry `#[serde(default)]`
-/// only because they're ALSO deserialized from user TOML on disk, where it
-/// does work as intended — don't mistake that for wire-format safety.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// TelemetryFrame), and on any change of encoding; the socket name follows
+/// it. The payload is postcard, whose struct decoding is purely positional —
+/// unlike this crate's TOML config-file path, `#[serde(default)]` on a wire
+/// struct cannot fill in a missing trailing field, because postcard has no
+/// per-field wire tag to detect "missing" in the first place; the reader's
+/// own struct definition dictates what it consumes regardless of what the
+/// writer actually sent. Some structs here carry `#[serde(default)]` only
+/// because they're ALSO deserialized from user TOML on disk, where it does
+/// work as intended — don't mistake that for wire-format safety.
+/// `wire_format_is_pinned_to_the_protocol_version` fails when the encoding
+/// of the wire types changes, as a reminder.
+///
+/// 6: postcard instead of bincode 1, which is no longer maintained.
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_MESSAGE_SIZE: usize = 256 * 1024;
 pub const BUILD_ID: &str = env!("ARGUS_BUILD_ID");
 
@@ -30,7 +35,13 @@ pub fn socket_path() -> std::path::PathBuf {
                 .unwrap_or("unknown");
             std::path::PathBuf::from(format!("/run/user/{uid}"))
         });
-    runtime.join("argus-lasso/overlay-v5.sock")
+    runtime.join("argus-lasso").join(socket_file())
+}
+
+/// The socket's file name, versioned so that a layer and a daemon speaking
+/// different protocols never meet on one socket.
+fn socket_file() -> String {
+    format!("overlay-v{PROTOCOL_VERSION}.sock")
 }
 
 /// Steam pressure-vessel does not expose arbitrary host XDG_RUNTIME_DIR
@@ -41,7 +52,9 @@ pub fn socket_paths() -> Vec<std::path::PathBuf> {
     if std::env::var_os("ARGUS_LASSO_SOCKET").is_none() {
         if let Some(home) = std::env::var_os("HOME") {
             paths.push(
-                std::path::PathBuf::from(home).join(".local/share/argus-lasso/ipc/overlay-v5.sock"),
+                std::path::PathBuf::from(home)
+                    .join(".local/share/argus-lasso/ipc")
+                    .join(socket_file()),
             );
         }
     }
@@ -62,7 +75,7 @@ pub fn connect() -> io::Result<(std::os::unix::net::UnixStream, std::path::PathB
     ))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 // IPC messages are transient, off the render thread; keep the wire model inline.
 #[allow(clippy::large_enum_variant)]
 pub enum IpcMessage {
@@ -76,7 +89,7 @@ pub enum IpcMessage {
 }
 
 pub fn encode(msg: &IpcMessage) -> io::Result<Vec<u8>> {
-    let data = bincode::serialize(msg).map_err(io::Error::other)?;
+    let data = postcard::to_allocvec(msg).map_err(io::Error::other)?;
     if data.len() > MAX_MESSAGE_SIZE {
         return Err(io::Error::other("IPC packet too large"));
     }
@@ -91,7 +104,6 @@ pub fn write_message(writer: &mut impl Write, msg: &IpcMessage) -> io::Result<()
     writer.write_all(&encode(msg)?)
 }
 pub fn read_message(reader: &mut impl Read) -> io::Result<IpcMessage> {
-    use bincode::Options;
     let mut header = [0; 12];
     reader.read_exact(&mut header)?;
     if &header[..4] != b"ARGL"
@@ -111,12 +123,22 @@ pub fn read_message(reader: &mut impl Read) -> io::Result<IpcMessage> {
     }
     let mut data = vec![0; len];
     reader.read_exact(&mut data)?;
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(MAX_MESSAGE_SIZE as u64)
-        .reject_trailing_bytes()
-        .deserialize(&data)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    decode(&data)
+}
+
+/// The payload of one packet: exactly one message, nothing after it. The
+/// packet's length is capped before it is read, and decoding a slice cannot
+/// allocate beyond what the slice holds.
+fn decode(data: &[u8]) -> io::Result<IpcMessage> {
+    let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidData, e);
+    let (msg, rest) = postcard::take_from_bytes(data).map_err(|e| invalid(e.to_string()))?;
+    if !rest.is_empty() {
+        return Err(invalid(format!(
+            "{} trailing bytes in IPC packet",
+            rest.len()
+        )));
+    }
+    Ok(msg)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -396,6 +418,89 @@ mod tests {
         bytes[4] = 99;
         assert!(read_message(&mut bytes.as_slice()).is_err());
     }
+    fn samples() -> [IpcMessage; 3] {
+        let mut config = OverlayConfig::default();
+        config.value_colors.insert(OverlayMetric::Fps, [1, 2, 3]);
+        config.hidden_cpu_ids = vec![3, 17];
+        [
+            IpcMessage::Hello {
+                build: "abc-123".into(),
+                protocol: PROTOCOL_VERSION,
+                host_pid: 4242,
+            },
+            IpcMessage::Telemetry(TelemetryFrame {
+                sample_unix_ms: u64::MAX,
+                cpu_name: "Ryzen 9 9950X3D".into(),
+                cpu_power_w: Some(142.5),
+                cpus: vec![LogicalCpu {
+                    id: 31,
+                    usage: Some(100),
+                    ..Default::default()
+                }],
+                game: Some(GameTelemetry::default()),
+                probalance_pids: vec![1, u32::MAX],
+                ..Default::default()
+            }),
+            IpcMessage::Config(config),
+        ]
+    }
+
+    #[test]
+    fn every_message_survives_the_wire() {
+        for msg in samples() {
+            let bytes = encode(&msg).unwrap();
+            assert_eq!(read_message(&mut bytes.as_slice()).unwrap(), msg);
+        }
+    }
+
+    /// One packet holds exactly one message.
+    #[test]
+    fn trailing_or_missing_bytes_are_refused() {
+        let payload = postcard::to_allocvec(&samples()[1]).unwrap();
+        let packet = |data: &[u8]| {
+            let mut bytes = b"ARGL".to_vec();
+            bytes.extend(PROTOCOL_VERSION.to_le_bytes());
+            bytes.extend((data.len() as u32).to_le_bytes());
+            bytes.extend(data);
+            bytes
+        };
+        let mut longer = payload.clone();
+        longer.push(0);
+        assert!(read_message(&mut packet(&longer).as_slice()).is_err());
+        let shorter = &payload[..payload.len() - 1];
+        assert!(read_message(&mut packet(shorter).as_slice()).is_err());
+        assert!(read_message(&mut packet(&payload).as_slice()).is_ok());
+    }
+
+    /// The wire types' encoding, pinned to the protocol version: a layer
+    /// and a daemon decode each other positionally, so a field added,
+    /// removed or reordered without a PROTOCOL_VERSION bump would make one
+    /// misread the other. When this fails, bump the version and the pin.
+    #[test]
+    fn wire_format_is_pinned_to_the_protocol_version() {
+        // FNV-1a: stable across Rust releases, unlike std's hasher.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let defaults = [
+            IpcMessage::Hello {
+                build: String::new(),
+                protocol: 0,
+                host_pid: 0,
+            },
+            IpcMessage::Telemetry(TelemetryFrame::default()),
+            IpcMessage::Config(OverlayConfig::default()),
+        ];
+        for msg in defaults.iter().chain(&samples()) {
+            for byte in postcard::to_allocvec(msg).unwrap() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        assert_eq!(
+            (PROTOCOL_VERSION, hash),
+            (6, 0x2864_b8aa_e3e2_0389),
+            "the wire encoding changed"
+        );
+    }
+
     #[test]
     fn reject_unbounded_packet() {
         let mut bytes = b"ARGL".to_vec();

@@ -107,11 +107,14 @@ cat ~/.local/share/vulkan/implicit_layer.d/ArgusOverlay.json
 rg libargus_layer /proc/GAME_PID/maps
 ```
 
-Protocol **5** has a checked header and length limit. Startup logs identify builds,
-protocol and connection status. The daemon replays current configuration when a
-client connects. IPC uses the user's private runtime socket, plus a private
-`~/.local/share/argus-lasso/ipc/overlay-v5.sock` fallback visible inside the tested
-Steam runtime. `ARGUS_LASSO_SOCKET` supplies an exclusive diagnostic override.
+Protocol **6** has a checked header and length limit, and a [postcard](https://docs.rs/postcard)
+payload (protocol 5 used bincode, which is no longer maintained). Startup logs
+identify builds, protocol and connection status. The daemon replays current
+configuration when a client connects. IPC uses the user's private runtime socket,
+plus a private `~/.local/share/argus-lasso/ipc/overlay-v6.sock` fallback visible
+inside the tested Steam runtime. The socket names carry the protocol version, so a
+game still running a layer from before an update shows "Telemetry disconnected"
+until it is restarted, rather than misreading messages. `ARGUS_LASSO_SOCKET` supplies an exclusive diagnostic override.
 Install a matching pair and restart a game to load the newly installed library.
 Do not infer the mapped library from the most recently copied filename.
 
