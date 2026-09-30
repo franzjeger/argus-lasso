@@ -16,8 +16,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Actions are pinned by commit SHA with the version in a comment, which
+    # Dependabot keeps up to date.
     ignore:
-      # ci.yml pins this action's ref to the minimum supported Rust
-      # (rust-version in Cargo.toml); it is a toolchain, not an action
-      # version, and only moves when the MSRV does.
+      # Pinned to a commit on its master branch: it publishes no versions,
+      # so there is nothing for Dependabot to compare. Updated by hand.
       - dependency-name: dtolnay/rust-toolchain

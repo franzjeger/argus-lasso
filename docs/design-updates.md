@@ -83,6 +83,10 @@ be enough to get a release signed. This protects against leaked tokens and
 collaborator access; it does not protect against someone who has taken over the
 maintainer's own account, which only offline signing would.
 
+The actions the workflows use are pinned by commit SHA (a tag can be moved to
+other code; CI fails on an unpinned one), and the signing job builds without a
+restored cache, which would be build output from another workflow run.
+
 The key was replaced on 2026-09-30 (key ID `D53DAD0590FF1744`, previously
 `4CF0D660D5D39564`), when the signing values moved to the environment: the old
 secret key existed only as a repository secret, which GitHub never hands back,

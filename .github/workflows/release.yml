@@ -37,7 +37,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: aarch64
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install system dependencies
         run: |
@@ -54,9 +54,12 @@ jobs:
             libxrandr-dev \
             libwayland-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      # No build cache here: this job holds the signing key, and a restored
+      # cache is build output that another workflow run produced.
 
       - name: cargo build (release)
         run: cargo build --release --workspace --locked
@@ -107,7 +110,7 @@ jobs:
           minisign -Vm "${pkg}.tar.gz" -p dist/argus-lasso.pub
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
@@ -125,7 +128,7 @@ jobs:
     steps:
       # The previous version of this job called generate-notes, which needs no
       # checkout. Reading the changelog does.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Publish the CHANGELOG section for this tag
         env:
