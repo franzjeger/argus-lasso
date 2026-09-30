@@ -333,6 +333,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   the rows it has, once the game has exited. The list keeps whole sessions instead
   of the 30 newest files, so a session with many swapchains no longer hides every
   earlier one, and swapchains that presented at most once are not listed.
+- The HUD appears on devices that list a compute or transfer queue family before
+  the graphics one; it used the first family requested and stayed off, with
+  nothing logged.
 
 ### Changed
 

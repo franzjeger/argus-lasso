@@ -690,12 +690,40 @@ unsafe fn record_device(
         .write_or_recover()
         .insert(device, (physical_device, ash_dev));
 
-    // Record the first queue family requested
+    // The HUD records its commands for a graphics queue: the first family
+    // requested that has graphics. The first family requested at all left
+    // the HUD off, with nothing logged, for a device listing a compute or
+    // transfer family first.
     let ci = &*p_create_info;
     if ci.queue_create_info_count > 0 && !ci.p_queue_create_infos.is_null() {
+        let requested = std::slice::from_raw_parts(
+            ci.p_queue_create_infos,
+            ci.queue_create_info_count as usize,
+        );
+        let properties = PHYS_TO_INST
+            .read_or_recover()
+            .get(&physical_device)
+            .and_then(|instance| {
+                ASH_INSTANCES
+                    .read_or_recover()
+                    .get(instance)
+                    .map(|inst| inst.get_physical_device_queue_family_properties(physical_device))
+            });
+        let graphics = |family: u32| {
+            properties.as_ref().is_none_or(|props| {
+                props
+                    .get(family as usize)
+                    .is_some_and(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            })
+        };
+        let family = requested
+            .iter()
+            .map(|info| info.queue_family_index)
+            .find(|&family| graphics(family))
+            .unwrap_or(requested[0].queue_family_index);
         DEVICE_QUEUE_FAMILY
             .write_or_recover()
-            .insert(device, (*ci.p_queue_create_infos).queue_family_index);
+            .insert(device, family);
     }
 }
 
