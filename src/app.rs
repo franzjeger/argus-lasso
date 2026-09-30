@@ -428,6 +428,12 @@ impl eframe::App for ArgusLassoApp {
         [0.0; 4]
     }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.tour.is_some() {
+            crate::ui_tour::without_pointer(raw_input);
+        }
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // Resume any process awaiting Undo before the GUI disappears.
         self.pending_kill = None;

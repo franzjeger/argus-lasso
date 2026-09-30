@@ -8,9 +8,9 @@ A Linux process manager and gaming toolkit, written in Rust with egui. Manage CP
 assignments and process priorities, inspect hardware sensors, customize a Vulkan
 HUD, and record game present intervals for performance comparisons.
 
-![Argus-Lasso Processes page — CPU as share of total capacity](assets/screenshots/2026-09-28/processes.png)
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/2026-09-30/dark/processes.png"><img alt="Argus-Lasso Processes page — CPU as share of total capacity" src="assets/screenshots/2026-09-30/light/processes.png"></picture>
 
-**Main-page screenshots: September 28, 2026.** [Browse every main menu and settings section](docs/screenshots.md).
+**Screenshots: September 30, 2026**, in the theme matching your GitHub appearance. [Browse every main menu and settings section](docs/screenshots.md).
 
 **This README describes the current source tree.** The latest published release is
 [v1.4.0](https://github.com/franzjeger/argus-lasso/releases/tag/v1.4.0)
@@ -128,19 +128,20 @@ The GPU/driver test matrix remains limited. [Tested, implemented and pending](do
 
 ## Current app screenshots
 
-Main pages captured from source commit `8ff0f9b` on 2026-09-28 using the
-read-only X11/Xvfb preview. The native customization image is dated 2026-09-13.
-Click an image to view it at full size.
-The [complete gallery](docs/screenshots.md) includes all main pages and the Gaming
-and Settings subsections.
+Captured on 2026-09-30 from the 1.4.0 source with the read-only X11/Xvfb tour,
+in Breeze Dark and Breeze Light; GitHub shows the set that matches your
+appearance. The overlay customization window is the real settings window from
+its isolated preview. The [complete gallery](docs/screenshots.md) includes all
+main pages and the Gaming and Settings subsections.
 
-| ProBalance: system-load activation | Gaming: CPU & performance |
-|---|---|
-| ![ProBalance](assets/screenshots/2026-09-28/probalance.png) | ![Gaming](assets/screenshots/2026-09-28/gaming-mode.png) |
-| **Overlay customization** | **Game recording** |
-| ![Overlay settings](assets/screenshots/2026-09-13/overlay-settings.png) | ![Recording](assets/screenshots/2026-09-28/gamingrecording.png) |
-| **Hardware sensors** | **Appearance settings** |
-| ![Sensors](assets/screenshots/2026-09-28/hw-monitor.png) | ![Settings](assets/screenshots/2026-09-28/settings.png) |
+<table>
+<tr><th width="50%">ProBalance: system-load activation</th><th width="50%">Gaming: CPU &amp; performance</th></tr>
+<tr><td><picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/2026-09-30/dark/probalance.png"><img alt="ProBalance" src="assets/screenshots/2026-09-30/light/probalance.png"></picture></td><td><picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/2026-09-30/dark/gaming-mode.png"><img alt="Gaming" src="assets/screenshots/2026-09-30/light/gaming-mode.png"></picture></td></tr>
+<tr><th width="50%">Overlay customization</th><th width="50%">Game recording</th></tr>
+<tr><td><picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/2026-09-30/dark/overlay-settings.png"><img alt="Overlay settings" src="assets/screenshots/2026-09-30/light/overlay-settings.png"></picture></td><td><picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/2026-09-30/dark/gamingrecording.png"><img alt="Recording" src="assets/screenshots/2026-09-30/light/gamingrecording.png"></picture></td></tr>
+<tr><th width="50%">Hardware sensors</th><th width="50%">Process rules</th></tr>
+<tr><td><picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/2026-09-30/dark/hw-monitor.png"><img alt="Sensors" src="assets/screenshots/2026-09-30/light/hw-monitor.png"></picture></td><td><picture><source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/2026-09-30/dark/rules.png"><img alt="Process rules" src="assets/screenshots/2026-09-30/light/rules.png"></picture></td></tr>
+</table>
 
 CPU usage is shown consistently as **0–100% of available capacity**. On 32 online
 logical CPUs, one fully busy CPU contributes 3.125% to the total. ProBalance's

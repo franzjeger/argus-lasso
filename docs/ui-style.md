@@ -25,6 +25,8 @@ and behave consistently across pages and detached windows.
   inspect narrow layouts after increasing fonts or button weights.
 
 Run the read-only UI tour for main-page screenshots. Detached windows need their
-own inspection. `overlay-settings-preview --light --embedded` renders the real
-overlay controls in a capturable light-theme fallback window; it is not a native
-window-decoration or Wayland-compositing test.
+own inspection. `overlay-settings-preview --theme <NAME>` renders the real
+overlay controls in any theme (`BreezeLight`, for example). With `--embedded`
+the window is drawn inside the preview and captured to `diagnostics/`; with
+`--hold` it stays open 12 s as a native window for an external capture. Neither
+is a window-decoration or Wayland-compositing test.

@@ -197,6 +197,12 @@ struct Args {
     #[arg(long, value_name = "DIR", hide = true)]
     ui_tour: Option<std::path::PathBuf>,
 
+    /// Theme for the --ui-tour captures, by its name in the configuration.
+    /// Without it the tour uses the configured theme.
+    #[arg(long, value_name = "THEME", hide = true, requires = "ui_tour",
+          value_parser = clap::builder::PossibleValuesParser::new(gui::theme::AppTheme::NAMES))]
+    tour_theme: Option<String>,
+
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -449,7 +455,10 @@ fn main() {
     // Load config
     // The tour renders a throwaway session: it must not write a config,
     // which migrating an old one would.
-    let (cfg, load_error) = config::load(args.ui_tour.is_none());
+    let (mut cfg, load_error) = config::load(args.ui_tour.is_none());
+    if args.ui_tour.is_some() {
+        ui_tour::prepare_config(&mut cfg, args.tour_theme.as_deref());
+    }
     // Set the unreadable file aside before anything can save over it — but
     // never from the read-only tour, which must not write configuration.
     let load_notice = match load_error {

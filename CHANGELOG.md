@@ -10,6 +10,28 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ## [Unreleased]
 
+### Added
+
+- `--tour-theme <THEME>` picks the theme of the `--ui-tour` captures (for example
+  `BreezeDark` or `BreezeLight`), so every theme's screenshots come from one
+  configuration without changing it. The overlay settings preview takes the same
+  `--theme <THEME>` in place of `--light`.
+
+### Changed
+
+- The screenshots in the README and the gallery are retaken in Breeze Dark and
+  Breeze Light at full opacity, and GitHub shows the set that matches the
+  reader's appearance. The superseded screenshot sets are removed, which makes
+  each release archive about 18 MB smaller.
+
+### Fixed
+
+- `--ui-tour` captures the window opaque. It used the window opacity of whoever
+  ran it, and at 80 % every screenshot was drawn over black: dark themes came out
+  a muddy brown-grey and light themes grey.
+- `--ui-tour` ignores the pointer. Under Xvfb it rests mid-screen, and the capture
+  of whichever screen had a widget there showed that widget's tooltip.
+
 ## [1.4.0] — 2026-09-30
 
 A Vulkan HUD for games, frame-time recording with A/B comparison, and signed
