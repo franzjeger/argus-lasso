@@ -118,6 +118,23 @@ until it is restarted, rather than misreading messages. `ARGUS_LASSO_SOCKET` sup
 Install a matching pair and restart a game to load the newly installed library.
 Do not infer the mapped library from the most recently copied filename.
 
+## Testing a layer from the source tree
+
+To load the layer built from the tree in one application, without installing it:
+
+```bash
+eval "$(scripts/dev-layer.sh)"   # --debug for a debug build
+vkcube
+```
+
+The script builds `argus-layer` and writes a manifest for `VK_LAYER_ARGUS_OVERLAY_DEV`
+pointing at the library in the directory Cargo builds into (`cargo metadata`, so
+`CARGO_TARGET_DIR` is honoured) rather than a guessed `./target`, which can hold an
+old build. It disables the installed layer for that environment, so only the
+tree's layer loads; its startup line (`[Argus-Layer] build=… protocol=…`) shows
+which build that is. The daemon it talks to is the running app, so test against an
+app from the same tree.
+
 ## Historical regression causes
 
 The original installed manifest selected an older library in a different

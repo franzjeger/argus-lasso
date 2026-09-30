@@ -12,6 +12,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Added
 
+- `scripts/dev-layer.sh` builds the Vulkan layer and prints the environment that
+  loads it from Cargo's actual target directory, for testing a layer from the tree
+  without installing it.
 - Recordings can be deleted from Gaming → Recording ("Delete…", then confirm),
   which removes the summary, CSV and metadata; the list shows how much space the
   recordings take. Nothing deleted them before, and CSVs of up to ~60 MB piled up.
