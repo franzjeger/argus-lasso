@@ -786,11 +786,7 @@ impl RuleEditDialog {
         let mut close_as: Option<bool> = None;
 
         {
-            let title_str = if self.rule.name.is_empty() {
-                "New rule".to_string()
-            } else {
-                format!("Edit Rule — {}", self.rule.name)
-            };
+            let title_str = editor_title(self.existing, &self.rule.name);
             let rule = &mut self.rule;
             let affinity_enabled = &mut self.affinity_enabled;
             let nice_enabled = &mut self.nice_enabled;
@@ -1020,6 +1016,16 @@ impl RuleEditDialog {
             }
         }
         None
+    }
+}
+
+/// The rule editor's window title: a rule from a template is new, even
+/// though it arrives with a name.
+fn editor_title(existing: bool, name: &str) -> String {
+    match (existing, name) {
+        (true, name) => format!("Edit rule — {name}"),
+        (false, "") => "New rule".into(),
+        (false, name) => format!("New rule — {name}"),
     }
 }
 
@@ -1726,7 +1732,16 @@ impl LutrisGamePickerDialog {
 
 #[cfg(test)]
 mod tests {
-    use super::AffinityDialog;
+    use super::{editor_title, AffinityDialog};
+
+    /// A rule from a template has a name but is not saved yet; its editor
+    /// was titled "Edit Rule".
+    #[test]
+    fn the_editor_says_whether_the_rule_is_new() {
+        assert_eq!(editor_title(false, ""), "New rule");
+        assert_eq!(editor_title(false, "Firefox"), "New rule — Firefox");
+        assert_eq!(editor_title(true, "Firefox"), "Edit rule — Firefox");
+    }
 
     /// A process's affinity dialog and Settings' default one used to share
     /// a window, so clicks meant for one reached the other.

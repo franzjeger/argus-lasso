@@ -9,6 +9,17 @@ use crate::gui::dialogs::{RuleEditDialog, RulePresetsDialog};
 use crate::gui::theme::{self, tokens};
 use crate::rules::{Rule, RuleEngine};
 
+/// What to open in the rule editor once the open one closes.
+enum NextEditor {
+    /// A new rule from this template.
+    New(Rule),
+    /// The saved rule with this ID, as it is when its turn comes.
+    Edit(String),
+}
+
+/// How the status line says a request waits for the open editor.
+const WAITS_FOR_EDITOR: &str = "opens when you save or cancel the rule you are editing.";
+
 /// Result from a background file-dialog thread.
 enum FileDialogResult {
     /// Export finished — carries a status string.
@@ -37,6 +48,9 @@ pub struct RulesTab {
     confirm_delete_profile: bool,
     /// Bring the open rule editor to the front on the next frame.
     focus_editor: bool,
+    /// Asked for while the editor was open; opened when it closes. The
+    /// latest request wins.
+    next_editor: Option<NextEditor>,
 }
 
 impl RulesTab {
@@ -56,6 +70,7 @@ impl RulesTab {
             pending_profile: None,
             confirm_delete_profile: false,
             focus_editor: false,
+            next_editor: None,
         }
     }
 
@@ -63,15 +78,48 @@ impl RulesTab {
         self.open_editor(template.unwrap_or_else(Rule::new_empty), false);
     }
 
-    /// Open the rule editor, unless it is open already: replacing it would
-    /// throw away unsaved edits, so bring that one to the front instead.
+    /// Open the rule editor. If it is open already, replacing it would throw
+    /// away unsaved edits and dropping the request would make the user pick
+    /// the template again, so the open one comes to the front and this one
+    /// opens when it closes.
     fn open_editor(&mut self, rule: Rule, existing: bool) {
-        if self.edit_dialog.is_some() {
-            self.focus_editor = true;
-            self.status = "Save or cancel the rule you are editing first.".into();
+        if self.edit_dialog.is_none() {
+            self.edit_dialog = Some(RuleEditDialog::new(rule, existing));
             return;
         }
-        self.edit_dialog = Some(RuleEditDialog::new(rule, existing));
+        self.focus_editor = true;
+        self.status = match rule.name.as_str() {
+            "" => format!("The new rule {WAITS_FOR_EDITOR}"),
+            name => format!("'{name}' {WAITS_FOR_EDITOR}"),
+        };
+        self.next_editor = Some(if existing {
+            NextEditor::Edit(rule.rule_id)
+        } else {
+            NextEditor::New(rule)
+        });
+    }
+
+    /// Open what was asked for while the editor was open, now that it is
+    /// closed. A saved rule is taken as it is now, and not at all if it was
+    /// deleted or replaced by a profile in the meantime.
+    fn open_next_editor(&mut self, rule_engine: &Arc<Mutex<RuleEngine>>) {
+        if self.edit_dialog.is_some() {
+            return;
+        }
+        let next = match self.next_editor.take() {
+            None => return,
+            Some(NextEditor::New(rule)) => Some((rule, false)),
+            Some(NextEditor::Edit(id)) => rule_engine.lock().ok().and_then(|re| {
+                let rule = re.get_rules().iter().find(|r| r.rule_id == id)?;
+                Some((rule.clone(), true))
+            }),
+        };
+        if self.status.ends_with(WAITS_FOR_EDITOR) {
+            self.status.clear();
+        }
+        if let Some((rule, existing)) = next {
+            self.edit_dialog = Some(RuleEditDialog::new(rule, existing));
+        }
     }
 
     /// Close the editor if it is editing a saved rule that `gone` says no
@@ -607,6 +655,7 @@ impl RulesTab {
                 }
             }
         }
+        self.open_next_editor(rule_engine);
     }
 
     /// Slim toolbar: primary action, templates, live pattern test, profile
@@ -984,7 +1033,55 @@ mod tests {
         tab.open_add_dialog(Some(Rule::from_config(&rule("other"))));
         assert_eq!(tab.edit_dialog.as_ref().unwrap().rule.name, "draft");
         assert!(tab.focus_editor);
-        assert!(!tab.status.is_empty());
+        assert_eq!(tab.status, format!("'other' {WAITS_FOR_EDITOR}"));
+    }
+
+    /// A template picked while the editor was open used to be dropped, with
+    /// a note to close the editor and pick the template again.
+    #[test]
+    fn a_template_picked_while_editing_opens_next() {
+        let mut h = Harness::new(&[]);
+        h.tab.open_add_dialog(None);
+        h.tab.edit_dialog.as_mut().unwrap().rule.name = "draft".into();
+        h.tab
+            .open_add_dialog(Some(Rule::from_config(&rule("from-template"))));
+        h.frame(vec![]);
+        assert_eq!(h.tab.edit_dialog.as_ref().unwrap().rule.name, "draft");
+
+        h.click("Cancel");
+        let next = h.tab.edit_dialog.as_ref().expect("the template opened");
+        assert_eq!(next.rule.name, "from-template");
+        assert!(!next.existing);
+        assert!(h.tab.status.is_empty(), "{}", h.tab.status);
+        assert!(
+            h.engine.lock().unwrap().get_rules().is_empty(),
+            "nothing saved"
+        );
+    }
+
+    /// A saved rule queued for editing opens as it is by then, and not at all
+    /// once it has been deleted.
+    #[test]
+    fn a_queued_edit_takes_the_rule_as_it_is_when_it_opens() {
+        let (first, second) = (rule("first"), rule("second"));
+        let mut h = Harness::new(&[first.clone(), second.clone()]);
+        edit_behind(&mut h.tab, &first);
+        h.tab.open_editor(Rule::from_config(&second), true);
+        h.engine.lock().unwrap().get_rules_mut()[1].name = "renamed".into();
+        h.tab.edit_dialog = None;
+        h.frame(vec![]);
+        assert_eq!(h.tab.edit_dialog.as_ref().unwrap().rule.name, "renamed");
+
+        h.tab.edit_dialog = None;
+        edit_behind(&mut h.tab, &first);
+        h.tab.open_editor(Rule::from_config(&second), true);
+        h.engine.lock().unwrap().remove_rule(&second.rule_id);
+        h.tab.edit_dialog = None;
+        h.frame(vec![]);
+        assert!(
+            h.tab.edit_dialog.is_none(),
+            "a deleted rule is not brought back"
+        );
     }
 
     /// Switching a rule off in the table while its editor is open, then
