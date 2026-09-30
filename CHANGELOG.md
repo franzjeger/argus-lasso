@@ -129,6 +129,23 @@ current source, release and verification status, see [docs/status.md](docs/statu
   I/O priority it set, and clearing the default affinity releases the processes
   it pinned; before, they kept the values until they exited. A value changed
   since by something else, such as a manual change, is left alone.
+- Importing rules gives each one its own ID, so importing an export of the current
+  rules no longer creates twins that toggle, edit and delete together. Rules the
+  kernel would refuse or clamp (nice 50, CPU list "abc", an invalid regular
+  expression, I/O level 8) are skipped and named in the status line.
+- The rule editor shows why a regular expression is invalid and does not save it,
+  names the I/O classes, and offers a level only for real-time and best-effort. A
+  rule with an I/O class but no level is enforced at level 4, as the editor showed,
+  instead of 0. A rule saved without a name takes its pattern as the name. Rules
+  with an invalid pattern are marked in the table.
+- Opening a second rule editor brings the open one to the front instead of
+  discarding its unsaved edits. Switching a rule on or off in the table while
+  it is being edited is kept when the editor is saved, and deleting the rule or
+  loading a profile closes its editor instead of letting Save bring the old
+  rule back.
+- Cancelling a profile load leaves the previous profile selected, so "Delete
+  profile" no longer targets the one that was not loaded. The current profile
+  can be picked again to reload it.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

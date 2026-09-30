@@ -123,6 +123,15 @@ impl Rule {
         }
     }
 
+    /// Why the pattern matches nothing, if it is an invalid regular
+    /// expression: the compiler's own message, shortened to its last line.
+    pub fn pattern_error(&self) -> Option<&str> {
+        match &self.cached_regex {
+            Some(Err(e)) => Some(regex_error_summary(e)),
+            _ => None,
+        }
+    }
+
     /// Returns true if proc_name matches this rule.
     pub fn matches(&self, proc_name: &str, proc_name_lower: &str) -> bool {
         if !self.enabled || self.pattern.is_empty() {
@@ -236,6 +245,80 @@ impl RuleEngine {
 pub fn any_matches(rules: &[Rule], proc_name: &str) -> bool {
     let lower = proc_name.to_lowercase();
     rules.iter().any(|r| r.matches(proc_name, &lower))
+}
+
+/// The regex crate's multi-line message ends with the actual reason.
+fn regex_error_summary(message: &str) -> &str {
+    let last = message.lines().last().unwrap_or(message).trim();
+    last.strip_prefix("error: ").unwrap_or(last)
+}
+
+/// What is wrong with a rule that did not come from the editor, whose
+/// controls cannot produce any of this. The kernel clamps an out-of-range
+/// nice value and rejects a bad CPU list or I/O priority, so such a rule
+/// would be re-applied, or fail, on every pass.
+pub fn rule_problem(rule: &RuleConfig) -> Option<String> {
+    if rule.pattern.is_empty() {
+        return Some("it has no pattern".into());
+    }
+    if rule.match_type == MatchType::Regex {
+        if let Err(e) = Regex::new(&rule.pattern) {
+            let e = e.to_string();
+            return Some(format!(
+                "its pattern is not a valid regular expression ({})",
+                regex_error_summary(&e)
+            ));
+        }
+    }
+    if let Some(affinity) = &rule.affinity {
+        let usable = utils::cpulist_to_set(affinity).is_ok_and(|cpus| {
+            !cpus.is_empty()
+                && cpus
+                    .iter()
+                    .all(|&cpu| (cpu as usize) < nix::sched::CpuSet::count())
+        });
+        if !usable {
+            return Some(format!("CPU list \"{affinity}\" is not valid"));
+        }
+    }
+    if let Some(nice) = rule.nice.filter(|n| !(-20..=19).contains(n)) {
+        return Some(format!("nice {nice} is outside -20 to 19"));
+    }
+    if let Some(class) = rule.ionice_class.filter(|c| !(0..=3).contains(c)) {
+        return Some(format!("I/O class {class} is outside 0 to 3"));
+    }
+    if let Some(level) = rule.ionice_level.filter(|l| !(0..=7).contains(l)) {
+        return Some(format!("I/O level {level} is outside 0 to 7"));
+    }
+    None
+}
+
+/// Rules read from an import file, ready to add after `existing`: the usable
+/// ones, each with an ID no other rule has (importing an export of these
+/// same rules would otherwise give every rule a twin that edits, toggles and
+/// deletes along with it), and a line for each one skipped.
+pub fn prepare_import(imported: Vec<RuleConfig>, existing: &[Rule]) -> (Vec<Rule>, Vec<String>) {
+    let mut ids: std::collections::HashSet<String> =
+        existing.iter().map(|r| r.rule_id.clone()).collect();
+    let mut rules = Vec::new();
+    let mut skipped = Vec::new();
+    for mut config in imported {
+        if let Some(problem) = rule_problem(&config) {
+            let name = if config.name.is_empty() {
+                &config.pattern
+            } else {
+                &config.name
+            };
+            skipped.push(format!("\"{name}\": {problem}"));
+            continue;
+        }
+        if config.rule_id.is_empty() || ids.contains(&config.rule_id) {
+            config.rule_id = uuid::Uuid::new_v4().to_string();
+        }
+        ids.insert(config.rule_id.clone());
+        rules.push(Rule::from_config(&config));
+    }
+    (rules, skipped)
 }
 
 /// A rule's nice or I/O priority change that failed for one process. It is
@@ -551,11 +634,13 @@ fn ionice_reached(current: (i32, i32), wanted: (i32, i32)) -> bool {
 }
 
 /// The (class, level) a rule asks for, as the kernel will accept and report
-/// it: class 0 ("none") takes no level, and a missing level means 0.
+/// it. Only real-time (1) and best-effort (2) have levels; "none" (0) rejects
+/// one and idle (3) ignores it. A missing level means 4, the normal level
+/// and the one ionice(1) and the rule editor use.
 pub fn ionice_target(class: i32, level: Option<i32>) -> (i32, i32) {
     match class {
-        0 => (0, 0),
-        _ => (class, level.unwrap_or(0).clamp(0, 7)),
+        1 | 2 => (class, level.unwrap_or(4).clamp(0, 7)),
+        _ => (class, 0),
     }
 }
 
@@ -895,7 +980,8 @@ mod tests {
     #[test]
     fn ionice_targets_are_what_the_kernel_accepts() {
         assert_eq!(ionice_target(0, Some(4)), (0, 0));
-        assert_eq!(ionice_target(2, None), (2, 0));
+        assert_eq!(ionice_target(3, Some(4)), (3, 0));
+        assert_eq!(ionice_target(2, None), (2, 4), "what the editor shows");
         assert_eq!(ionice_target(2, Some(9)), (2, 7));
     }
 
@@ -1031,5 +1117,72 @@ mod tests {
             "{restored:?}"
         );
         assert_eq!(utils::get_affinity_str(pid), affinity);
+    }
+
+    fn config(name: &str) -> RuleConfig {
+        RuleConfig {
+            name: name.into(),
+            pattern: name.into(),
+            ..RuleConfig::default()
+        }
+    }
+
+    /// Importing an export of the current rules used to give every rule a
+    /// twin with the same ID.
+    #[test]
+    fn imported_rules_get_ids_of_their_own() {
+        let mine = Rule::from_config(&config("mine"));
+        let mut again = config("again");
+        again.rule_id = mine.rule_id.clone();
+        let twice = config("twice");
+        let mut unnamed = config("unnamed");
+        unnamed.rule_id.clear();
+
+        let (rules, skipped) = prepare_import(
+            vec![again, twice.clone(), twice, unnamed],
+            std::slice::from_ref(&mine),
+        );
+
+        assert!(skipped.is_empty());
+        let mut ids: Vec<&str> = rules.iter().map(|r| r.rule_id.as_str()).collect();
+        ids.push(&mine.rule_id);
+        let unique: std::collections::HashSet<&&str> = ids.iter().collect();
+        assert_eq!(unique.len(), 5);
+        assert!(ids.iter().all(|id| !id.is_empty()));
+    }
+
+    #[test]
+    fn imported_rules_the_kernel_would_refuse_are_skipped() {
+        let mut far = config("far");
+        far.nice = Some(50);
+        let mut garbled = config("garbled");
+        garbled.affinity = Some("abc".into());
+        let mut regex = config("regex");
+        regex.match_type = MatchType::Regex;
+        regex.pattern = "(unclosed".into();
+        let mut io = config("io");
+        io.ionice_level = Some(8);
+        let mut fine = config("fine");
+        fine.nice = Some(19);
+        fine.affinity = Some("0-1".into());
+
+        let (rules, skipped) = prepare_import(vec![far, garbled, regex, io, fine], &[]);
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "fine");
+        assert_eq!(skipped.len(), 4, "{skipped:?}");
+        assert!(skipped[0].contains("nice 50"), "{skipped:?}");
+        assert!(skipped[1].contains("\"abc\""), "{skipped:?}");
+        assert!(skipped[2].contains("unclosed group"), "{skipped:?}");
+        assert!(skipped[3].contains("level 8"), "{skipped:?}");
+    }
+
+    #[test]
+    fn an_invalid_regex_says_why() {
+        let mut rule = rule_with("(unclosed", MatchType::Regex);
+        assert_eq!(rule.pattern_error(), Some("unclosed group"));
+        rule.pattern = "ok".into();
+        rule.refresh_pattern_caches();
+        assert_eq!(rule.pattern_error(), None);
     }
 }
