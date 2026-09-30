@@ -305,6 +305,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - A ProBalance cgroup throttle whose systemctl call timed out keeps its record of
   the unit's original CPU policy, so it is put back if the change landed anyway.
   Forgetting it let a later throttle record the throttled weight as the original.
+- The update rollback record no longer undoes an installation made since: a
+  `make install` after an in-app update could be reverted by "Restore previous app
+  and overlay", or silently by the next start after an interrupted update. The
+  installer removes the record, and a record for another path or a damaged one no
+  longer stops every start (a restart loop under systemd). The installer also
+  keeps only the current and previous layer builds instead of every one.
 
 ### Changed
 

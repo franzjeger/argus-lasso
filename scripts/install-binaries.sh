@@ -18,8 +18,18 @@ for pid in $(pgrep -u "$(id -u)" -x argus-lasso || true); do
         exit 1
     fi
 done
-layer_dir="$HOME/.local/share/argus-lasso/layers/$ARGUS_BUILD_ID"
+layers="$HOME/.local/share/argus-lasso/layers"
+layer_dir="$layers/$ARGUS_BUILD_ID"
 manifest_dir="$HOME/.local/share/vulkan/implicit_layer.d"
+# The build the manifest points at now, kept below as the previous one.
+previous_layer=$(python3 - "$manifest_dir/ArgusOverlay.json" <<'PY' || true
+import json,os,sys
+try:
+ print(os.path.dirname(json.load(open(sys.argv[1]))['layer']['library_path']))
+except (OSError,ValueError,KeyError,TypeError):
+ pass
+PY
+)
 mkdir -p "$layer_dir" "$manifest_dir" "$HOME/.local/bin"
 install -m755 "$binary_dir/libargus_layer.so" "$layer_dir/libargus_layer.so.new"
 mv "$layer_dir/libargus_layer.so.new" "$layer_dir/libargus_layer.so"
@@ -40,6 +50,17 @@ tmp.write_text(json.dumps({'file_format_version':'1.0.0','layer':{
  'disable_environment':{'ARGUS_LASSO_HUD_DISABLE':'1'}}},indent=2)+'\n')
 tmp.replace(path)
 PY
+# This install replaces whatever an in-app update left: its rollback record
+# would put that update's previous app back over this one.
+rm -f "$HOME/.local/bin/.argus-lasso-rollback.json"
+# Keep this build's layer and the previous one; older builds are referenced
+# by nothing. A game that still has one mapped keeps it after deletion.
+for dir in "$layers"/*/; do
+    dir=${dir%/}
+    if [ "$dir" != "$layer_dir" ] && [ "$dir" != "$previous_layer" ]; then
+        rm -rf -- "$dir"
+    fi
+done
 mkdir -p "$HOME/.local/share/applications" "$HOME/.config/systemd/user"
 # Keep local service customizations, including existing launch preferences.
 if [ ! -e "$HOME/.config/systemd/user/argus-lasso.service" ]; then

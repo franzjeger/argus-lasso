@@ -22,6 +22,11 @@ struct Rollback {
     manifest_path: PathBuf,
     manifest: Option<Vec<u8>>,
     pending: bool,
+    /// The app this update installed. A record whose target is neither this
+    /// nor the previous app describes an installation made since (a manual
+    /// `make install`), which it must not undo. Absent in older records.
+    #[serde(default)]
+    installed_sha256: Option<String>,
 }
 fn journal_path(target: &Path) -> Result<PathBuf, String> {
     Ok(target
@@ -79,6 +84,8 @@ fn restore(record: &Rollback) -> Result<(), String> {
     }
     Ok(())
 }
+/// Undo the update the journal records: an interrupted one (`pending_only`,
+/// at startup) or the last completed one (the user's rollback).
 pub(super) fn rollback(target: &Path, pending_only: bool) -> Result<bool, String> {
     let journal = journal_path(target)?;
     let Some(bytes) = read_optional(&journal)? else {
@@ -86,11 +93,30 @@ pub(super) fn rollback(target: &Path, pending_only: bool) -> Result<bool, String
     };
     let mut record: Rollback =
         serde_json::from_slice(&bytes).map_err(|e| format!("Invalid rollback record: {e}"))?;
+    // A completed update needs no recovery, whichever installation the
+    // record is for; checking the target first failed every start.
+    if pending_only && !record.pending {
+        return Ok(false);
+    }
     if record.target != target {
         return Err("Rollback record belongs to a different installation".into());
     }
-    if pending_only && !record.pending {
-        return Ok(false);
+    if let Some(installed) = &record.installed_sha256 {
+        let live = std::fs::read(target).map(|bytes| sha256_hex(&bytes)).ok();
+        let ours = live.as_ref().is_some_and(|live| {
+            live == installed || (record.pending && *live == record.binary_sha256)
+        });
+        if !ours {
+            // Installed since by other means: the record no longer applies.
+            let _ = std::fs::remove_file(&journal);
+            if pending_only {
+                return Ok(false);
+            }
+            return Err(
+                "The installed app was replaced since this update; its rollback record was discarded"
+                    .into(),
+            );
+        }
     }
     record.pending = true;
     write_journal(&journal, &record)?;
@@ -318,6 +344,7 @@ fn install_pair_locked(
         manifest_path: manifest_path.into(),
         manifest: old_manifest,
         pending: true,
+        installed_sha256: Some(sha256_hex(app)),
     };
     let journal = journal_path(target)?;
     write_journal(&journal, &record)?;
@@ -495,12 +522,86 @@ mod tests {
                 manifest_path: manifest.clone(),
                 manifest: None,
                 pending: true,
+                installed_sha256: None,
             },
         )
         .unwrap();
         assert!(rollback(&app, true).unwrap());
         assert_eq!(std::fs::read(&app).unwrap(), b"old app");
         assert!(!manifest.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A journal in a scratch directory, for an app at `app` whose update
+    /// installed `installed` over `previous`.
+    fn journal_for(app: &Path, previous: &[u8], installed: &[u8], pending: bool) -> PathBuf {
+        let backup = app.with_file_name("backup");
+        std::fs::write(&backup, previous).unwrap();
+        write_journal(
+            &journal_path(app).unwrap(),
+            &Rollback {
+                target: app.into(),
+                binary: backup,
+                binary_sha256: sha256_hex(previous),
+                manifest_path: app.with_file_name("manifest.json"),
+                manifest: None,
+                pending,
+                installed_sha256: Some(sha256_hex(installed)),
+            },
+        )
+        .unwrap();
+        journal_path(app).unwrap()
+    }
+
+    fn scratch() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("argus-journal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+
+    /// After an update, a manual install replaced the app. Rolling back, or
+    /// recovering an interrupted update, silently put the old app back over
+    /// the one the user had just installed.
+    #[test]
+    fn a_rollback_record_does_not_undo_a_later_install() {
+        for pending in [false, true] {
+            let root = scratch();
+            let app = root.join("app");
+            std::fs::write(&app, b"installed by hand").unwrap();
+            let journal = journal_for(&app, b"old app", b"updated app", pending);
+
+            let result = rollback(&app, pending);
+            assert_eq!(result.is_err(), !pending, "{result:?}");
+            assert_eq!(std::fs::read(&app).unwrap(), b"installed by hand");
+            assert!(!journal.exists(), "the stale record is gone");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// A completed update's record for another path made every start exit.
+    #[test]
+    fn a_completed_record_for_another_path_does_not_stop_a_start() {
+        let root = scratch();
+        let app = root.join("app");
+        std::fs::write(&app, b"app").unwrap();
+        let journal = journal_for(&app, b"old", b"app", false);
+        let mut record: Rollback =
+            serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        record.target = root.join("elsewhere");
+        write_journal(&journal, &record).unwrap();
+
+        assert_eq!(rollback(&app, true), Ok(false));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_interrupted_update_still_recovers() {
+        let root = scratch();
+        let app = root.join("app");
+        std::fs::write(&app, b"updated app").unwrap();
+        journal_for(&app, b"old app", b"updated app", true);
+        assert_eq!(rollback(&app, true), Ok(true));
+        assert_eq!(std::fs::read(&app).unwrap(), b"old app");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

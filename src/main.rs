@@ -425,10 +425,9 @@ fn main() {
                 std::process::exit(1);
             }
             Ok(false) => {}
-            Err(e) => {
-                eprintln!("Update recovery failed: {e}");
-                std::process::exit(1);
-            }
+            // Exiting here failed every start (a restart loop under
+            // systemd) with no way out; the running binary is complete.
+            Err(e) => eprintln!("Warning: update recovery skipped: {e}"),
         }
     }
 
