@@ -4,11 +4,14 @@ fn main() {
 
     let file = std::fs::File::open(icon_path)
         .expect("assets/icon.png not found — regenerate it with `make icon`");
-    let decoder = png::Decoder::new(file);
+    let decoder = png::Decoder::new(std::io::BufReader::new(file));
     let mut reader = decoder
         .read_info()
         .expect("failed to decode assets/icon.png");
-    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let size = reader
+        .output_buffer_size()
+        .expect("assets/icon.png is too large to decode");
+    let mut buf = vec![0u8; size];
     let info = reader
         .next_frame(&mut buf)
         .expect("failed to read PNG frame");
