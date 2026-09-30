@@ -336,6 +336,11 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - The HUD appears on devices that list a compute or transfer queue family before
   the graphics one; it used the first family requested and stayed off, with
   nothing logged.
+- The HUD is drawn with the right colours on sRGB swapchains, where its colours
+  were encoded twice and looked washed out, and is left off HDR swapchains (HDR10
+  or scRGB), where its sRGB colours meant up to thousands of nits. It is also left
+  off swapchains whose images may have no memory yet or whose image views would
+  inherit a storage usage their format does not support.
 
 ### Changed
 

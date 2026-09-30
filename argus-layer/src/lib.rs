@@ -966,6 +966,29 @@ unsafe fn init_overlay(
         eprintln!("[Argus-Layer] HUD skipped: unsupported swapchain usage/layers/protection");
         return;
     }
+    // Images may have no memory until first acquired, and the HUD makes its
+    // views now. A mutable-format image's views inherit its storage usage,
+    // which the sRGB formats do not support.
+    if ci
+        .flags
+        .contains(vk::SwapchainCreateFlagsKHR::DEFERRED_MEMORY_ALLOCATION_EXT)
+        || (ci
+            .flags
+            .contains(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
+            && ci.image_usage.contains(vk::ImageUsageFlags::STORAGE))
+    {
+        eprintln!("[Argus-Layer] HUD skipped: deferred-memory or mutable-format storage swapchain");
+        return;
+    }
+    // The HUD's colours are display-encoded sRGB. Under HDR10 (PQ) they
+    // would mean up to thousands of nits, under scRGB something else again.
+    if ci.image_color_space != vk::ColorSpaceKHR::SRGB_NONLINEAR {
+        eprintln!(
+            "[Argus-Layer] HUD skipped: colour space {:?} is not sRGB",
+            ci.image_color_space
+        );
+        return;
+    }
     let Some((physical_device, ash_dev)) = DEVICE_MAP
         .read_or_recover()
         .get(&device)
