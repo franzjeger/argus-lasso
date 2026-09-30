@@ -377,6 +377,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Changed
 
+- The overlay's IPC uses postcard instead of bincode, which is no longer
+  maintained; the protocol is now 6 and its sockets are `overlay-v6.sock`. Restart
+  running games after updating: until then their HUD shows "Telemetry
+  disconnected".
 - The GitHub Actions the workflows use are pinned by commit SHA, and CI fails on
   one that is not; the release job, which holds the signing key, no longer
   restores a build cache.
