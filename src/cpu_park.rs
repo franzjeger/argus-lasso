@@ -1134,7 +1134,7 @@ mod tests {
         // its sibling above, which is refused before reaching renice) — see
         // PROCESS_NICE_TEST_LOCK's doc comment for why that needs
         // serializing against other tests doing the same (rules.rs's
-        // apply_rules_lets_a_later_rule_override_..).
+        // rules_sharing_a_nice_target_change_it_once).
         let _guard = crate::utils::PROCESS_NICE_TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::MetadataExt;
         let script = stage_script("renice-start-match", RENICE_SCRIPT);

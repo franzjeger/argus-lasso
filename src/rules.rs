@@ -229,18 +229,22 @@ impl RuleEngine {
     /// the action list from apply_rules (an already-correct process yields no
     /// actions but is still rule-managed).
     pub fn matches_any(&self, proc_name: &str) -> bool {
-        let lower = proc_name.to_lowercase();
-        self.rules.iter().any(|r| r.matches(proc_name, &lower))
+        any_matches(&self.rules, proc_name)
     }
+}
+
+pub fn any_matches(rules: &[Rule], proc_name: &str) -> bool {
+    let lower = proc_name.to_lowercase();
+    rules.iter().any(|r| r.matches(proc_name, &lower))
 }
 
 /// A rule's nice or I/O priority change that failed for one process. It is
 /// not retried every pass: a permission failure never heals by itself, and
 /// retrying would spawn a syscall and a log line every 500 ms forever.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FailKey {
+struct FailKey {
     rule_id: String,
-    pub pid: u32,
+    pid: u32,
     attr: Attr,
 }
 
@@ -250,7 +254,159 @@ enum Attr {
     Ionice,
 }
 
-pub type FailedChanges = std::collections::HashSet<FailKey>;
+/// What the daemon enforces: the rules, and the affinity for processes no
+/// rule matches.
+pub struct Policy<'a> {
+    pub rules: &'a [Rule],
+    pub default_affinity: Option<&'a str>,
+}
+
+/// One process as enforcement sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct Target<'a> {
+    pub pid: u32,
+    /// Tells the process a change was made to from a later one given its PID.
+    pub start_ticks: u64,
+    pub name: &'a str,
+    pub nice: Option<i32>,
+}
+
+/// A value enforcement set, what the process had before, and who set it
+/// (the log prefix, such as `[Rule:games]` or `[Default]`).
+#[derive(Debug)]
+struct Undo<T> {
+    original: T,
+    applied: T,
+    by: String,
+}
+
+impl<T> Undo<T> {
+    /// Keep the first original through later changes.
+    fn record(slot: &mut Option<Self>, original: T, applied: T, by: String) {
+        match slot {
+            Some(undo) => {
+                undo.applied = applied;
+                undo.by = by;
+            }
+            None => {
+                *slot = Some(Undo {
+                    original,
+                    applied,
+                    by,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct Changes {
+    start_ticks: u64,
+    affinity: Option<Undo<String>>,
+    nice: Option<Undo<i32>>,
+    ionice: Option<Undo<(i32, i32)>>,
+}
+
+impl Changes {
+    fn is_empty(&self) -> bool {
+        self.affinity.is_none() && self.nice.is_none() && self.ionice.is_none()
+    }
+}
+
+/// What enforcement changed on each process, so that a value no rule asks
+/// for any more is put back, and which changes failed, so that they are not
+/// retried every pass.
+#[derive(Debug, Default)]
+pub struct RuleState {
+    failed: std::collections::HashSet<FailKey>,
+    changes: std::collections::HashMap<u32, Changes>,
+}
+
+impl RuleState {
+    /// The rules changed: failed changes get another chance.
+    pub fn rules_changed(&mut self) {
+        self.failed.clear();
+    }
+
+    /// Whether some change could still need undoing.
+    pub fn has_changes(&self) -> bool {
+        !self.changes.is_empty()
+    }
+
+    /// Forget processes that exited, including a PID now used by another
+    /// process (`live` maps PID to start time).
+    pub fn retain_live(&mut self, live: &std::collections::HashMap<u32, u64>) {
+        self.failed.retain(|failed| live.contains_key(&failed.pid));
+        self.changes
+            .retain(|pid, changes| live.get(pid) == Some(&changes.start_ticks));
+    }
+
+    /// The changes recorded for this process, starting over for a new one.
+    fn changes(&mut self, target: Target) -> &mut Changes {
+        let changes = self.changes.entry(target.pid).or_default();
+        if changes.start_ticks != target.start_ticks {
+            *changes = Changes {
+                start_ticks: target.start_ticks,
+                ..Changes::default()
+            };
+        }
+        changes
+    }
+
+    fn recorded(&self, target: Target) -> Option<&Changes> {
+        self.changes
+            .get(&target.pid)
+            .filter(|changes| changes.start_ticks == target.start_ticks)
+    }
+
+    /// Take a recorded change to undo it, without creating a record.
+    fn take<T>(
+        &mut self,
+        target: Target,
+        slot: fn(&mut Changes) -> &mut Option<Undo<T>>,
+    ) -> Option<Undo<T>> {
+        let changes = self.changes.get_mut(&target.pid)?;
+        (changes.start_ticks == target.start_ticks)
+            .then(|| slot(changes).take())
+            .flatten()
+    }
+
+    /// Set `affinity` on a process if it differs, remembering what it had.
+    fn set_affinity(&mut self, target: Target, affinity: &str, by: String) -> bool {
+        let original = match self.recorded(target).and_then(|c| c.affinity.as_ref()) {
+            Some(undo) => undo.original.clone(),
+            None => utils::get_affinity_to_restore(target.pid),
+        };
+        let changed = utils::set_affinity_if_changed(target.pid, affinity);
+        if changed {
+            let slot = &mut self.changes(target).affinity;
+            Undo::record(slot, original, affinity.to_string(), by);
+        }
+        changed
+    }
+
+    /// Apply the default affinity to a process no rule matches.
+    pub fn apply_default_affinity(
+        &mut self,
+        target: Target,
+        affinity: &str,
+        log: &impl Fn(String),
+    ) {
+        if self.set_affinity(target, affinity, "[Default]".into()) {
+            log(format!(
+                "[Default] affinity={affinity} → {}({})",
+                target.name, target.pid
+            ));
+        }
+    }
+
+    /// Drop a process's record once nothing is left to undo.
+    fn tidy(&mut self, pid: u32) {
+        if self.changes.get(&pid).is_some_and(Changes::is_empty) {
+            self.changes.remove(&pid);
+        }
+    }
+}
 
 /// Enforce the rules matching one process. Standalone so the monitor daemon
 /// can clone the rules and run enforcement WITHOUT holding the RuleEngine
@@ -261,17 +417,22 @@ pub type FailedChanges = std::collections::HashSet<FailKey>;
 /// attribute the last rule that sets it wins. Each attribute is then
 /// dirty-checked and changed at most once, so two rules that disagree no
 /// longer undo each other on every pass. `current_ionice` is only called when
-/// a matching rule sets I/O priority.
+/// I/O priority is set or put back.
+///
+/// A value enforcement set earlier that nothing asks for any more (the rule
+/// was disabled, deleted or edited, or the default affinity was cleared) is
+/// put back to what the process had, unless something else has changed it
+/// since. A default affinity is kept while it is configured and no rule
+/// matches the process.
 pub fn apply_rules(
-    rules: &[Rule],
-    pid: u32,
-    proc_name: &str,
-    current_nice: Option<i32>,
+    policy: &Policy,
+    target: Target,
     current_ionice: impl FnOnce() -> Option<(i32, i32)>,
-    failed: &mut FailedChanges,
+    state: &mut RuleState,
     log: &impl Fn(String),
 ) -> Vec<String> {
-    let effect = preview_effect(rules, proc_name);
+    let effect = preview_effect(policy.rules, target.name);
+    let (pid, name) = (target.pid, target.name);
     let mut actions = Vec::new();
     let mut report = |msg: String| {
         log(msg.clone());
@@ -282,11 +443,19 @@ pub fn apply_rules(
 
     if let Some(rule) = last_setting(|r| r.affinity.is_some()) {
         let aff = rule.affinity.as_deref().unwrap_or_default();
-        if utils::set_affinity_if_changed(pid, aff) {
-            report(format!(
-                "[Rule:{}] Set affinity={} on {}({})",
-                rule.name, aff, proc_name, pid
-            ));
+        let by = format!("[Rule:{}]", rule.name);
+        if state.set_affinity(target, aff, by.clone()) {
+            report(format!("{by} Set affinity={aff} on {name}({pid})"));
+        }
+    } else if effect.matches.is_empty() && policy.default_affinity.is_some() {
+        // The default's to keep; it is applied to new processes only.
+    } else if let Some(undo) = state.take(target, |c| &mut c.affinity) {
+        if utils::affinity_matches(pid, &undo.applied) {
+            let (value, by) = (&undo.original, &undo.by);
+            report(match utils::set_affinity(pid, value) {
+                Ok(()) => format!("{by} Restored affinity={value} on {name}({pid})"),
+                Err(e) => format!("{by} Restoring affinity={value} FAILED for {name}({pid}): {e}"),
+            });
         }
     }
 
@@ -299,47 +468,86 @@ pub fn apply_rules(
             pid,
             attr: Attr::Nice,
         };
-        if current_nice != Some(nice) && !failed.contains(&key) {
+        if target.nice != Some(nice) && !state.failed.contains(&key) {
             match utils::set_nice(pid, nice) {
-                Ok(()) => report(format!(
-                    "[Rule:{}] Set nice={} on {}({})",
-                    rule.name, nice, proc_name, pid
-                )),
+                Ok(()) => {
+                    let by = format!("[Rule:{}]", rule.name);
+                    report(format!("{by} Set nice={nice} on {name}({pid})"));
+                    if let Some(original) = target.nice {
+                        Undo::record(&mut state.changes(target).nice, original, nice, by);
+                    }
+                }
                 Err(e) => {
-                    failed.insert(key);
+                    state.failed.insert(key);
                     report(format!(
                         "[Rule:{}] nice={} FAILED for {}({}): {e} — giving up for this process",
-                        rule.name, nice, proc_name, pid
+                        rule.name, nice, name, pid
                     ));
                 }
             }
         }
+    } else if let Some(undo) = state.take(target, |c| &mut c.nice) {
+        if target.nice == Some(undo.applied) {
+            let (value, by) = (undo.original, &undo.by);
+            report(match utils::set_nice(pid, value) {
+                Ok(()) => format!("{by} Restored nice={value} on {name}({pid})"),
+                Err(e) => format!("{by} Restoring nice={value} FAILED for {name}({pid}): {e}"),
+            });
+        }
     }
 
     if let Some(rule) = last_setting(|r| r.ionice_class.is_some()) {
-        let target = ionice_target(rule.ionice_class.unwrap_or_default(), rule.ionice_level);
+        let wanted = ionice_target(rule.ionice_class.unwrap_or_default(), rule.ionice_level);
         let key = FailKey {
             rule_id: rule.rule_id.clone(),
             pid,
             attr: Attr::Ionice,
         };
-        if !failed.contains(&key) && current_ionice() != Some(target) {
-            match utils::set_ionice(pid, target.0, Some(target.1)) {
-                Ok(()) => report(format!(
-                    "[Rule:{}] Set ionice class={} level={} on {}({})",
-                    rule.name, target.0, target.1, proc_name, pid
-                )),
-                Err(e) => {
-                    failed.insert(key);
+        let current = if state.failed.contains(&key) {
+            Some(wanted)
+        } else {
+            current_ionice()
+        };
+        if !current.is_some_and(|c| ionice_reached(c, wanted)) {
+            let (class, level) = wanted;
+            match utils::set_ionice(pid, class, Some(level)) {
+                Ok(()) => {
+                    let by = format!("[Rule:{}]", rule.name);
                     report(format!(
-                        "[Rule:{}] ionice class={} level={} FAILED for {}({}): {e} — giving up for this process",
-                        rule.name, target.0, target.1, proc_name, pid
+                        "{by} Set ionice class={class} level={level} on {name}({pid})"
+                    ));
+                    if let Some(original) = current {
+                        Undo::record(&mut state.changes(target).ionice, original, wanted, by);
+                    }
+                }
+                Err(e) => {
+                    state.failed.insert(key);
+                    report(format!(
+                        "[Rule:{}] ionice class={class} level={level} FAILED for {name}({pid}): {e} — giving up for this process",
+                        rule.name
                     ));
                 }
             }
         }
+    } else if let Some(undo) = state.take(target, |c| &mut c.ionice) {
+        if current_ionice().is_some_and(|c| ionice_reached(c, undo.applied)) {
+            let ((class, level), by) = (undo.original, &undo.by);
+            report(match utils::set_ionice(pid, class, Some(level)) {
+                Ok(()) => format!("{by} Restored ionice class={class} level={level} on {name}({pid})"),
+                Err(e) => format!(
+                    "{by} Restoring ionice class={class} level={level} FAILED for {name}({pid}): {e}"
+                ),
+            });
+        }
     }
+    state.tidy(pid);
     actions
+}
+
+/// Class 0 ("none") follows the nice value; older kernels report a level
+/// with it, which is not a difference worth a syscall.
+fn ionice_reached(current: (i32, i32), wanted: (i32, i32)) -> bool {
+    current == wanted || (current.0 == 0 && wanted.0 == 0)
 }
 
 /// The (class, level) a rule asks for, as the kernel will accept and report
@@ -389,6 +597,59 @@ mod tests {
         r.match_type = match_type;
         r.refresh_pattern_caches();
         r
+    }
+
+    fn only(rules: &[Rule]) -> Policy<'_> {
+        Policy {
+            rules,
+            default_affinity: None,
+        }
+    }
+
+    fn process(pid: u32, name: &str, nice: Option<i32>) -> Target<'_> {
+        Target {
+            pid,
+            start_ticks: 0,
+            name,
+            nice,
+        }
+    }
+
+    /// A `sleep` to change, killed when dropped.
+    struct Sleeper(std::process::Child);
+
+    impl Sleeper {
+        fn spawn() -> Self {
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn target(&self) -> Target<'static> {
+            process(self.0.id(), "argus-undo-test", utils::get_nice(self.0.id()))
+        }
+
+        /// One enforcement pass, returning what it did.
+        fn enforce(&self, policy: &Policy, state: &mut RuleState) -> Vec<String> {
+            let pid = self.0.id();
+            apply_rules(
+                policy,
+                self.target(),
+                || utils::get_ionice_raw(pid),
+                state,
+                &|_| {},
+            )
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     #[test]
@@ -495,12 +756,10 @@ mod tests {
         engine.load_rules(&[cfg]);
         // Non-matching name → empty actions, no syscalls attempted
         let actions = apply_rules(
-            engine.get_rules(),
-            0,
-            "firefox",
-            None,
+            &only(engine.get_rules()),
+            process(0, "firefox", None),
             || None,
-            &mut FailedChanges::new(),
+            &mut RuleState::default(),
             &|_| {},
         );
         assert!(actions.is_empty());
@@ -581,14 +840,11 @@ mod tests {
         rule2.rule_id = "r2".into();
         rule2.nice = Some(target);
 
-        let mut nice_failed = FailedChanges::new();
         let actions = apply_rules(
-            &[rule1, rule2],
-            pid,
-            "apply-rules-staleness-test",
-            Some(starting),
+            &only(&[rule1, rule2]),
+            process(pid, "apply-rules-staleness-test", Some(starting)),
             || None,
-            &mut nice_failed,
+            &mut RuleState::default(),
             &|_| {},
         );
 
@@ -623,22 +879,15 @@ mod tests {
         last.rule_id = "last".into();
         last.nice = Some(starting + 1);
         let rules = [first, last];
-        let mut failed = FailedChanges::new();
-        let pass = |current: Option<i32>, failed: &mut FailedChanges| {
-            apply_rules(
-                &rules,
-                pid,
-                "apply-rules-disagree-test",
-                current,
-                || None,
-                failed,
-                &|_| {},
-            )
+        let mut state = RuleState::default();
+        let mut pass = |nice: Option<i32>| {
+            let target = process(pid, "apply-rules-disagree-test", nice);
+            apply_rules(&only(&rules), target, || None, &mut state, &|_| {})
         };
 
-        assert_eq!(pass(Some(starting), &mut failed).len(), 1);
+        assert_eq!(pass(Some(starting)).len(), 1);
         assert_eq!(utils::get_nice(pid), Some(starting + 1));
-        assert!(pass(utils::get_nice(pid), &mut failed).is_empty());
+        assert!(pass(utils::get_nice(pid)).is_empty());
     }
 
     /// I/O class 0 ("none") takes no level: asking for level 4 with it is
@@ -664,26 +913,123 @@ mod tests {
         rule.ionice_level = Some(0);
         let rules = [rule];
         let pid = std::process::id();
-        let mut failed = FailedChanges::new();
+        let mut state = RuleState::default();
         let reads = std::cell::Cell::new(0);
         let mut pass = || {
-            apply_rules(
-                &rules,
-                pid,
-                "apply-rules-ionice-test",
-                None,
-                || {
-                    reads.set(reads.get() + 1);
-                    None
-                },
-                &mut failed,
-                &|_| {},
-            )
+            let read = || {
+                reads.set(reads.get() + 1);
+                None
+            };
+            let target = process(pid, "apply-rules-ionice-test", None);
+            apply_rules(&only(&rules), target, read, &mut state, &|_| {})
         };
         let first = pass();
         assert_eq!(first.len(), 1);
         assert!(first[0].contains("FAILED"), "{first:?}");
         assert!(pass().is_empty());
         assert_eq!(reads.get(), 1, "a known failure needs no ioprio read");
+    }
+
+    /// Disabling a rule used to leave its affinity and I/O priority on the
+    /// process until it exited.
+    #[test]
+    fn a_disabled_rule_puts_back_what_it_changed() {
+        let sleeper = Sleeper::spawn();
+        let pid = sleeper.0.id();
+        let affinity = utils::get_affinity_str(pid);
+        let cpus = utils::cpulist_to_set(&affinity).unwrap();
+        let Some(&cpu) = cpus.iter().min().filter(|_| cpus.len() > 1) else {
+            eprintln!("needs two CPUs to change affinity");
+            return;
+        };
+        let io_before = utils::get_ionice_raw(pid).unwrap();
+        let mut rule = rule_with("argus-undo-test", MatchType::Exact);
+        rule.affinity = Some(cpu.to_string());
+        rule.ionice_class = Some(2);
+        rule.ionice_level = Some(7);
+        let mut rules = [rule];
+        let mut state = RuleState::default();
+
+        assert_eq!(sleeper.enforce(&only(&rules), &mut state).len(), 2);
+        assert_eq!(utils::get_affinity_str(pid), cpu.to_string());
+        assert_eq!(utils::get_ionice_raw(pid), Some((2, 7)));
+
+        rules[0].enabled = false;
+        let restored = sleeper.enforce(&only(&rules), &mut state);
+        assert_eq!(restored.len(), 2, "{restored:?}");
+        assert!(
+            restored.iter().all(|a| a.contains("Restored")),
+            "{restored:?}"
+        );
+        assert_eq!(utils::get_affinity_str(pid), affinity);
+        assert!(ionice_reached(
+            utils::get_ionice_raw(pid).unwrap(),
+            io_before
+        ));
+        assert!(!state.has_changes());
+        assert!(sleeper.enforce(&only(&rules), &mut state).is_empty());
+    }
+
+    /// A value someone else set after the rule, such as a manual change from
+    /// the process table, stays when the rule goes. So does anything on a
+    /// later process given the same PID.
+    #[test]
+    fn only_a_value_still_as_set_is_put_back() {
+        let sleeper = Sleeper::spawn();
+        let pid = sleeper.0.id();
+        let mut rule = rule_with("argus-undo-test", MatchType::Exact);
+        rule.ionice_class = Some(2);
+        rule.ionice_level = Some(7);
+        let mut rules = [rule];
+        let mut state = RuleState::default();
+        assert_eq!(sleeper.enforce(&only(&rules), &mut state).len(), 1);
+
+        utils::set_ionice(pid, 2, Some(5)).unwrap();
+        rules[0].enabled = false;
+        assert!(sleeper.enforce(&only(&rules), &mut state).is_empty());
+        assert_eq!(utils::get_ionice_raw(pid), Some((2, 5)));
+        assert!(!state.has_changes());
+
+        rules[0].enabled = true;
+        sleeper.enforce(&only(&rules), &mut state);
+        rules[0].enabled = false;
+        let mut later = sleeper.target();
+        later.start_ticks += 1;
+        let read = || utils::get_ionice_raw(pid);
+        assert!(apply_rules(&only(&rules), later, read, &mut state, &|_| {}).is_empty());
+        assert_eq!(utils::get_ionice_raw(pid), Some((2, 7)));
+    }
+
+    /// The default affinity stays while it is set and no rule matches, and
+    /// goes when it is cleared.
+    #[test]
+    fn a_cleared_default_affinity_is_put_back() {
+        let sleeper = Sleeper::spawn();
+        let pid = sleeper.0.id();
+        let affinity = utils::get_affinity_str(pid);
+        let cpus = utils::cpulist_to_set(&affinity).unwrap();
+        let Some(cpu) = cpus.iter().min().filter(|_| cpus.len() > 1) else {
+            eprintln!("needs two CPUs to change affinity");
+            return;
+        };
+        let cpu = cpu.to_string();
+        let mut state = RuleState::default();
+        state.apply_default_affinity(sleeper.target(), &cpu, &|_| {});
+        assert_eq!(utils::get_affinity_str(pid), cpu);
+
+        let with_default = Policy {
+            rules: &[],
+            default_affinity: Some(&cpu),
+        };
+        assert!(sleeper.enforce(&with_default, &mut state).is_empty());
+        assert_eq!(utils::get_affinity_str(pid), cpu);
+
+        let restored = sleeper.enforce(&only(&[]), &mut state);
+        assert_eq!(restored.len(), 1, "{restored:?}");
+        assert!(
+            restored[0].starts_with("[Default] Restored"),
+            "{restored:?}"
+        );
+        assert_eq!(utils::get_affinity_str(pid), affinity);
     }
 }

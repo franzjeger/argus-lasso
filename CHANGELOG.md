@@ -125,6 +125,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   instead of retried silently forever, the "none" I/O class no longer sends a
   level the kernel rejects, and I/O priority is read only for processes a rule
   sets it on. An affinity naming parked CPUs is no longer re-applied every pass.
+- Disabling, deleting or editing a rule puts back the affinity, nice value and
+  I/O priority it set, and clearing the default affinity releases the processes
+  it pinned; before, they kept the values until they exited. A value changed
+  since by something else, such as a manual change, is left alone.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

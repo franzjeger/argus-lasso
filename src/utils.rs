@@ -151,17 +151,7 @@ fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> std::io::Resul
         }
     }
 
-    // sched_getaffinity(2) reports the requested mask limited to online
-    // CPUs, so with CPUs parked the thread never "matches" the full request;
-    // compare against what the kernel can actually show instead.
-    let reported = only_changed.then(|| {
-        let online = get_online_cpus();
-        let mut set = CpuSet::new();
-        for cpu in cpuset.iter().filter(|cpu| online.contains(cpu)) {
-            let _ = set.set(*cpu as usize);
-        }
-        set
-    });
+    let reported = only_changed.then(|| reported_mask(&cpuset));
 
     let mut any_ok = false;
     let mut first_err = None;
@@ -191,6 +181,40 @@ fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> std::io::Resul
             Ok(any_ok)
         }
     }
+}
+
+/// `cpus` as sched_getaffinity(2) reports it: limited to online CPUs, so with
+/// CPUs parked a thread never "matches" the full request.
+fn reported_mask(cpus: &HashSet<u32>) -> CpuSet {
+    let online = get_online_cpus();
+    let mut set = CpuSet::new();
+    for cpu in cpus.iter().filter(|cpu| online.contains(cpu)) {
+        let _ = set.set(*cpu as usize);
+    }
+    set
+}
+
+/// Whether the main thread's affinity is `cpulist`, as far as the kernel shows.
+pub fn affinity_matches(pid: u32, cpulist: &str) -> bool {
+    use nix::sched::sched_getaffinity;
+    use nix::unistd::Pid;
+    let Ok(cpus) = cpulist_to_set(cpulist) else {
+        return false;
+    };
+    sched_getaffinity(Pid::from_raw(pid as i32))
+        .is_ok_and(|current| current == reported_mask(&cpus))
+}
+
+/// The main thread's affinity, to put back later. A process allowed every
+/// online CPU is recorded as allowed every CPU: its mask still includes
+/// parked CPUs the kernel does not report, and restoring only the online
+/// ones would keep it off them once they return.
+pub fn get_affinity_to_restore(pid: u32) -> String {
+    let current = get_affinity_str(pid);
+    if cpulist_to_set(&current).is_ok_and(|cpus| cpus == get_online_cpus()) {
+        return cpuset_to_cpulist(&(0..get_cpu_count()).collect());
+    }
+    current
 }
 
 /// Apply affinity to every thread whose CPU mask differs from `cpulist`.
