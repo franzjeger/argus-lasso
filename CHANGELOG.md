@@ -115,6 +115,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   process that reuses a paused one's PID is no longer shown as suspended.
 - Ending a process appears in the status bar's Recent events again. The messages
   had been reworded and no longer matched what the event list looked for.
+- Picking a game from the Steam list now launches it. The app id kept its closing
+  quote (`steam -applaunch 620"`), so the launcher rejected the command; names
+  showed the stray quote too. Lutris names containing `|` are no longer split,
+  and the Lutris database is read read-only.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

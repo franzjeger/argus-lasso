@@ -7,6 +7,7 @@ mod cpu_park;
 mod fast_proc;
 mod file_dialog;
 mod game_benchmark;
+mod game_library;
 mod gui;
 mod hw_monitor;
 mod icon;
