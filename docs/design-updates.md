@@ -72,6 +72,15 @@ The metadata is authenticated as part of the signed archive.
 
 The workflow requires `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD`, signs each
 archive and verifies the signature against the checked-in public key before
-publishing. Missing signing configuration fails the job. Release notes come from
+publishing. Missing signing configuration fails the job.
+
+The signing job runs in the `release` environment. It waits for the maintainer's
+approval, can only be deployed from `v*` tags and `master` (for the manual
+trigger), and holds the two signing values as environment secrets. The values
+must not also be repository secrets: any workflow in the repository, including
+one pushed to a new branch, can read those, and pushing a tag alone would then
+be enough to get a release signed. This protects against leaked tokens and
+collaborator access; it does not protect against someone who has taken over the
+maintainer's own account, which only offline signing would. Release notes come from
 the matching version section in `CHANGELOG.md`. Pushing source does not publish a
 release, and implementing this updater does not retrofit older published archives.

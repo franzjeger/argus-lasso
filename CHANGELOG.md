@@ -341,6 +341,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   or scRGB), where its sRGB colours meant up to thousands of nits. It is also left
   off swapchains whose images may have no memory yet or whose image views would
   inherit a storage usage their format does not support.
+- The CPU control helpers no longer run without a password for every local user:
+  their polkit actions ask for an administrator's password, and a polkit rule
+  installed with them exempts only the user who installed them, from an active
+  local session. The helpers are updated (v7) and ask to be reinstalled.
 
 ### Changed
 
