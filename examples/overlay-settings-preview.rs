@@ -76,11 +76,10 @@ impl eframe::App for Preview {
             })
         });
         if let Some(image) = screenshot {
-            let file = std::fs::File::create(if std::env::args().any(|a| a == "--light") {
-                "diagnostics/polish-components-light.png"
-            } else {
-                "diagnostics/polish-components-dark.png"
-            })
+            let file = std::fs::File::create(format!(
+                "diagnostics/overlay-settings-{}.png",
+                theme_arg().to_str()
+            ))
             .unwrap();
             let mut encoder = png::Encoder::new(file, image.size[0] as u32, image.size[1] as u32);
             encoder.set_color(png::ColorType::Rgba);
@@ -96,6 +95,17 @@ impl eframe::App for Preview {
         ctx.request_repaint();
     }
 }
+/// `--theme <NAME>` picks the theme by its name in the configuration, for
+/// example `BreezeLight`; without it the preview is Adwaita Dark.
+fn theme_arg() -> theme::AppTheme {
+    let args: Vec<String> = std::env::args().collect();
+    args.windows(2)
+        .find(|pair| pair[0] == "--theme")
+        .map_or(theme::AppTheme::AdwaitaDark, |pair| {
+            theme::AppTheme::from_str(&pair[1])
+        })
+}
+
 fn main() -> eframe::Result {
     eframe::run_native(
         "Argus overlay settings preview",
@@ -107,14 +117,7 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             cc.egui_ctx
                 .set_embed_viewports(std::env::args().any(|a| a == "--embedded"));
-            theme::apply_theme(
-                &cc.egui_ctx,
-                &if std::env::args().any(|a| a == "--light") {
-                    theme::AppTheme::AdwaitaLight
-                } else {
-                    theme::AppTheme::AdwaitaDark
-                },
-            );
+            theme::apply_theme(&cc.egui_ctx, &theme_arg());
             Ok(Box::new(Preview {
                 config: argus_ipc::OverlayConfig {
                     show_overlay: true,
