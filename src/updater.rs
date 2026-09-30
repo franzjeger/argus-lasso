@@ -6,12 +6,12 @@
 //! owned by root and is left to the package manager, which this module
 //! detects and reports rather than failing halfway through.
 //!
-//! Integrity: the release publishes a `.sha256` beside each tarball and the
-//! download is checked against it. That catches a truncated or corrupted
-//! transfer, not a compromised release — both files come from the same
-//! place. Real tamper-resistance needs a detached signature over the tarball
-//! with a key that does not live in the release; see the note in
-//! `docs/design-updates.md`.
+//! Integrity: the release publishes a `.sha256` and a minisign signature
+//! beside each tarball. The checksum catches a truncated or corrupted
+//! transfer; the signature is checked against the public key compiled into
+//! this build (`verify_signature`), so a tarball not signed with the release
+//! key is refused. The signature is only as safe as that key: it is held by
+//! the release workflow, see `docs/design-updates.md`.
 
 mod bundle;
 
@@ -356,9 +356,9 @@ fn install_blocking(update: &Update) -> Result<(), String> {
 /// byte-for-byte what the release key signed — they say nothing about
 /// *which* release that was. `latest_release()` takes the displayed
 /// `version` straight from the GitHub API's `tag_name`, which has no
-/// cryptographic link to the tarball's content. An attacker who compromises
-/// only release-upload access (a stolen PAT, not the offline minisign
-/// secret) can re-publish an old, genuinely-signed tarball — together with
+/// cryptographic link to the tarball's content. An attacker who can only
+/// upload release assets, without getting new content signed, can
+/// re-publish an old, genuinely-signed tarball — together with
 /// its own already-public `.sha256`/`.minisig`, no private key needed — under
 /// a fabricated newer tag, and every check above this one passes, because it
 /// really is validly signed, just for stale content. A rollback to old,
@@ -594,9 +594,10 @@ fn refresh_if_present(path: &Path, contents: &[u8], label: &str) -> Option<Strin
 
 /// Refresh the user-local files `make install` puts alongside the binary.
 ///
-/// Swapping the binary alone leaves the desktop entry, the systemd user unit
-/// and the icons frozen at whatever version first installed them, so a
-/// release that changes any of them silently does not take effect.
+/// Swapping the binary alone leaves the desktop entry and the icons frozen at
+/// whatever version first installed them, so a release that changes any of
+/// them silently does not take effect. The systemd user unit is left alone:
+/// it may carry the user's own customizations.
 ///
 /// Only files that already exist are rewritten. Creating missing ones would
 /// guess at a layout the user may not have — a distro package, a different
@@ -1096,8 +1097,8 @@ QtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfN
 
     #[test]
     fn prerelease_does_not_outrank_its_release() {
-        // "1.1.0-rc1" parses as 1.1.0.0 — equal to 1.1.0 on the first three
-        // components, so it must not be offered as an upgrade from 1.1.0.
+        // "1.1.0-rc1" is a prerelease of 1.1.0 and sorts below it, so it must
+        // not be offered as an upgrade from 1.1.0.
         assert!(!is_newer("1.1.0-rc1", "1.1.0"));
     }
 }

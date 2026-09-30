@@ -201,9 +201,10 @@ done
 "#;
 
 /// Three separate actions so an administrator can tighten one without losing
-/// the others. All default to `allow_active=yes` — no prompt for the user at
-/// the physical seat — which matches what the sudoers rule did, except the
-/// grant is now per operation and renice is confined to the caller's own
+/// the others. All default to `allow_active=yes`: no prompt for whoever is
+/// logged in at the physical seat, which is any local user, not only the one
+/// who installed the helpers (the sudoers rule this replaced was per-user).
+/// The grant is per operation, and renice is confined to the caller's own
 /// processes by the helper itself.
 fn policy_xml() -> String {
     let action = |id: &str, desc: &str, msg: &str, path: String| {
