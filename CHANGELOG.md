@@ -10,8 +10,52 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-09-30
+
+A Vulkan HUD for games, frame-time recording with A/B comparison, and signed
+updates that replace the app and the HUD together, with one-step rollback.
+Rules, ProBalance and Gaming Mode now reach every thread of a process and put
+back what they changed.
+
+**Upgrading from 1.3.1 or older:** releases are now signed with a new key, which
+the updater in those versions refuses. [Install this release by
+hand](https://github.com/franzjeger/argus-lasso/blob/v1.4.0/docs/installation.md#binary-archives)
+once; later updates work from the app again. Reinstall the CPU control helpers
+when the app asks, and the sensor service if you use it
+(`scripts/install-sensors.sh`), so their tighter permissions apply.
+
+### Security
+
+- The sensor service's CPU package power is readable by the installing user's group
+  only, not by every local user; the kernel keeps it root-only for a reason
+  (CVE-2020-8694). `install-sensors.sh` hands the program to root on stdin and
+  installs it only if its SHA-256 still matches, instead of having root copy it
+  from a user-writable build directory. Reinstall the sensor service to apply.
+- The CPU control helpers no longer run without a password for every local user:
+  their polkit actions ask for an administrator's password, and a polkit rule
+  installed with them exempts only the user who installed them, from an active
+  local session. The helpers are updated (v7) and ask to be reinstalled.
+- Installing the CPU control helpers no longer trusts files in the user's own
+  directories: the helper files travel inside the root command, and root checks
+  each against its SHA-256 before installing it. A file swapped while the polkit
+  prompt was open used to be installed, a FIFO or device node in its place could
+  hang root, and home directories with spaces or non-ASCII characters could not
+  install at all.
+- The optional sensor service runs in a tighter sandbox: no sockets or network,
+  no privileged or resource system calls, and no view of other processes. It needs
+  none of them, and as root they could reach the system bus if it were ever
+  compromised. `systemd-analyze security` rates it 0.7 instead of 3.5.
+- Without `$HOME`, the configuration no longer falls back to the shared `/tmp`,
+  where another user could create it first; the home directory comes from the
+  password database instead. Autostart and library scans no longer treat an
+  empty `$HOME` as the current directory. The single-instance lock never uses
+  the shared temp directory, and a lock that cannot be created is reported as
+  such rather than as "already running".
+
 ### Added
 
+- The installation guide shows how to check a release archive's checksum and
+  signature and install it by hand, which 1.3.1 and older need once to update.
 - `scripts/dev-layer.sh` builds the Vulkan layer and prints the environment that
   loads it from Cargo's actual target directory, for testing a layer from the tree
   without installing it.
@@ -45,18 +89,13 @@ current source, release and verification status, see [docs/status.md](docs/statu
   configured RAM speed, with system authentication from Gaming → Sensors.
 - Separate Gaming and Settings subsections, detached customization/detail windows,
   launcher/profile context, shared spacing and typography, and current guides/gallery.
-- Paired user installer and future release archives containing app/layer/helper;
+- Paired user installer and release archives containing app/layer/helper;
   workspace-wide build, lint, test and minimum-Rust checks.
 
 ### Fixed
 
 - The layer manifest written by `make install` names the build's IPC protocol
   (it said 5 after the move to 6), read from the build instead of written in.
-- The sensor service's CPU package power is readable by the installing user's group
-  only, not by every local user; the kernel keeps it root-only for a reason
-  (CVE-2020-8694). `install-sensors.sh` hands the program to root on stdin and
-  installs it only if its SHA-256 still matches, instead of having root copy it
-  from a user-writable build directory. Reinstall the sensor service to apply.
 - ProBalance's nice throttles are recorded like its unit throttles, so the next
   run puts them back after a crash or kill instead of leaving them for good.
 - A rule's I/O priority is put back per thread, as its nice value already was,
@@ -78,12 +117,6 @@ current source, release and verification status, see [docs/status.md](docs/statu
   open is no longer dropped with a note to pick it again. The open editor comes
   to the front, and the new rule opens as soon as it is saved or cancelled. A
   rule from a template is titled "New rule", not "Edit Rule".
-- Installing the CPU control helpers no longer trusts files in the user's own
-  directories: the helper files travel inside the root command, and root checks
-  each against its SHA-256 before installing it. A file swapped while the polkit
-  prompt was open used to be installed, a FIFO or device node in its place could
-  hang root, and home directories with spaces or non-ASCII characters could not
-  install at all.
 - Nice and I/O priority now reach every thread of a process, as affinity already
   did. Rules, ProBalance and the Gaming Mode boost previously changed only the
   main thread. The renice helper is updated (v5) and asks to be reinstalled.
@@ -110,12 +143,6 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Updates remove the staged apps and layer directories nothing refers to any more,
   keeping only the live layer and what one-step rollback restores. Previously
   every update, including a rejected one, left its files behind permanently.
-- Without `$HOME`, the configuration no longer falls back to the shared `/tmp`,
-  where another user could create it first; the home directory comes from the
-  password database instead. Autostart and library scans no longer treat an
-  empty `$HOME` as the current directory. The single-instance lock never uses
-  the shared temp directory, and a lock that cannot be created is reported as
-  such rather than as "already running".
 - Affinity, nice and I/O priority reach threads that a single `/proc` thread
   listing skips while a program starts or ends other threads.
 - Recording files are read only if they are regular files, opened without
@@ -243,10 +270,6 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Recover Wine/Proton process names from unambiguous mapped executables when
   games clear their name and command line (including The Last of Us Part II).
   Refresh cached identities after renames and periodically after startup.
-- Completed the shared process-string and reusable snapshot migration across
-  the GUI, JSON exports and read-only preview so the workspace builds again.
-- Restored independent one-second sensor sampling and the existing weighted CPU
-  readings for overlay telemetry after the performance refactor.
 - Sensor sparklines iterate the ring buffer directly without temporary history
   or point vectors; history order is tested across repeated wraps.
 - CLI overlay toggles use separate queued requests, preserving rapid/concurrent
@@ -354,10 +377,6 @@ current source, release and verification status, see [docs/status.md](docs/statu
   is reported and set aside rather than taken as absent and replaced with
   defaults. The old `process-lasso-rs` configuration is migrated once, atomically,
   and never again over a newer one; `--ui-tour` no longer migrates it.
-- The optional sensor service runs in a tighter sandbox: no sockets or network,
-  no privileged or resource system calls, and no view of other processes. It needs
-  none of them, and as root they could reach the system bus if it were ever
-  compromised. `systemd-analyze security` rates it 0.7 instead of 3.5.
 - `make uninstall` also removes the update backups, the rollback record and the
   autostart entry, and prints the commands to remove the system-wide CPU control
   helpers when they are installed; they still granted their actions afterwards.
@@ -375,10 +394,6 @@ current source, release and verification status, see [docs/status.md](docs/statu
   or scRGB), where its sRGB colours meant up to thousands of nits. It is also left
   off swapchains whose images may have no memory yet or whose image views would
   inherit a storage usage their format does not support.
-- The CPU control helpers no longer run without a password for every local user:
-  their polkit actions ask for an administrator's password, and a polkit rule
-  installed with them exempts only the user who installed them, from an active
-  local session. The helpers are updated (v7) and ask to be reinstalled.
 
 ### Changed
 
@@ -734,7 +749,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 - Virtualized the process table; dropped per-frame clones and sysfs reads.
 
-[Unreleased]: https://github.com/franzjeger/argus-lasso/compare/v1.3.1...HEAD
+[Unreleased]: https://github.com/franzjeger/argus-lasso/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/franzjeger/argus-lasso/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/franzjeger/argus-lasso/compare/v1.3.0...v1.3.1
 [1.2.0]: https://github.com/franzjeger/argus-lasso/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/franzjeger/argus-lasso/compare/v1.0.9...v1.1.0
