@@ -270,6 +270,41 @@ current source, release and verification status, see [docs/status.md](docs/statu
   different scale.
 - A process's details window closes when the process exits even if its PID is
   reused at once, instead of showing the new process under the old one's name.
+- ProBalance never lowers a process's nice value: a CPU hog already at nice 19 was
+  "throttled" to the floor of 15, that is, given more CPU, or retried every second
+  when that was refused. A nice throttle is put back only while the process still
+  has the value ProBalance set, so a manual change made meanwhile (which also
+  exempts the process) or a rule's is no longer undone.
+- Stopping Argus with `systemctl --user stop`, logging out or Ctrl+C now restores
+  parked CPUs, ProBalance throttles and Gaming Mode nices, as quitting from the
+  window or tray does. The process died at once on those signals, leaving CPUs
+  offline system-wide. Unparking now comes first and the restore gets up to 10 s.
+- A rule that sets a process's nice value takes it over from ProBalance: the rule
+  now records the value from before ProBalance's throttle as the one to put back,
+  and ProBalance leaves processes whose nice a rule sets alone. Deleting such a
+  rule left the process at the throttle value for good.
+- Gaming Mode puts back what it changed on each process when it ends: the
+  preferred-core pin stayed after Gaming Mode was off, and its -1 nice was
+  restored even over a change made since. It changes only what no rule sets (a
+  rule's nice or affinity used to be overridden until the next pass), only ever
+  raises priority, and also boosts the detected game and processes already
+  running when it is turned on, not only processes started afterwards.
+- "Restore all CPU assignments" restores the processes Argus changed, to what
+  they had before. It reset every process ever seen, pinning those first seen
+  while CPUs were parked to the CPUs online then.
+- Turning Gaming Mode off while a detected game runs keeps it off until the game
+  exits, instead of auto-detection turning it (and CPU parking) back on within a
+  second.
+- Putting back a nice value (a rule undone, a ProBalance throttle or Gaming Mode's
+  boost ending) restores each thread to its own value. All threads were set to the
+  main thread's, raising the priority of threads a process had lowered itself,
+  such as a browser's background threads.
+- Clearing the default affinity also releases processes that inherited it from a
+  process it had pinned; they had the mask from the start, so nothing recorded
+  them and they stayed pinned.
+- A ProBalance cgroup throttle whose systemctl call timed out keeps its record of
+  the unit's original CPU policy, so it is put back if the change landed anyway.
+  Forgetting it let a later throttle record the throttled weight as the original.
 
 ### Changed
 

@@ -323,27 +323,70 @@ fn set_every_thread(
 
 // ── nice ──────────────────────────────────────────────────────────────────────
 
+/// Set one thread's nice value.
+fn set_thread_nice(tid: u32, nice: i32) -> std::io::Result<()> {
+    use nix::libc;
+    // Unlike getpriority(2), whose -1 is ambiguous with a legitimate return
+    // value of -1, setpriority(2) unambiguously returns 0 on success and -1
+    // (with errno set) on failure — no errno-clearing dance needed first.
+    //
+    // SAFETY: only plain integers cross the FFI boundary; no pointers or
+    // lifetimes are involved.
+    let res =
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice as libc::c_int) };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Every thread's nice value, to put back as it was. A process's threads
+/// can differ (browsers lower their background threads), and restoring them
+/// all to the main thread's value raised those.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadNices {
+    main: i32,
+    threads: HashMap<u32, i32>,
+}
+
+impl ThreadNices {
+    pub fn read(pid: u32) -> Option<Self> {
+        let main = get_nice(pid)?;
+        let mut threads = HashMap::new();
+        for_each_thread(pid, |tid| {
+            if let Some(nice) = get_nice(tid) {
+                threads.insert(tid, nice);
+            }
+        });
+        Some(Self { main, threads })
+    }
+
+    /// Every thread at `nice`, for when the threads were not read.
+    pub fn uniform(nice: i32) -> Self {
+        Self {
+            main: nice,
+            threads: HashMap::new(),
+        }
+    }
+
+    pub fn main(&self) -> i32 {
+        self.main
+    }
+
+    /// Put each thread back to its value; a thread started since gets the
+    /// main thread's.
+    pub fn restore(&self, pid: u32) -> std::io::Result<()> {
+        set_every_thread(pid, "setpriority", |tid| {
+            set_thread_nice(tid, *self.threads.get(&tid).unwrap_or(&self.main))
+        })
+    }
+}
+
 /// Set the nice value of every thread of `pid` via the `setpriority` syscall.
 /// Lowering it (raising priority) is limited by RLIMIT_NICE / CAP_SYS_NICE.
 pub fn set_nice(pid: u32, nice: i32) -> std::io::Result<()> {
-    use nix::libc;
-    let result = set_every_thread(pid, "setpriority", |tid| {
-        // Unlike getpriority(2), whose -1 is ambiguous with a legitimate
-        // return value of -1, setpriority(2) unambiguously returns 0 on
-        // success and -1 (with errno set) on failure — no errno-clearing
-        // dance needed first.
-        //
-        // SAFETY: only plain integers cross the FFI boundary; no pointers or
-        // lifetimes are involved.
-        let res = unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, nice as libc::c_int)
-        };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    });
+    let result = set_every_thread(pid, "setpriority", |tid| set_thread_nice(tid, nice));
     match &result {
         Ok(()) => log::debug!("setpriority pid={pid} nice={nice}: OK"),
         Err(err) => log::warn!("setpriority pid={pid} nice={nice} failed: {err}"),
@@ -785,9 +828,9 @@ fn csv_field(s: &str) -> String {
 }
 
 /// Guards tests (here and in cpu_park.rs/rules.rs) that change this test
-/// binary's own process-wide nice value via a real setpriority(2) syscall.
-/// PRIO_PROCESS affects every thread in the process, and the default test
-/// harness runs all tests as threads in one process — two such tests
+/// binary's own nice value via real setpriority(2) calls. set_nice reaches
+/// every thread (PRIO_PROCESS itself names a single thread), and the default
+/// test harness runs all tests as threads in one process — two such tests
 /// running concurrently race on the same live value otherwise. Take this
 /// lock for the duration of any test that actually renices its own pid.
 #[cfg(test)]

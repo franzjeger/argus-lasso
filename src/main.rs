@@ -445,6 +445,15 @@ fn main() {
         None => None,
     };
 
+    // Termination signals are taken by one thread, below: blocked here,
+    // before any other thread starts, so every thread inherits the mask.
+    let stop_signals = stop_signal_set();
+    if args.ui_tour.is_none() {
+        if let Err(e) = stop_signals.thread_block() {
+            eprintln!("Warning: could not take termination signals ({e}); stopping the service will not restore CPUs and priorities.");
+        }
+    }
+
     // Build shared state
     let state = Arc::new(Mutex::new(monitor::AppState::default()));
     {
@@ -483,6 +492,15 @@ fn main() {
             Arc::clone(&gui_context),
         )
     };
+
+    if args.ui_tour.is_none() {
+        spawn_stop_signal_handler(
+            stop_signals,
+            Arc::clone(&state),
+            cmd_tx.clone(),
+            Arc::clone(&gui_context),
+        );
+    }
 
     // System tray via D-Bus StatusNotifierItem (KDE/freedesktop, no libxdo).
     // Spawned after state + cmd_tx exist so the menu can read/toggle gaming mode.
@@ -577,6 +595,60 @@ fn main() {
     // image mid-restore.
     if !monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2)) {
         log::warn!("daemon thread did not finish within 2s of exit; it may be stuck mid-restore");
+    }
+}
+
+/// SIGTERM (systemctl stop, logout), SIGINT (Ctrl+C) and SIGHUP (the
+/// terminal going away).
+fn stop_signal_set() -> nix::sys::signal::SigSet {
+    use nix::sys::signal::{SigSet, Signal};
+    let mut set = SigSet::empty();
+    for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP] {
+        set.add(signal);
+    }
+    set
+}
+
+/// Stop the way the tray's Quit does when a termination signal arrives,
+/// instead of dying with CPUs parked and priorities changed: the window
+/// closes, flushes its settings and has the monitor restore everything.
+/// If the window cannot (not created yet, or stuck), the restore is done
+/// from here and the process exits.
+fn spawn_stop_signal_handler(
+    signals: nix::sys::signal::SigSet,
+    state: Arc<Mutex<monitor::AppState>>,
+    cmd_tx: crossbeam_channel::Sender<monitor::DaemonCmd>,
+    context: gui::SharedContext,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("stop-signals".into())
+        .spawn(move || {
+            let Ok(signal) = signals.wait() else {
+                return;
+            };
+            log::info!("{signal:?} received; restoring state and exiting");
+            if let Ok(mut s) = state.lock() {
+                s.quit_requested = true;
+            }
+            let window = context.lock().ok().and_then(|context| context.clone());
+            if let Some(ctx) = window {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                ctx.request_repaint();
+                // The window's exit restores state; the process ends when
+                // it is done. Step in only if that does not happen.
+                let restored = || state.lock().map(|s| s.shutdown_complete).unwrap_or(true);
+                for _ in 0..150 {
+                    if restored() {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            monitor::shutdown_and_wait(&state, &cmd_tx);
+            std::process::exit(0);
+        });
+    if let Err(e) = spawned {
+        eprintln!("Warning: no termination signal handler ({e}).");
     }
 }
 

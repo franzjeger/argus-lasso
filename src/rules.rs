@@ -231,17 +231,13 @@ impl RuleEngine {
     pub fn to_config_list(&self) -> Vec<RuleConfig> {
         self.rules.iter().map(|r| r.to_config()).collect()
     }
-
-    /// Returns true if any enabled rule matches this process name — independent
-    /// of whether applying it would change anything right now. Callers deciding
-    /// between "rule-managed" and "apply default affinity" must use this, not
-    /// the action list from apply_rules (an already-correct process yields no
-    /// actions but is still rule-managed).
-    pub fn matches_any(&self, proc_name: &str) -> bool {
-        any_matches(&self.rules, proc_name)
-    }
 }
 
+/// Whether any enabled rule matches this process name — independent of
+/// whether applying it would change anything right now. Callers deciding
+/// between "rule-managed" and "apply default affinity" must use this, not
+/// the action list from apply_rules (an already-correct process yields no
+/// actions but is still rule-managed).
 pub fn any_matches(rules: &[Rule], proc_name: &str) -> bool {
     let lower = proc_name.to_lowercase();
     rules.iter().any(|r| r.matches(proc_name, &lower))
@@ -351,31 +347,50 @@ pub struct Target<'a> {
     /// Tells the process a change was made to from a later one given its PID.
     pub start_ticks: u64,
     pub name: &'a str,
+    /// The parent's PID, whose affinity a new process starts with.
+    pub ppid: u32,
     pub nice: Option<i32>,
+    /// The nice the process's threads had before another part of Argus
+    /// (ProBalance) changed it. A rule that takes the value over records
+    /// this as what to put back, not the other part's temporary value.
+    pub held_nice: Option<&'a utils::ThreadNices>,
 }
 
-/// A value enforcement set, what the process had before, and who set it
-/// (the log prefix, such as `[Rule:games]` or `[Default]`).
+/// Who a recorded change belongs to, and so what puts it back: rules (and
+/// the default affinity) when no rule asks for the value any more, Gaming
+/// Mode when it ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    Rules,
+    Gaming,
+}
+
+/// A value Argus set, what the process had before, and who set it (the log
+/// prefix, such as `[Rule:games]` or `[Default]`, and the owner).
 #[derive(Debug)]
-struct Undo<T> {
-    original: T,
+struct Undo<T, O = T> {
+    original: O,
     applied: T,
     by: String,
+    owner: Owner,
 }
 
-impl<T> Undo<T> {
-    /// Keep the first original through later changes.
-    fn record(slot: &mut Option<Self>, original: T, applied: T, by: String) {
+impl<T, O> Undo<T, O> {
+    /// Keep the first original through later changes; the latest change
+    /// owns the value.
+    fn record(slot: &mut Option<Self>, original: O, applied: T, by: String, owner: Owner) {
         match slot {
             Some(undo) => {
                 undo.applied = applied;
                 undo.by = by;
+                undo.owner = owner;
             }
             None => {
                 *slot = Some(Undo {
                     original,
                     applied,
                     by,
+                    owner,
                 })
             }
         }
@@ -386,7 +401,8 @@ impl<T> Undo<T> {
 struct Changes {
     start_ticks: u64,
     affinity: Option<Undo<String>>,
-    nice: Option<Undo<i32>>,
+    /// Each thread's value from before, since they can differ.
+    nice: Option<Undo<i32, utils::ThreadNices>>,
     ionice: Option<Undo<(i32, i32)>>,
 }
 
@@ -442,20 +458,22 @@ impl RuleState {
             .filter(|changes| changes.start_ticks == target.start_ticks)
     }
 
-    /// Take a recorded change to undo it, without creating a record.
-    fn take<T>(
+    /// Take `owner`'s recorded change to undo it, without creating a record.
+    fn take<T, O>(
         &mut self,
         target: Target,
-        slot: fn(&mut Changes) -> &mut Option<Undo<T>>,
-    ) -> Option<Undo<T>> {
+        slot: fn(&mut Changes) -> &mut Option<Undo<T, O>>,
+        owner: Owner,
+    ) -> Option<Undo<T, O>> {
         let changes = self.changes.get_mut(&target.pid)?;
-        (changes.start_ticks == target.start_ticks)
-            .then(|| slot(changes).take())
-            .flatten()
+        if changes.start_ticks != target.start_ticks {
+            return None;
+        }
+        slot(changes).take_if(|undo| undo.owner == owner)
     }
 
     /// Set `affinity` on a process if it differs, remembering what it had.
-    fn set_affinity(&mut self, target: Target, affinity: &str, by: String) -> bool {
+    fn set_affinity(&mut self, target: Target, affinity: &str, by: String, owner: Owner) -> bool {
         let original = match self.recorded(target).and_then(|c| c.affinity.as_ref()) {
             Some(undo) => undo.original.clone(),
             None => utils::get_affinity_to_restore(target.pid),
@@ -463,9 +481,76 @@ impl RuleState {
         let changed = utils::set_affinity_if_changed(target.pid, affinity);
         if changed {
             let slot = &mut self.changes(target).affinity;
-            Undo::record(slot, original, affinity.to_string(), by);
+            Undo::record(slot, original, affinity.to_string(), by, owner);
         }
         changed
+    }
+
+    /// Gaming Mode moved a process to the preferred cores.
+    pub fn gaming_pin(&mut self, target: Target, cpulist: &str) -> bool {
+        self.set_affinity(target, cpulist, "[Gaming Mode]".into(), Owner::Gaming)
+    }
+
+    /// Gaming Mode raised a process's priority from `original` to `applied`.
+    pub fn record_gaming_nice(
+        &mut self,
+        target: Target,
+        original: utils::ThreadNices,
+        applied: i32,
+    ) {
+        let slot = &mut self.changes(target).nice;
+        Undo::record(
+            slot,
+            original,
+            applied,
+            "[Gaming Mode]".into(),
+            Owner::Gaming,
+        );
+    }
+
+    /// Put back what `owner` changed, on every process, where the value is
+    /// still the one it set. Returns how many values were put back.
+    pub fn end(&mut self, owner: Owner, log: &impl Fn(String)) -> usize {
+        let mut restored = 0;
+        for (&pid, changes) in self.changes.iter_mut() {
+            if let Some(undo) = changes.affinity.take_if(|undo| undo.owner == owner) {
+                if utils::affinity_matches(pid, &undo.applied)
+                    && utils::set_affinity(pid, &undo.original).is_ok()
+                {
+                    restored += 1;
+                }
+            }
+            if let Some(undo) = changes.nice.take_if(|undo| undo.owner == owner) {
+                if utils::get_nice(pid) == Some(undo.applied) && undo.original.restore(pid).is_ok()
+                {
+                    restored += 1;
+                }
+            }
+        }
+        self.changes.retain(|_, changes| !changes.is_empty());
+        if restored > 0 {
+            let who = match owner {
+                Owner::Rules => "[Rules]",
+                Owner::Gaming => "[Gaming Mode]",
+            };
+            log(format!("{who} Restored {restored} values it had set."));
+        }
+        restored
+    }
+
+    /// Put back every affinity Argus set, as asked by "Restore all CPU
+    /// assignments": whatever still asks for it applies it again.
+    pub fn restore_all_affinities(&mut self) -> usize {
+        let mut restored = 0;
+        for (&pid, changes) in self.changes.iter_mut() {
+            if let Some(undo) = changes.affinity.take() {
+                if utils::set_affinity(pid, &undo.original).is_ok() {
+                    restored += 1;
+                }
+            }
+        }
+        self.changes.retain(|_, changes| !changes.is_empty());
+        restored
     }
 
     /// Apply the default affinity to a process no rule matches.
@@ -475,12 +560,34 @@ impl RuleState {
         affinity: &str,
         log: &impl Fn(String),
     ) {
-        if self.set_affinity(target, affinity, "[Default]".into()) {
+        if self.set_affinity(target, affinity, "[Default]".into(), Owner::Rules) {
             log(format!(
                 "[Default] affinity={affinity} → {}({})",
                 target.name, target.pid
             ));
+        } else if let Some(original) = self.inherited(target, affinity) {
+            // Started by a process Argus pinned, it has the mask already;
+            // without a record, clearing the default would leave it pinned.
+            let slot = &mut self.changes(target).affinity;
+            Undo::record(
+                slot,
+                original,
+                affinity.to_string(),
+                "[Default]".into(),
+                Owner::Rules,
+            );
         }
+    }
+
+    /// The parent's original affinity, when a process without a record of
+    /// its own has `affinity` because its parent was given it.
+    fn inherited(&self, target: Target, affinity: &str) -> Option<String> {
+        if self.recorded(target).is_some_and(|c| c.affinity.is_some()) {
+            return None;
+        }
+        let parent = self.changes.get(&target.ppid)?.affinity.as_ref()?;
+        (parent.applied == affinity && utils::affinity_matches(target.pid, affinity))
+            .then(|| parent.original.clone())
     }
 
     /// Drop a process's record once nothing is left to undo.
@@ -527,12 +634,12 @@ pub fn apply_rules(
     if let Some(rule) = last_setting(|r| r.affinity.is_some()) {
         let aff = rule.affinity.as_deref().unwrap_or_default();
         let by = format!("[Rule:{}]", rule.name);
-        if state.set_affinity(target, aff, by.clone()) {
+        if state.set_affinity(target, aff, by.clone(), Owner::Rules) {
             report(format!("{by} Set affinity={aff} on {name}({pid})"));
         }
     } else if effect.matches.is_empty() && policy.default_affinity.is_some() {
         // The default's to keep; it is applied to new processes only.
-    } else if let Some(undo) = state.take(target, |c| &mut c.affinity) {
+    } else if let Some(undo) = state.take(target, |c| &mut c.affinity, Owner::Rules) {
         if utils::affinity_matches(pid, &undo.applied) {
             let (value, by) = (&undo.original, &undo.by);
             report(match utils::set_affinity(pid, value) {
@@ -552,12 +659,17 @@ pub fn apply_rules(
             attr: Attr::Nice,
         };
         if target.nice != Some(nice) && !state.failed.contains(&key) {
+            let before = target
+                .held_nice
+                .cloned()
+                .or_else(|| utils::ThreadNices::read(pid));
             match utils::set_nice(pid, nice) {
                 Ok(()) => {
                     let by = format!("[Rule:{}]", rule.name);
                     report(format!("{by} Set nice={nice} on {name}({pid})"));
-                    if let Some(original) = target.nice {
-                        Undo::record(&mut state.changes(target).nice, original, nice, by);
+                    if let Some(original) = before {
+                        let slot = &mut state.changes(target).nice;
+                        Undo::record(slot, original, nice, by, Owner::Rules);
                     }
                 }
                 Err(e) => {
@@ -569,10 +681,10 @@ pub fn apply_rules(
                 }
             }
         }
-    } else if let Some(undo) = state.take(target, |c| &mut c.nice) {
+    } else if let Some(undo) = state.take(target, |c| &mut c.nice, Owner::Rules) {
         if target.nice == Some(undo.applied) {
-            let (value, by) = (undo.original, &undo.by);
-            report(match utils::set_nice(pid, value) {
+            let (value, by) = (undo.original.main(), &undo.by);
+            report(match undo.original.restore(pid) {
                 Ok(()) => format!("{by} Restored nice={value} on {name}({pid})"),
                 Err(e) => format!("{by} Restoring nice={value} FAILED for {name}({pid}): {e}"),
             });
@@ -600,7 +712,8 @@ pub fn apply_rules(
                         "{by} Set ionice class={class} level={level} on {name}({pid})"
                     ));
                     if let Some(original) = current {
-                        Undo::record(&mut state.changes(target).ionice, original, wanted, by);
+                        let slot = &mut state.changes(target).ionice;
+                        Undo::record(slot, original, wanted, by, Owner::Rules);
                     }
                 }
                 Err(e) => {
@@ -612,7 +725,7 @@ pub fn apply_rules(
                 }
             }
         }
-    } else if let Some(undo) = state.take(target, |c| &mut c.ionice) {
+    } else if let Some(undo) = state.take(target, |c| &mut c.ionice, Owner::Rules) {
         if current_ionice().is_some_and(|c| ionice_reached(c, undo.applied)) {
             let ((class, level), by) = (undo.original, &undo.by);
             report(match utils::set_ionice(pid, class, Some(level)) {
@@ -696,7 +809,9 @@ mod tests {
             pid,
             start_ticks: 0,
             name,
+            ppid: 0,
             nice,
+            held_nice: None,
         }
     }
 
@@ -1184,5 +1299,192 @@ mod tests {
         rule.pattern = "ok".into();
         rule.refresh_pattern_caches();
         assert_eq!(rule.pattern_error(), None);
+    }
+
+    /// A rule taking over the nice of a process ProBalance had throttled
+    /// recorded the throttle value as the original, so deleting the rule
+    /// left the process throttled for good.
+    #[test]
+    fn a_rule_puts_back_the_value_from_before_a_throttle() {
+        let sleeper = Sleeper::spawn();
+        let pid = sleeper.0.id();
+        // The throttle; then a rule; all raising, so no privilege is needed.
+        utils::set_nice(pid, 10).unwrap();
+        let mut rule = rule_with("argus-undo-test", MatchType::Exact);
+        rule.nice = Some(12);
+        let mut rules = [rule];
+        let mut state = RuleState::default();
+        let mut target = sleeper.target();
+        let held = utils::ThreadNices::uniform(13);
+        target.held_nice = Some(&held);
+        let read = || None;
+        apply_rules(&only(&rules), target, read, &mut state, &|_| {});
+        assert_eq!(utils::get_nice(pid), Some(12));
+
+        rules[0].enabled = false;
+        sleeper.enforce(&only(&rules), &mut state);
+        assert_eq!(utils::get_nice(pid), Some(13), "not the throttle's 10");
+    }
+
+    /// Gaming Mode's preferred-core pin was never undone, and rule
+    /// enforcement must not take it for its own and undo it either.
+    #[test]
+    fn gaming_mode_puts_back_its_own_changes_when_it_ends() {
+        let sleeper = Sleeper::spawn();
+        let pid = sleeper.0.id();
+        let affinity = utils::get_affinity_str(pid);
+        let cpus = utils::cpulist_to_set(&affinity).unwrap();
+        let Some(cpu) = cpus.iter().min().filter(|_| cpus.len() > 1) else {
+            eprintln!("needs two CPUs to change affinity");
+            return;
+        };
+        let mut state = RuleState::default();
+        assert!(state.gaming_pin(sleeper.target(), &cpu.to_string()));
+        // A matching rule that sets something else leaves the pin alone.
+        let mut rule = rule_with("argus-undo-test", MatchType::Exact);
+        rule.ionice_class = Some(2);
+        rule.ionice_level = Some(7);
+        sleeper.enforce(&only(&[rule]), &mut state);
+        assert_eq!(utils::get_affinity_str(pid), cpu.to_string());
+
+        // A nice Gaming Mode raised (simulated with a raise from 10 to 12
+        // being "put back", so no privilege is needed).
+        utils::set_nice(pid, 10).unwrap();
+        state.record_gaming_nice(sleeper.target(), utils::ThreadNices::uniform(12), 10);
+
+        assert_eq!(state.end(Owner::Gaming, &|_| {}), 2);
+        assert_eq!(utils::get_affinity_str(pid), affinity);
+        assert_eq!(utils::get_nice(pid), Some(12));
+        assert!(state.has_changes(), "the rule's I/O priority is the rule's");
+        assert_eq!(utils::get_ionice_raw(pid), Some((2, 7)));
+    }
+
+    /// Gaming Mode's nice used to be put back unconditionally, over a
+    /// manual change made since.
+    #[test]
+    fn gaming_mode_leaves_a_value_changed_since() {
+        let sleeper = Sleeper::spawn();
+        let pid = sleeper.0.id();
+        utils::set_nice(pid, 10).unwrap();
+        let mut state = RuleState::default();
+        state.record_gaming_nice(sleeper.target(), utils::ThreadNices::uniform(12), 10);
+        utils::set_nice(pid, 15).unwrap();
+        assert_eq!(state.end(Owner::Gaming, &|_| {}), 0);
+        assert_eq!(utils::get_nice(pid), Some(15));
+    }
+
+    /// "Restore all CPU assignments" puts back what Argus set, and only that.
+    #[test]
+    fn restoring_all_affinities_touches_only_what_argus_changed() {
+        let changed = Sleeper::spawn();
+        let untouched = Sleeper::spawn();
+        let affinity = utils::get_affinity_str(changed.0.id());
+        let cpus = utils::cpulist_to_set(&affinity).unwrap();
+        let Some(cpu) = cpus.iter().min().filter(|_| cpus.len() > 1) else {
+            eprintln!("needs two CPUs to change affinity");
+            return;
+        };
+        let cpu = cpu.to_string();
+        utils::set_affinity(untouched.0.id(), &cpu).unwrap();
+        let mut state = RuleState::default();
+        state.apply_default_affinity(changed.target(), &cpu, &|_| {});
+
+        assert_eq!(state.restore_all_affinities(), 1);
+        assert_eq!(utils::get_affinity_str(changed.0.id()), affinity);
+        assert_eq!(
+            utils::get_affinity_str(untouched.0.id()),
+            cpu,
+            "not Argus's to reset"
+        );
+    }
+
+    /// Every restore used to set all threads to the main thread's original,
+    /// raising the priority of threads the process had lowered itself.
+    #[test]
+    fn undoing_a_rule_puts_each_thread_back_to_its_own_nice() {
+        // A child process with a worker thread niced above the main one:
+        // python can set a thread's nice through its TID.
+        let script = "import os,threading,time\n\
+            def w():\n    os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10); time.sleep(30)\n\
+            threading.Thread(target=w).start(); time.sleep(30)\n";
+        let Ok(mut child) = std::process::Command::new("python3")
+            .args(["-c", script])
+            .spawn()
+        else {
+            eprintln!("needs python3");
+            return;
+        };
+        let pid = child.id();
+        let thread_nices = || {
+            let mut nices: Vec<i32> = utils::get_tids(pid)
+                .into_iter()
+                .filter_map(utils::get_nice)
+                .collect();
+            nices.sort();
+            nices
+        };
+        // The child starts at this test binary's nice, which other tests
+        // raise; its worker lowers itself to 10.
+        let base = utils::get_nice(pid).unwrap_or(0);
+        if base >= 10 {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("needs the test process below nice 10");
+            return;
+        }
+        // Until python has started the thread and lowered it.
+        for _ in 0..100 {
+            if thread_nices() == [base, 10] {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let before = thread_nices();
+        let mut rule = rule_with("argus-thread-test", MatchType::Exact);
+        rule.nice = Some(12);
+        let mut rules = [rule];
+        let mut state = RuleState::default();
+        let target = process(pid, "argus-thread-test", utils::get_nice(pid));
+        apply_rules(&only(&rules), target, || None, &mut state, &|_| {});
+        let during = thread_nices();
+        rules[0].enabled = false;
+        let target = process(pid, "argus-thread-test", utils::get_nice(pid));
+        apply_rules(&only(&rules), target, || None, &mut state, &|_| {});
+        let after = thread_nices();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(before, [base, 10], "the setup");
+        assert_eq!(during, [12, 12]);
+        // Needs lowering 12 back to base and 10, allowed where RLIMIT_NICE is.
+        if after != [12, 12] {
+            assert_eq!(after, before);
+        }
+    }
+
+    /// A process started by one the default affinity had pinned has the mask
+    /// already, so nothing was recorded and clearing the default left it
+    /// pinned.
+    #[test]
+    fn an_inherited_default_affinity_is_released_with_the_default() {
+        let parent = Sleeper::spawn();
+        let child = Sleeper::spawn();
+        let affinity = utils::get_affinity_str(parent.0.id());
+        let cpus = utils::cpulist_to_set(&affinity).unwrap();
+        let Some(cpu) = cpus.iter().min().filter(|_| cpus.len() > 1) else {
+            eprintln!("needs two CPUs to change affinity");
+            return;
+        };
+        let cpu = cpu.to_string();
+        let mut state = RuleState::default();
+        state.apply_default_affinity(parent.target(), &cpu, &|_| {});
+        // As if inherited from the pinned parent.
+        utils::set_affinity(child.0.id(), &cpu).unwrap();
+        let mut target = child.target();
+        target.ppid = parent.0.id();
+        state.apply_default_affinity(target, &cpu, &|_| {});
+
+        child.enforce(&only(&[]), &mut state);
+        assert_eq!(utils::get_affinity_str(child.0.id()), affinity);
     }
 }
