@@ -170,6 +170,15 @@ current source, release and verification status, see [docs/status.md](docs/statu
   with the newest as A. Proton and Wine recordings are named after the game's
   Windows program instead of `wine64-preloader`. "Stop recording" no longer
   starts a new recording when the last one has just run out.
+- ProBalance's cgroup method works with a hard quota on desktops where the cpu
+  controller is not enabled for the app slice: the original quota is read from
+  systemd instead of a `cpu.max` file that does not exist there. A throttle
+  never gives a unit more CPU (an `idle` weight or a lower quota stays), a
+  closed app's unit is no longer retried every second forever, and throttles
+  left by a crash or kill are restored by the next run instead of being taken
+  for the units' own settings. Only application and background units are
+  throttled, never the desktop's own session services, and only the unit that
+  owns the process's cgroup. `systemctl` calls time out after 5 seconds.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

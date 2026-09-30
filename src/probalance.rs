@@ -196,7 +196,16 @@ pub struct ProBalance {
     cgroup_failed_units: std::collections::HashSet<String>,
     /// PIDs logged as un-throttleable under method="cgroup" (log once)
     cgroup_failed_pids: std::collections::HashSet<u32>,
+    /// Where the unit throttles are recorded (see `with_journal`).
+    journal: Option<std::path::PathBuf>,
     log_callback: Option<Box<dyn Fn(String) + Send>>,
+}
+
+/// Where the daemon records unit throttles: the runtime directory, which
+/// lives exactly as long as systemd's `--runtime` properties do.
+pub fn journal_path() -> Option<std::path::PathBuf> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
+    Some(std::path::PathBuf::from(runtime).join("argus-lasso/cgroup-throttles.json"))
 }
 
 impl ProBalance {
@@ -208,7 +217,41 @@ impl ProBalance {
             unit_refs: HashMap::new(),
             cgroup_failed_units: std::collections::HashSet::new(),
             cgroup_failed_pids: std::collections::HashSet::new(),
+            journal: None,
             log_callback: None,
+        }
+    }
+
+    /// Record unit throttles in `path` as they are made, and take over the
+    /// ones a previous run left there. A throttle outlives a crash or kill
+    /// (systemd keeps the property until logout), and a later run would
+    /// otherwise read the throttled weight as the unit's own and never put
+    /// the real one back. Taken-over throttles are restored on the first
+    /// tick, like any restore that failed.
+    pub fn with_journal(mut self, path: Option<std::path::PathBuf>) -> Self {
+        if let Some(path) = &path {
+            let left: HashMap<String, crate::cgroup::CpuPolicy> =
+                crate::cgroup::read_json_capped(path).unwrap_or_default();
+            for (unit, original) in left {
+                self.unit_refs
+                    .insert(unit, UnitThrottle { count: 0, original });
+            }
+        }
+        self.journal = path;
+        self
+    }
+
+    fn save_journal(&self) {
+        let Some(path) = &self.journal else {
+            return;
+        };
+        let originals: HashMap<&String, &crate::cgroup::CpuPolicy> = self
+            .unit_refs
+            .iter()
+            .map(|(unit, t)| (unit, &t.original))
+            .collect();
+        if let Err(e) = crate::cgroup::write_json_private(path, &originals) {
+            log::warn!("cannot record cgroup throttles in {}: {e}", path.display());
         }
     }
 
@@ -293,18 +336,22 @@ impl ProBalance {
         t.count = t.count.saturating_sub(1);
         if t.count == 0 {
             let original = t.original.clone();
-            if crate::cgroup::restore_unit(unit, &original) {
-                self.unit_refs.remove(unit);
-                logs.push(format!(
-                    "[ProBalance] RESTORE ({reason}) unit {unit} CPUWeight→{}",
-                    original
-                        .weight
-                        .map_or("default".to_string(), |w| w.to_string())
-                ));
-            } else {
-                logs.push(format!(
+            match crate::cgroup::restore_unit(unit, &original) {
+                crate::cgroup::Restore::Done => {
+                    self.unit_refs.remove(unit);
+                    self.save_journal();
+                    logs.push(format!(
+                        "[ProBalance] RESTORE ({reason}) unit {unit} {original}"
+                    ));
+                }
+                // The app closed and systemd removed its scope.
+                crate::cgroup::Restore::Gone => {
+                    self.unit_refs.remove(unit);
+                    self.save_journal();
+                }
+                crate::cgroup::Restore::Failed => logs.push(format!(
                     "[ProBalance] RESTORE ({reason}) unit {unit} FAILED — will retry"
-                ));
+                )),
             }
         }
     }
@@ -321,9 +368,19 @@ impl ProBalance {
             let Some(original) = self.unit_refs.get(&unit).map(|t| t.original.clone()) else {
                 continue;
             };
-            if crate::cgroup::restore_unit(&unit, &original) {
-                self.unit_refs.remove(&unit);
-                logs.push(format!("[ProBalance] RESTORE (retry) unit {unit}"));
+            match crate::cgroup::restore_unit(&unit, &original) {
+                crate::cgroup::Restore::Done => {
+                    self.unit_refs.remove(&unit);
+                    self.save_journal();
+                    logs.push(format!(
+                        "[ProBalance] RESTORE (retry) unit {unit} {original}"
+                    ));
+                }
+                crate::cgroup::Restore::Gone => {
+                    self.unit_refs.remove(&unit);
+                    self.save_journal();
+                }
+                crate::cgroup::Restore::Failed => {}
             }
         }
     }
@@ -352,24 +409,36 @@ impl ProBalance {
                         ));
                         return Some(Applied::Cgroup { unit });
                     }
-                    let original = crate::cgroup::read_unit_cpu_policy(
+                    let current = crate::cgroup::read_unit_cpu_policy(
                         &unit,
+                        proc.pid,
                         self.cfg.cgroup_quota_percent > 0,
                     );
-                    if let Some(original) = original.filter(|_| {
-                        crate::cgroup::throttle_unit(
-                            &unit,
+                    if let Some(current) = current {
+                        let (set, original) = crate::cgroup::plan_throttle(
+                            &current,
                             self.cfg.cgroup_throttle_weight,
                             self.cfg.cgroup_quota_percent,
-                        )
-                    }) {
+                        );
+                        // Recorded before it is made, so a crash in between
+                        // still leaves the original to put back.
                         self.unit_refs
                             .insert(unit.clone(), UnitThrottle { count: 1, original });
-                        logs.push(format!(
-                            "[ProBalance] THROTTLE {}({}) cpu={:.1}% unit {unit} CPUWeight→{}",
-                            proc.name, proc.pid, proc.cpu_percent, self.cfg.cgroup_throttle_weight
-                        ));
-                        return Some(Applied::Cgroup { unit });
+                        self.save_journal();
+                        if crate::cgroup::throttle_unit(&unit, &set) {
+                            let what = if set == crate::cgroup::CpuPolicy::default() {
+                                "already limited further".to_string()
+                            } else {
+                                set.to_string()
+                            };
+                            logs.push(format!(
+                                "[ProBalance] THROTTLE {}({}) cpu={:.1}% unit {unit} {what}",
+                                proc.name, proc.pid, proc.cpu_percent
+                            ));
+                            return Some(Applied::Cgroup { unit });
+                        }
+                        self.unit_refs.remove(&unit);
+                        self.save_journal();
                     }
                     self.cgroup_failed_units.insert(unit.clone());
                     logs.push(format!(
@@ -1093,5 +1162,41 @@ mod system_pressure_tests {
         cfg.system_cpu_threshold_percent = 90.0;
         policy.update_config(cfg);
         assert_eq!(policy.states[&4242].consecutive_high, 0.0);
+    }
+
+    /// A throttle outlives Argus being killed; the next run used to read the
+    /// throttled weight as the unit's own. Now it finds the original in the
+    /// journal and restores it like a failed restore, on the first tick.
+    #[test]
+    fn unit_throttles_survive_in_the_journal() {
+        use crate::cgroup::{CpuPolicy, Weight};
+        let path = std::env::temp_dir().join(format!("argus-journal-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let original = CpuPolicy {
+            weight: Some(Weight::Idle),
+            quota: None,
+        };
+
+        let mut crashed =
+            ProBalance::new(ProBalanceConfig::default()).with_journal(Some(path.clone()));
+        crashed.unit_refs.insert(
+            "app-build.scope".into(),
+            UnitThrottle {
+                count: 2,
+                original: original.clone(),
+            },
+        );
+        crashed.save_journal();
+        drop(crashed);
+
+        let next = ProBalance::new(ProBalanceConfig::default()).with_journal(Some(path.clone()));
+        let pending = &next.unit_refs["app-build.scope"];
+        assert_eq!(pending.count, 0, "restored on the first tick");
+        assert_eq!(pending.original, original);
+
+        let mut next = next;
+        next.unit_refs.clear();
+        next.save_journal();
+        assert!(!path.exists(), "nothing left to restore");
     }
 }

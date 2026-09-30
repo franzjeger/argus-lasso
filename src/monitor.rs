@@ -660,7 +660,8 @@ impl Daemon {
             config.gaming_mode.overlay.clone(),
         ));
 
-        let mut probalance = ProBalance::new(config.probalance.clone());
+        let mut probalance = ProBalance::new(config.probalance.clone())
+            .with_journal(crate::probalance::journal_path());
         probalance.set_log_callback(logger(&state));
         let log = Box::new(logger(&state));
 
