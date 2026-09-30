@@ -30,8 +30,11 @@ enum ProcState {
 /// same one even if the configured method changes mid-throttle.
 #[derive(Debug, Clone, PartialEq)]
 enum Applied {
-    Nice,
-    Cgroup { unit: String },
+    /// With each thread's value from before, when it could be read.
+    Nice(Option<utils::ThreadNices>),
+    Cgroup {
+        unit: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -327,12 +330,20 @@ impl ProBalance {
                 let unit = unit.clone();
                 self.release_unit(&unit, reason, logs);
             }
-            Some(Applied::Nice) | None => {
+            // `None`: a legacy entry, which was a nice throttle.
+            Some(Applied::Nice(_)) | None => {
+                let before = match &entry.applied {
+                    Some(Applied::Nice(before)) => before.clone(),
+                    _ => None,
+                };
                 if let Some(now) = current_nice.filter(|now| Some(*now) != entry.throttle_nice) {
                     logs.push(format!(
                         "[ProBalance] RESTORE ({reason}) PID {pid} left at nice {now}: changed since the throttle"
                     ));
-                } else if utils::set_nice(pid, original_nice).is_ok() {
+                } else if before
+                    .map_or_else(|| utils::set_nice(pid, original_nice), |b| b.restore(pid))
+                    .is_ok()
+                {
                     logs.push(format!(
                         "[ProBalance] RESTORE ({reason}) PID {pid} nice→{original_nice}"
                     ));
@@ -490,12 +501,13 @@ impl ProBalance {
         if new_nice <= proc.nice {
             return None; // already at least this low in priority
         }
+        let before = utils::ThreadNices::read(proc.pid);
         if utils::set_nice(proc.pid, new_nice).is_ok() {
             logs.push(format!(
                 "[ProBalance] THROTTLE {}({}) cpu={:.1}% nice {}→{}",
                 proc.name, proc.pid, proc.cpu_percent, proc.nice, new_nice
             ));
-            Some(Applied::Nice)
+            Some(Applied::Nice(before))
         } else {
             None
         }
@@ -662,12 +674,17 @@ impl ProBalance {
     /// The nice value each process throttled through nice had before, for a
     /// rule that takes the value over: what it should put back later is this,
     /// not the throttle.
-    pub fn held_nices(&self) -> HashMap<u32, i32> {
+    pub fn held_nices(&self) -> HashMap<u32, utils::ThreadNices> {
         self.states
             .iter()
             .filter(|(_, e)| e.state == ProcState::Throttled)
-            .filter(|(_, e)| !matches!(e.applied, Some(Applied::Cgroup { .. })))
-            .filter_map(|(&pid, e)| Some((pid, e.original_nice?)))
+            .filter_map(|(&pid, e)| match &e.applied {
+                Some(Applied::Nice(Some(before))) => Some((pid, before.clone())),
+                Some(Applied::Nice(None)) | None => {
+                    Some((pid, utils::ThreadNices::uniform(e.original_nice?)))
+                }
+                Some(Applied::Cgroup { .. }) => None,
+            })
             .collect()
     }
 
@@ -897,7 +914,7 @@ mod tests {
         entry.start_ticks = start;
         entry.state = ProcState::Throttled;
         entry.throttle_nice = Some(10);
-        entry.applied = Some(Applied::Nice);
+        entry.applied = Some(Applied::Nice(None));
         pb.states.insert(pid, entry);
         let now = ProcSnapshot {
             pid,

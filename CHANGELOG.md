@@ -295,6 +295,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Turning Gaming Mode off while a detected game runs keeps it off until the game
   exits, instead of auto-detection turning it (and CPU parking) back on within a
   second.
+- Putting back a nice value (a rule undone, a ProBalance throttle or Gaming Mode's
+  boost ending) restores each thread to its own value. All threads were set to the
+  main thread's, raising the priority of threads a process had lowered itself,
+  such as a browser's background threads.
 
 ### Changed
 

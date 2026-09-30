@@ -1066,7 +1066,7 @@ impl Daemon {
                 continue;
             }
             let mut target = target(proc, Some(proc.nice));
-            target.held_nice = held.get(&proc.pid).copied();
+            target.held_nice = held.get(&proc.pid);
             crate::rules::apply_rules(
                 &policy,
                 target,
@@ -1102,7 +1102,7 @@ impl Daemon {
                 continue;
             }
             let mut target = target(proc, utils::get_nice(proc.pid));
-            target.held_nice = held.get(&proc.pid).copied();
+            target.held_nice = held.get(&proc.pid);
             let ionice = || utils::get_ionice_raw(proc.pid);
             crate::rules::apply_rules(&policy, target, ionice, &mut self.rule_state, &self.log);
             if let Some(affinity) = policy.default_affinity {
@@ -1841,11 +1841,13 @@ fn gaming_boost(
         return;
     }
     let target = target(proc, Some(proc.nice));
-    if effect.nice.is_none()
-        && proc.nice > GAMING_NICE
-        && cpu_park::set_process_nice_via_helper(proc.pid, proc.start_ticks, GAMING_NICE)
+    let before = (effect.nice.is_none() && proc.nice > GAMING_NICE)
+        .then(|| utils::ThreadNices::read(proc.pid))
+        .flatten();
+    if let Some(before) = before
+        .filter(|_| cpu_park::set_process_nice_via_helper(proc.pid, proc.start_ticks, GAMING_NICE))
     {
-        rule_state.record_gaming_nice(target, proc.nice, GAMING_NICE);
+        rule_state.record_gaming_nice(target, before, GAMING_NICE);
         log_cb(format!(
             "[Gaming Mode] nice {GAMING_NICE} → {}({})",
             proc.name, proc.pid

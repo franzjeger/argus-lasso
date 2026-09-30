@@ -348,10 +348,10 @@ pub struct Target<'a> {
     pub start_ticks: u64,
     pub name: &'a str,
     pub nice: Option<i32>,
-    /// The nice the process had before another part of Argus (ProBalance)
-    /// changed it. A rule that takes the value over records this as what to
-    /// put back, not the other part's temporary value.
-    pub held_nice: Option<i32>,
+    /// The nice the process's threads had before another part of Argus
+    /// (ProBalance) changed it. A rule that takes the value over records
+    /// this as what to put back, not the other part's temporary value.
+    pub held_nice: Option<&'a utils::ThreadNices>,
 }
 
 /// Who a recorded change belongs to, and so what puts it back: rules (and
@@ -366,17 +366,17 @@ pub enum Owner {
 /// A value Argus set, what the process had before, and who set it (the log
 /// prefix, such as `[Rule:games]` or `[Default]`, and the owner).
 #[derive(Debug)]
-struct Undo<T> {
-    original: T,
+struct Undo<T, O = T> {
+    original: O,
     applied: T,
     by: String,
     owner: Owner,
 }
 
-impl<T> Undo<T> {
+impl<T, O> Undo<T, O> {
     /// Keep the first original through later changes; the latest change
     /// owns the value.
-    fn record(slot: &mut Option<Self>, original: T, applied: T, by: String, owner: Owner) {
+    fn record(slot: &mut Option<Self>, original: O, applied: T, by: String, owner: Owner) {
         match slot {
             Some(undo) => {
                 undo.applied = applied;
@@ -399,7 +399,8 @@ impl<T> Undo<T> {
 struct Changes {
     start_ticks: u64,
     affinity: Option<Undo<String>>,
-    nice: Option<Undo<i32>>,
+    /// Each thread's value from before, since they can differ.
+    nice: Option<Undo<i32, utils::ThreadNices>>,
     ionice: Option<Undo<(i32, i32)>>,
 }
 
@@ -456,12 +457,12 @@ impl RuleState {
     }
 
     /// Take `owner`'s recorded change to undo it, without creating a record.
-    fn take<T>(
+    fn take<T, O>(
         &mut self,
         target: Target,
-        slot: fn(&mut Changes) -> &mut Option<Undo<T>>,
+        slot: fn(&mut Changes) -> &mut Option<Undo<T, O>>,
         owner: Owner,
-    ) -> Option<Undo<T>> {
+    ) -> Option<Undo<T, O>> {
         let changes = self.changes.get_mut(&target.pid)?;
         if changes.start_ticks != target.start_ticks {
             return None;
@@ -489,7 +490,12 @@ impl RuleState {
     }
 
     /// Gaming Mode raised a process's priority from `original` to `applied`.
-    pub fn record_gaming_nice(&mut self, target: Target, original: i32, applied: i32) {
+    pub fn record_gaming_nice(
+        &mut self,
+        target: Target,
+        original: utils::ThreadNices,
+        applied: i32,
+    ) {
         let slot = &mut self.changes(target).nice;
         Undo::record(
             slot,
@@ -513,8 +519,7 @@ impl RuleState {
                 }
             }
             if let Some(undo) = changes.nice.take_if(|undo| undo.owner == owner) {
-                if utils::get_nice(pid) == Some(undo.applied)
-                    && utils::set_nice(pid, undo.original).is_ok()
+                if utils::get_nice(pid) == Some(undo.applied) && undo.original.restore(pid).is_ok()
                 {
                     restored += 1;
                 }
@@ -630,11 +635,15 @@ pub fn apply_rules(
             attr: Attr::Nice,
         };
         if target.nice != Some(nice) && !state.failed.contains(&key) {
+            let before = target
+                .held_nice
+                .cloned()
+                .or_else(|| utils::ThreadNices::read(pid));
             match utils::set_nice(pid, nice) {
                 Ok(()) => {
                     let by = format!("[Rule:{}]", rule.name);
                     report(format!("{by} Set nice={nice} on {name}({pid})"));
-                    if let Some(original) = target.held_nice.or(target.nice) {
+                    if let Some(original) = before {
                         let slot = &mut state.changes(target).nice;
                         Undo::record(slot, original, nice, by, Owner::Rules);
                     }
@@ -650,8 +659,8 @@ pub fn apply_rules(
         }
     } else if let Some(undo) = state.take(target, |c| &mut c.nice, Owner::Rules) {
         if target.nice == Some(undo.applied) {
-            let (value, by) = (undo.original, &undo.by);
-            report(match utils::set_nice(pid, value) {
+            let (value, by) = (undo.original.main(), &undo.by);
+            report(match undo.original.restore(pid) {
                 Ok(()) => format!("{by} Restored nice={value} on {name}({pid})"),
                 Err(e) => format!("{by} Restoring nice={value} FAILED for {name}({pid}): {e}"),
             });
@@ -1281,7 +1290,8 @@ mod tests {
         let mut rules = [rule];
         let mut state = RuleState::default();
         let mut target = sleeper.target();
-        target.held_nice = Some(13);
+        let held = utils::ThreadNices::uniform(13);
+        target.held_nice = Some(&held);
         let read = || None;
         apply_rules(&only(&rules), target, read, &mut state, &|_| {});
         assert_eq!(utils::get_nice(pid), Some(12));
@@ -1315,7 +1325,7 @@ mod tests {
         // A nice Gaming Mode raised (simulated with a raise from 10 to 12
         // being "put back", so no privilege is needed).
         utils::set_nice(pid, 10).unwrap();
-        state.record_gaming_nice(sleeper.target(), 12, 10);
+        state.record_gaming_nice(sleeper.target(), utils::ThreadNices::uniform(12), 10);
 
         assert_eq!(state.end(Owner::Gaming, &|_| {}), 2);
         assert_eq!(utils::get_affinity_str(pid), affinity);
@@ -1332,7 +1342,7 @@ mod tests {
         let pid = sleeper.0.id();
         utils::set_nice(pid, 10).unwrap();
         let mut state = RuleState::default();
-        state.record_gaming_nice(sleeper.target(), 12, 10);
+        state.record_gaming_nice(sleeper.target(), utils::ThreadNices::uniform(12), 10);
         utils::set_nice(pid, 15).unwrap();
         assert_eq!(state.end(Owner::Gaming, &|_| {}), 0);
         assert_eq!(utils::get_nice(pid), Some(15));
@@ -1361,5 +1371,60 @@ mod tests {
             cpu,
             "not Argus's to reset"
         );
+    }
+
+    /// Every restore used to set all threads to the main thread's original,
+    /// raising the priority of threads the process had lowered itself.
+    #[test]
+    fn undoing_a_rule_puts_each_thread_back_to_its_own_nice() {
+        // A child process with a worker thread niced above the main one:
+        // python can set a thread's nice through its TID.
+        let script = "import os,threading,time\n\
+            def w():\n    os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10); time.sleep(30)\n\
+            threading.Thread(target=w).start(); time.sleep(30)\n";
+        let Ok(mut child) = std::process::Command::new("python3")
+            .args(["-c", script])
+            .spawn()
+        else {
+            eprintln!("needs python3");
+            return;
+        };
+        let pid = child.id();
+        let thread_nices = || {
+            let mut nices: Vec<i32> = utils::get_tids(pid)
+                .into_iter()
+                .filter_map(utils::get_nice)
+                .collect();
+            nices.sort();
+            nices
+        };
+        // Until python has started the thread and lowered it.
+        for _ in 0..100 {
+            if thread_nices() == [0, 10] {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let before = thread_nices();
+        let mut rule = rule_with("argus-thread-test", MatchType::Exact);
+        rule.nice = Some(12);
+        let mut rules = [rule];
+        let mut state = RuleState::default();
+        let target = process(pid, "argus-thread-test", utils::get_nice(pid));
+        apply_rules(&only(&rules), target, || None, &mut state, &|_| {});
+        let during = thread_nices();
+        rules[0].enabled = false;
+        let target = process(pid, "argus-thread-test", utils::get_nice(pid));
+        apply_rules(&only(&rules), target, || None, &mut state, &|_| {});
+        let after = thread_nices();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(before, [0, 10], "the setup");
+        assert_eq!(during, [12, 12]);
+        // Needs lowering 12 back to 0 and 10, allowed where RLIMIT_NICE is.
+        if after != [12, 12] {
+            assert_eq!(after, before);
+        }
     }
 }
