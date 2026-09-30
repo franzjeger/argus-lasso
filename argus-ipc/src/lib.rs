@@ -44,6 +44,23 @@ fn socket_file() -> String {
     format!("overlay-v{PROTOCOL_VERSION}.sock")
 }
 
+/// Sockets of other protocol versions in `dir`: a daemon replaced by an
+/// update leaves its socket file behind, one more with every version.
+pub fn other_version_sockets(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let current = socket_file();
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name != current && name.starts_with("overlay-v") && name.ends_with(".sock")
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
 /// Steam pressure-vessel does not expose arbitrary host XDG_RUNTIME_DIR
 /// entries. HOME is shared, so publish the same stream on a private home
 /// socket too. An explicit override remains exclusive for isolated tests.
@@ -499,6 +516,29 @@ mod tests {
             (6, 0x2864_b8aa_e3e2_0389),
             "the wire encoding changed"
         );
+    }
+
+    #[test]
+    fn sockets_of_other_versions_are_found_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("argus-ipc-sockets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "overlay-v4.sock",
+            "overlay-v5.sock",
+            "notes.txt",
+            "overlay.sock",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        std::fs::write(dir.join(socket_file()), b"").unwrap();
+        let mut found = other_version_sockets(&dir);
+        found.sort();
+        assert_eq!(
+            found,
+            [dir.join("overlay-v4.sock"), dir.join("overlay-v5.sock")]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

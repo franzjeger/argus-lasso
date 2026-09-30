@@ -316,6 +316,17 @@ mod ipc_server {
                         .mode(0o700)
                         .create(parent);
                 }
+                // A daemon replaced by an update left its socket behind. One
+                // that still has a listener (an exempt UI-tour instance) stays.
+                for stale in path
+                    .parent()
+                    .map(argus_ipc::other_version_sockets)
+                    .unwrap_or_default()
+                {
+                    if UnixStream::connect(&stale).is_err() {
+                        let _ = std::fs::remove_file(&stale);
+                    }
+                }
                 // Do not unlink another listener (including an exempt UI-tour instance).
                 if UnixStream::connect(&path).is_ok() {
                     log::error!("Overlay socket already has a listener: {}", path.display());
