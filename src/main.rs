@@ -596,7 +596,7 @@ fn main() {
     let cmd_tx_gui = cmd_tx.clone();
     let tour_dir = args.ui_tour.clone();
 
-    eframe::run_native(
+    let run = eframe::run_native(
         "Argus-Lasso",
         native_options,
         Box::new(move |cc| {
@@ -607,8 +607,17 @@ fn main() {
                 cc, state_gui, cmd_tx_gui, re_gui, cfg_gui, tour_dir,
             )))
         }),
-    )
-    .expect("eframe launch failed");
+    );
+    // Losing the display (logout, a compositor crash) ends the window with
+    // an error, perhaps before on_exit ran. Panicking here ended the process
+    // in the middle of the restore a stop signal had started; restore, then
+    // exit with an error so systemd restarts the app after a crash.
+    if let Err(e) = run {
+        eprintln!("Argus-Lasso's window failed: {e}");
+        monitor::shutdown_and_wait(&state, &cmd_tx);
+        monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2));
+        std::process::exit(1);
+    }
 
     // The window is closed and on_exit already asked the daemon to restore
     // state (shutdown_and_wait). Give it a bounded grace period to finish

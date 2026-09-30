@@ -47,6 +47,16 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- ProBalance's nice throttles are recorded like its unit throttles, so the next
+  run puts them back after a crash or kill instead of leaving them for good.
+- A rule's I/O priority is put back per thread, as its nice value already was,
+  instead of giving every thread the main thread's old value.
+- Clearing the default affinity also releases processes that had it with no
+  record behind them (their pinning parent had exited, or an earlier run pinned
+  them); they get every CPU back.
+- Losing the display (logout, a compositor crash) no longer panics in the middle
+  of restoring CPUs and priorities: the app restores, then exits with an error so
+  systemd restarts it after a crash.
 - The launcher no longer takes an exited, unreaped process of the game's name for
   the running game, and when several processes carry the name it watches the one
   started first instead of whichever `/proc` listed first.

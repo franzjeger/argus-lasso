@@ -72,6 +72,35 @@ struct UnitThrottle {
     original: crate::cgroup::CpuPolicy,
 }
 
+/// A nice throttle as the journal keeps it, to be put back by the next run
+/// if this one is killed or crashes.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct NiceThrottle {
+    pid: u32,
+    start_ticks: u64,
+    throttle_nice: i32,
+    original: utils::ThreadNices,
+}
+
+/// The throttles in place, kept in the runtime directory while they last.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Journal {
+    #[serde(default)]
+    units: HashMap<String, crate::cgroup::CpuPolicy>,
+    #[serde(default)]
+    nices: Vec<NiceThrottle>,
+}
+
+/// A journal as found: the current form, or the earlier one that held only
+/// the units (unit name → original).
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum StoredJournal {
+    Current(Journal),
+    Units(HashMap<String, crate::cgroup::CpuPolicy>),
+}
+
 // ── Throttle detail for UI display ───────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -211,6 +240,11 @@ pub struct ProBalance {
     cgroup_failed_pids: std::collections::HashSet<u32>,
     /// Where the unit throttles are recorded (see `with_journal`).
     journal: Option<std::path::PathBuf>,
+    /// The journal as last written, so an unchanged one is not rewritten.
+    journal_written: Option<String>,
+    /// Nice throttles an earlier run left in the journal, put back on the
+    /// first tick.
+    left_nices: Vec<NiceThrottle>,
     log_callback: Option<Box<dyn Fn(String) + Send>>,
 }
 
@@ -231,6 +265,8 @@ impl ProBalance {
             cgroup_failed_units: std::collections::HashSet::new(),
             cgroup_failed_pids: std::collections::HashSet::new(),
             journal: None,
+            journal_written: None,
+            left_nices: Vec::new(),
             log_callback: None,
         }
     }
@@ -243,28 +279,90 @@ impl ProBalance {
     /// tick, like any restore that failed.
     pub fn with_journal(mut self, path: Option<std::path::PathBuf>) -> Self {
         if let Some(path) = &path {
-            let left: HashMap<String, crate::cgroup::CpuPolicy> =
-                crate::cgroup::read_json_capped(path).unwrap_or_default();
-            for (unit, original) in left {
+            let left = match crate::cgroup::read_json_capped(path) {
+                Some(StoredJournal::Current(journal)) => journal,
+                Some(StoredJournal::Units(units)) => Journal {
+                    units,
+                    ..Journal::default()
+                },
+                None => Journal::default(),
+            };
+            for (unit, original) in left.units {
                 self.unit_refs
                     .insert(unit, UnitThrottle { count: 0, original });
             }
+            self.left_nices = left.nices;
         }
         self.journal = path;
         self
     }
 
-    fn save_journal(&self) {
+    /// Record the throttles in place: the units, before each is changed, and
+    /// the nice throttles, as soon as each is made. Written only when it
+    /// changed.
+    fn save_journal(&mut self) {
         let Some(path) = &self.journal else {
             return;
         };
-        let originals: HashMap<&String, &crate::cgroup::CpuPolicy> = self
-            .unit_refs
-            .iter()
-            .map(|(unit, t)| (unit, &t.original))
-            .collect();
-        if let Err(e) = crate::cgroup::write_json_private(path, &originals) {
-            log::warn!("cannot record cgroup throttles in {}: {e}", path.display());
+        let journal = Journal {
+            units: self
+                .unit_refs
+                .iter()
+                .map(|(unit, t)| (unit.clone(), t.original.clone()))
+                .collect(),
+            nices: self
+                .states
+                .iter()
+                .filter(|(_, e)| e.state == ProcState::Throttled)
+                .filter_map(|(&pid, e)| {
+                    let original = match &e.applied {
+                        Some(Applied::Nice(Some(before))) => before.clone(),
+                        Some(Applied::Nice(None)) | None => {
+                            utils::ThreadNices::uniform(e.original_nice?)
+                        }
+                        Some(Applied::Cgroup { .. }) => return None,
+                    };
+                    Some(NiceThrottle {
+                        pid,
+                        start_ticks: e.start_ticks,
+                        throttle_nice: e.throttle_nice?,
+                        original,
+                    })
+                })
+                .chain(self.left_nices.iter().cloned())
+                .collect(),
+        };
+        let Ok(text) = serde_json::to_string(&journal) else {
+            return;
+        };
+        if self.journal_written.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        let empty = journal.units.is_empty() && journal.nices.is_empty();
+        match crate::cgroup::write_json_private(path, &journal, empty) {
+            Ok(()) => self.journal_written = Some(text),
+            Err(e) => log::warn!("cannot record throttles in {}: {e}", path.display()),
+        }
+    }
+
+    /// Put back nice throttles an earlier run left because it was killed or
+    /// crashed, for a process that is still the same one (start time) and
+    /// still at the throttle; anything else changed it since.
+    fn restore_left_nices(&mut self, logs: &mut Vec<String>) {
+        for left in std::mem::take(&mut self.left_nices) {
+            let Some(stat) = crate::fast_proc::read_stat(left.pid, &mut [0; 1024]) else {
+                continue;
+            };
+            if stat.starttime != left.start_ticks || stat.nice != left.throttle_nice {
+                continue;
+            }
+            let (pid, nice) = (left.pid, left.original.main());
+            logs.push(match left.original.restore(pid) {
+                Ok(()) => format!("[ProBalance] RESTORE (left by an earlier run) PID {pid} nice→{nice}"),
+                Err(e) => format!(
+                    "[ProBalance] RESTORE (left by an earlier run) PID {pid} nice→{nice} FAILED: {e}"
+                ),
+            });
         }
     }
 
@@ -306,6 +404,7 @@ impl ProBalance {
         }
         // Successfully restored units were removed by release_unit; entries
         // that failed to restore stay (count 0) for the per-tick retry.
+        self.save_journal();
         for msg in pending_logs {
             self.log(msg);
         }
@@ -423,7 +522,8 @@ impl ProBalance {
         new_nice: i32,
         logs: &mut Vec<String>,
     ) -> Option<Applied> {
-        let method = self.cfg.method.as_str();
+        let method = self.cfg.method.clone();
+        let method = method.as_str();
         let cgroup_wanted = matches!(method, "cgroup" | "auto");
 
         if cgroup_wanted {
@@ -559,6 +659,15 @@ impl ProBalance {
         } else {
             0.0
         };
+        // What an earlier run left is put back even while disabled.
+        if !self.left_nices.is_empty() {
+            let mut logs = Vec::new();
+            self.restore_left_nices(&mut logs);
+            self.save_journal();
+            for msg in logs {
+                self.log(msg);
+            }
+        }
         // Failed unit restores are retried even while disabled — a unit left
         // at the throttle weight must not depend on ProBalance staying on.
         if !self.unit_refs.is_empty() {
@@ -676,6 +785,8 @@ impl ProBalance {
             }
         }
 
+        // Nice throttles made or undone in this tick; unchanged is not rewritten.
+        self.save_journal();
         // Flush log messages now that the mutable borrow of self.states is released
         for msg in pending_logs {
             self.log(msg);
@@ -1326,5 +1437,95 @@ mod system_pressure_tests {
         next.unit_refs.clear();
         next.save_journal();
         assert!(!path.exists(), "nothing left to restore");
+    }
+
+    /// A nice throttle outlived a crash or kill for good: only units were
+    /// journaled. The next run now puts it back, but only on the same
+    /// process, still at the throttle.
+    #[test]
+    fn nice_throttles_survive_in_the_journal() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let spawn = || {
+            Child(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let start = |pid| {
+            crate::fast_proc::read_stat(pid, &mut [0; 1024])
+                .unwrap()
+                .starttime
+        };
+        let throttled = |pid: u32, start_ticks: u64| {
+            let mut entry = ProcEntry::new(0);
+            entry.start_ticks = start_ticks;
+            entry.state = ProcState::Throttled;
+            entry.throttle_nice = Some(5);
+            entry.applied = Some(Applied::Nice(Some(utils::ThreadNices::uniform(0))));
+            (pid, entry)
+        };
+        let path =
+            std::env::temp_dir().join(format!("argus-nice-journal-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (same, reused) = (spawn(), spawn());
+        for child in [&same, &reused] {
+            utils::set_nice(child.0.id(), 5).unwrap();
+        }
+
+        let mut crashed =
+            ProBalance::new(ProBalanceConfig::default()).with_journal(Some(path.clone()));
+        crashed.states.extend([
+            throttled(same.0.id(), start(same.0.id())),
+            // As if the PID now belonged to another process.
+            throttled(reused.0.id(), start(reused.0.id()) + 1),
+        ]);
+        crashed.save_journal();
+        drop(crashed);
+
+        let mut next =
+            ProBalance::new(ProBalanceConfig::default()).with_journal(Some(path.clone()));
+        assert_eq!(next.left_nices.len(), 2);
+        let mut logs = Vec::new();
+        next.restore_left_nices(&mut logs);
+        assert_eq!(logs.len(), 1, "{logs:?}");
+        // Lowering nice again needs RLIMIT_NICE, which CI runners lack.
+        assert!(
+            utils::get_nice(same.0.id()) == Some(0) || logs[0].contains("FAILED"),
+            "{logs:?}"
+        );
+        assert_eq!(
+            utils::get_nice(reused.0.id()),
+            Some(5),
+            "another process is left alone"
+        );
+        next.save_journal();
+        assert!(!path.exists(), "nothing left to restore");
+    }
+
+    /// The journal used to hold only units, as a map; one written by an
+    /// older build before an update is still taken over.
+    #[test]
+    fn a_journal_of_units_only_is_still_read() {
+        use crate::cgroup::{CpuPolicy, Weight};
+        let path =
+            std::env::temp_dir().join(format!("argus-old-journal-{}.json", std::process::id()));
+        let original = CpuPolicy {
+            weight: Some(Weight::Value(100)),
+            quota: None,
+        };
+        let old: HashMap<String, CpuPolicy> =
+            [("app-old.scope".to_string(), original.clone())].into();
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let next = ProBalance::new(ProBalanceConfig::default()).with_journal(Some(path.clone()));
+        assert_eq!(next.unit_refs["app-old.scope"].original, original);
+        std::fs::remove_file(&path).ok();
     }
 }

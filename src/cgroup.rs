@@ -327,18 +327,15 @@ pub fn read_json_capped<T: serde::de::DeserializeOwned>(path: &std::path::Path) 
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Replace `path` with `value` as JSON, readable by this user only; an
-/// empty map removes the file.
-pub fn write_json_private<K, V>(
+/// Replace `path` with `value` as JSON, readable by this user only; when
+/// there is nothing to keep (`empty`), the file is removed.
+pub fn write_json_private(
     path: &std::path::Path,
-    value: &std::collections::HashMap<K, V>,
-) -> std::io::Result<()>
-where
-    K: Serialize + Eq + std::hash::Hash,
-    V: Serialize,
-{
+    value: &impl Serialize,
+    empty: bool,
+) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    if value.is_empty() {
+    if empty {
         return match std::fs::remove_file(path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
