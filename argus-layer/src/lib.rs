@@ -729,7 +729,7 @@ pub unsafe extern "system" fn argus_vkDestroyDevice(
 /// recycled addresses: a stale entry would hand the next device this one's
 /// function table and HUD state.
 unsafe fn forget_device(device: vk::Device) {
-    let leftovers: Vec<OverlayState> = {
+    let leftovers: Vec<(vk::SwapchainKHR, OverlayState)> = {
         let mut states = OVERLAY_STATES.lock_or_recover();
         let swapchains: Vec<_> = states
             .iter()
@@ -738,11 +738,24 @@ unsafe fn forget_device(device: vk::Device) {
             .collect();
         swapchains
             .iter()
-            .filter_map(|swapchain| states.remove(swapchain))
+            .filter_map(|&swapchain| states.remove(&swapchain).map(|state| (swapchain, state)))
             .collect()
     };
-    if let Some((_, dev)) = DEVICE_MAP.write_or_recover().remove(&device) {
-        for state in &leftovers {
+    if capture::enabled() {
+        // Recordings end with the device. A game that exits right after
+        // tearing it down takes the recorder thread with it, so wait
+        // (bounded) until they are written.
+        use ash::vk::Handle;
+        for (swapchain, _) in &leftovers {
+            capture::end(swapchain.as_raw());
+        }
+        capture::settle(std::time::Duration::from_millis(500));
+    }
+    // Out of the map first: destroying waits on fences, which must not
+    // happen under the lock every present and swapchain call takes.
+    let removed = DEVICE_MAP.write_or_recover().remove(&device);
+    if let Some((_, dev)) = removed {
+        for (_, state) in &leftovers {
             state.destroy(&dev);
         }
     }

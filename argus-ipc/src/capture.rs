@@ -140,6 +140,9 @@ fn update(
     fs::rename(temp, dir.join("control.json"))?;
     Ok(c)
 }
+/// What a recording measures, as its summary states it.
+pub const METRIC: &str = "CPU intervals between successful vkQueuePresentKHR entry timestamps; not GPU time or displayed/FG FPS";
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Summary {
     pub schema: u32,
@@ -196,8 +199,24 @@ fn read_summary_capped(path: &Path) -> Option<Summary> {
     serde_json::from_slice(&buf).ok()
 }
 
+/// Recording sessions listed at most, the newest first.
+const LISTED_SESSIONS: usize = 30;
+/// Summary files read per scan at most, the newest first.
+const MAX_SUMMARIES_READ: usize = 500;
+/// Largest recording CSV read to recover it (two million rows fit).
+const MAX_RECOVERED_CSV: u64 = 96 * 1024 * 1024;
+
 pub fn load_summaries() -> Vec<(PathBuf, Summary)> {
-    let mut paths: Vec<_> = fs::read_dir(directory())
+    let dir = directory();
+    recover_orphans(&dir, |pid| Path::new(&format!("/proc/{pid}")).exists());
+    load_summaries_in(&dir)
+}
+
+/// The recordings of the newest sessions. A session has one per swapchain,
+/// and a game that recreates its swapchain on every resize step made one
+/// session fill a list cut at 30 files, pushing every earlier one out.
+fn load_summaries_in(dir: &Path) -> Vec<(PathBuf, Summary)> {
+    let mut paths: Vec<_> = fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -207,13 +226,134 @@ pub fn load_summaries() -> Vec<(PathBuf, Summary)> {
                 .is_some_and(|n| n.to_string_lossy().ends_with(".summary.json"))
         })
         .collect();
+    // Names begin with the session, which begins with its start time.
     paths.sort();
     paths.reverse();
-    paths.truncate(30);
+    paths.truncate(MAX_SUMMARIES_READ);
+    let mut sessions: Vec<String> = Vec::new();
     paths
         .into_iter()
         .filter_map(|p| read_summary_capped(&p).map(|s| (p, s)))
+        .filter(|(_, summary)| summary.frames > 0)
+        .filter(|(_, summary)| {
+            if sessions.contains(&summary.session) {
+                return true;
+            }
+            if sessions.len() >= LISTED_SESSIONS {
+                return false;
+            }
+            sessions.push(summary.session.clone());
+            true
+        })
         .collect()
+}
+
+/// A game that exits or crashes mid-recording never writes a summary; its
+/// rows stay in a `.csv.partial`, unlisted and never cleaned up. Once the
+/// process is gone, give each such file an incomplete summary built from
+/// the rows it wrote.
+fn recover_orphans(dir: &Path, alive: impl Fn(u32) -> bool) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".csv.partial")) else {
+            continue;
+        };
+        let summary_path = dir.join(format!("{stem}.summary.json"));
+        if summary_path.exists() {
+            continue; // finished as incomplete; the rows are kept for it
+        }
+        let Some((session, pid, swapchain)) = parse_recording_name(stem) else {
+            continue;
+        };
+        if alive(pid) {
+            continue; // possibly still recording
+        }
+        let Some(summary) = recovered_summary(dir, stem, session, pid, swapchain) else {
+            // Nothing recorded: nothing to keep.
+            let _ = fs::remove_file(dir.join(format!("{stem}.csv.partial")));
+            let _ = fs::remove_file(dir.join(format!("{stem}.metadata.json")));
+            continue;
+        };
+        let temp = dir.join(format!("{stem}.summary.json.tmp"));
+        let written = serde_json::to_vec_pretty(&summary)
+            .map_err(io::Error::other)
+            .and_then(|bytes| {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&temp)?;
+                io::Write::write_all(&mut file, &bytes)
+            })
+            .and_then(|()| fs::rename(&temp, &summary_path));
+        if written.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+    }
+}
+
+/// `{session}-{pid}-{swapchain:x}-{sequence}`, the session itself being
+/// `{start ms}-{pid}`.
+fn parse_recording_name(stem: &str) -> Option<(String, u32, u64)> {
+    let mut parts = stem.rsplitn(4, '-');
+    let _sequence: u32 = parts.next()?.parse().ok()?;
+    let swapchain = u64::from_str_radix(parts.next()?, 16).ok()?;
+    let pid: u32 = parts.next()?.parse().ok()?;
+    let session = parts.next()?.to_string();
+    Some((session, pid, swapchain))
+}
+
+fn recovered_summary(
+    dir: &Path,
+    stem: &str,
+    session: String,
+    pid: u32,
+    swapchain: u64,
+) -> Option<Summary> {
+    let csv =
+        read_regular_capped(&dir.join(format!("{stem}.csv.partial")), MAX_RECOVERED_CSV).ok()??;
+    // Only whole rows: a last row cut off by the exit may hold a prefix of
+    // its number, which would still parse.
+    let whole = csv
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(&csv[..0], |end| &csv[..=end]);
+    let mut intervals: Vec<u64> = String::from_utf8_lossy(whole)
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split(',').nth(1)?.parse().ok())
+        .filter(|ns| *ns > 0)
+        .collect();
+    if intervals.is_empty() {
+        return None;
+    }
+    let executable = read_regular_capped(&dir.join(format!("{stem}.metadata.json")), 64 * 1024)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|meta| meta["program"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let frames = intervals.len();
+    let duration_seconds = intervals.iter().map(|ns| *ns as f64 / 1e9).sum();
+    let (average_fps, low_1_fps, p99_frametime_ms) = statistics(&mut intervals);
+    Some(Summary {
+        schema: 1,
+        metric: METRIC.into(),
+        build: String::new(),
+        session,
+        pid,
+        executable,
+        swapchain,
+        frames,
+        duration_seconds,
+        average_fps,
+        low_1_fps,
+        p99_frametime_ms,
+        dropped_samples: 0,
+        failed_presents: 0,
+        complete: false,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -354,5 +494,97 @@ mod tests {
         assert!((avg.unwrap() - 200e3 / 426.0).abs() < 0.001);
         assert!((low.unwrap() - 1000.0 / 15.0).abs() < 0.001);
         assert_eq!(p99, Some(2.0));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = temp_path(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn recording_names_give_session_pid_and_swapchain() {
+        assert_eq!(
+            parse_recording_name("1790000000000-4242-777-1a2b-3"),
+            Some(("1790000000000-4242".into(), 777, 0x1a2b))
+        );
+        assert_eq!(parse_recording_name("control"), None);
+    }
+
+    /// A game that crashed mid-recording left only a .csv.partial, never
+    /// listed and never cleaned up.
+    #[test]
+    fn a_recording_left_by_a_game_that_died_is_recovered() {
+        let dir = scratch("argus-ipc-orphans");
+        let dead = "1790000000000-1-900-ab-1";
+        let running = "1790000000000-1-901-cd-2";
+        let empty = "1790000000000-1-902-ef-3";
+        let rows = "present_begin_ns,interval_ns,vulkan_result\n0,10000000,0\n10,20000000,0\n30,5";
+        for stem in [dead, running] {
+            fs::write(dir.join(format!("{stem}.csv.partial")), rows).unwrap();
+        }
+        fs::write(
+            dir.join(format!("{dead}.metadata.json")),
+            r#"{"program":"/usr/bin/vkcube"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join(format!("{empty}.csv.partial")),
+            "present_begin_ns,interval_ns\n",
+        )
+        .unwrap();
+
+        recover_orphans(&dir, |pid| pid == 901);
+
+        let summary = read_summary_capped(&dir.join(format!("{dead}.summary.json"))).unwrap();
+        assert_eq!(summary.frames, 2, "the torn last row is left out");
+        assert!(!summary.complete);
+        assert_eq!(summary.executable, "/usr/bin/vkcube");
+        assert_eq!(summary.pid, 900);
+        assert!((summary.duration_seconds - 0.03).abs() < 1e-9);
+        assert!(
+            !dir.join(format!("{running}.summary.json")).exists(),
+            "still running"
+        );
+        assert!(
+            !dir.join(format!("{empty}.csv.partial")).exists(),
+            "nothing to keep"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One session with a summary per swapchain used to push every earlier
+    /// session out of a list cut at 30 files.
+    #[test]
+    fn the_list_keeps_whole_sessions_and_skips_empty_recordings() {
+        let dir = scratch("argus-ipc-sessions");
+        let write = |name: &str, session: &str, frames: usize| {
+            let summary = Summary {
+                session: session.into(),
+                frames,
+                ..Default::default()
+            };
+            fs::write(
+                dir.join(format!("{name}.summary.json")),
+                serde_json::to_vec(&summary).unwrap(),
+            )
+            .unwrap();
+        };
+        write("1700000000000-1-5-a-1", "1700000000000-1", 100);
+        for i in 0..40 {
+            write(
+                &format!("1800000000000-2-6-{i:x}-{i}"),
+                "1800000000000-2",
+                100,
+            );
+        }
+        write("1800000000000-2-6-ff-99", "1800000000000-2", 0);
+
+        let listed = load_summaries_in(&dir);
+        assert_eq!(listed.len(), 41);
+        assert!(listed.iter().any(|(_, s)| s.session == "1700000000000-1"));
+        assert!(listed.iter().all(|(_, s)| s.frames > 0));
+        fs::remove_dir_all(&dir).ok();
     }
 }

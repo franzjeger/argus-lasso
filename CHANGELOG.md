@@ -327,6 +327,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
   process of the user could replace a staged file with a FIFO that hung root or a
   device node; home directories with spaces or non-ASCII characters no longer stop
   the install.
+- A recording is no longer lost when the game exits or crashes before finishing
+  it. The layer writes rows out every 100 ms and finishes recordings when the game
+  tears down its device; a recording left unfinished is listed as incomplete, with
+  the rows it has, once the game has exited. The list keeps whole sessions instead
+  of the 30 newest files, so a session with many swapchains no longer hides every
+  earlier one, and swapchains that presented at most once are not listed.
 
 ### Changed
 
