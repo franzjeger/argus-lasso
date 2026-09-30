@@ -60,8 +60,9 @@ Installed locations:
 | Config | `~/.config/argus-lasso/config.toml` |
 
 The installed startup log records the app/layer build ID and IPC version.
-`argus-lasso --version` reports the Cargo package version, which is still 1.3.1
-on current source builds; use the build ID to identify a particular installation.
+`argus-lasso --version` reports the Cargo package version, which source builds
+between releases share with the last release; use the build ID to identify a
+particular installation.
 [Verified source and release status](status.md).
 
 The sensor helper is installed separately with `scripts/install-sensors.sh` and
@@ -87,22 +88,30 @@ replacing the layer; existing mapped libraries are retained in versioned directo
 
 ## Binary archives
 
-Future archives produced by this tree include the app, layer, optional sensor
-reader, desktop files and installer scripts. After verifying the archive checksum
-and minisign signature, extract it and run from the extracted directory:
+Release archives from 1.4.0 on contain the app, layer, optional sensor reader,
+desktop files and installer scripts. Check the archive's checksum and its
+signature against the release key ([`dist/argus-lasso.pub`](../dist/argus-lasso.pub))
+before installing it, then install from the extracted directory:
 
 ```bash
+version=1.4.0
+pkg=argus-lasso-$version-$(uname -m)-linux
+curl -fL --remote-name-all \
+  https://github.com/franzjeger/argus-lasso/releases/download/v$version/$pkg.tar.gz{,.sha256,.minisig}
+sha256sum -c "$pkg.tar.gz.sha256"
+minisign -Vm "$pkg.tar.gz" -P RWREF/+QBa091Zu8cM6JWhgU7AoKI8LOqMfQcF9DbUvkK1QBuBUJh6g1
+tar xzf "$pkg.tar.gz" && cd "$pkg"
 ./scripts/install-binaries.sh . "$(cat BUILD_ID)"
 # Optional helper installation from the same archive:
 ./scripts/install-sensors.sh .
 ```
 
-Older archives lack these files. They install only their original app. The in-app
-updater in the current source installs a matched app/layer pair from signed
-archives containing bundle metadata and retains a rollback. The privileged
-sensor helper remains separate. Older archives without bundle metadata require
-manual installation. See [updater behavior](design-updates.md). No new release is implied by an Unreleased
-changelog entry.
+This is also how 1.3.1 and older move to 1.4.0, once: their updater checks
+against the release key that was replaced on 2026-09-30 and refuses newer
+archives. From 1.4.0 on, the in-app updater installs a matched app/layer pair
+from signed archives containing bundle metadata and retains a rollback. The
+privileged sensor helper remains separate. Archives of 1.3.1 and older contain
+only the desktop app. See [updater behavior](design-updates.md).
 
 `dist/PKGBUILD` is an older-release packaging template, not evidence of a published
 AUR package or a complete current overlay package. See its header before use.

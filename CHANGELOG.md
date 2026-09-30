@@ -12,6 +12,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Added
 
+- The installation guide shows how to check a release archive's checksum and
+  signature and install it by hand, which 1.3.1 and older need once to update.
 - `scripts/dev-layer.sh` builds the Vulkan layer and prints the environment that
   loads it from Cargo's actual target directory, for testing a layer from the tree
   without installing it.
