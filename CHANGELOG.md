@@ -12,6 +12,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Added
 
+- `scripts/dev-layer.sh` builds the Vulkan layer and prints the environment that
+  loads it from Cargo's actual target directory, for testing a layer from the tree
+  without installing it.
 - Recordings can be deleted from Gaming → Recording ("Delete…", then confirm),
   which removes the summary, CSV and metadata; the list shows how much space the
   recordings take. Nothing deleted them before, and CSVs of up to ~60 MB piled up.
@@ -47,6 +50,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- The layer manifest written by `make install` names the build's IPC protocol
+  (it said 5 after the move to 6), read from the build instead of written in.
 - The sensor service's CPU package power is readable by the installing user's group
   only, not by every local user; the kernel keeps it root-only for a reason
   (CVE-2020-8694). `install-sensors.sh` hands the program to root on stdin and
