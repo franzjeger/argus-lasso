@@ -449,6 +449,158 @@ impl eframe::App for ArgusLassoApp {
         if self.state.lock().is_ok_and(|s| s.quit_requested) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        self.handle_gaming_events(ctx);
+        // --ui-tour drives the UI from a script rather than from the user.
+        // Applied before the frame is built so the capture at the end of it
+        // shows the screen this step is meant to document.
+        if self.tour.is_some() {
+            self.apply_tour_step();
+        }
+        self.log_repaint_rate();
+
+        let Some(frame) = self.read_frame() else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            return;
+        };
+        let FrameData {
+            ref snapshot,
+            ref cpu_pcts,
+            cpu_gen,
+            ref proc_cpu_history,
+            ref config,
+            gaming_active,
+            gaming_changes,
+            cpu_avg,
+            ..
+        } = frame;
+
+        self.proc_count = snapshot.len();
+        self.throttled_count = frame.throttled_pids.len();
+        // Gaming Mode belongs to the daemon; the tab and the status bar both
+        // show its state rather than keeping their own.
+        self.gaming_mode_tab
+            .sync_gaming_state(gaming_active, gaming_changes);
+
+        // Only push CPU bars + history when the daemon has emitted a new sample.
+        // The hwmon temp scan (a full /sys/class/hwmon walk) also lives here —
+        // it's far too expensive to run on every 60fps repaint.
+        if cpu_gen != self.last_cpu_gen && !cpu_pcts.is_empty() {
+            self.last_cpu_gen = cpu_gen;
+            self.process_tab.update_cpu(cpu_pcts.clone(), cpu_avg);
+            self.cpu_temp = read_cpu_temp();
+        }
+
+        // Poll active dialogs
+        let notif_enabled = config.ui.notifications_enabled;
+        let notify_error = move |msg: &str| {
+            log::error!("{msg}");
+            if notif_enabled {
+                let _ = notify_rust::Notification::new()
+                    .summary("Argus-Lasso Error")
+                    .body(msg)
+                    .timeout(notify_rust::Timeout::Milliseconds(5000))
+                    .show();
+            }
+        };
+        self.dialog_manager.poll_dialogs(
+            ctx,
+            self.opacity,
+            &self.state,
+            &self.cmd_tx,
+            &self.rule_engine,
+            &notify_error,
+        );
+
+        // Per-process details window
+        self.detail_window
+            .show(ctx, snapshot, proc_cpu_history, cpu_gen, self.opacity);
+
+        self.deliver_due_kill(config.ui.notifications_enabled);
+
+        // ── Top-level panels ─────────────────────────────────────────────
+        self.show_status_bar(root_ui, cpu_avg, gaming_active, &frame.notable_events);
+        self.show_kill_toast(ctx);
+        self.show_error_banners(root_ui);
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(ctx.global_style().visuals.panel_fill)
+                    .inner_margin(16),
+            )
+            .show_inside(root_ui, |ui| {
+                // Tab bar: five primary workflow tabs on the left; the occasional
+                // tools live behind a "Tools ▾" menu and Settings behind the gear,
+                // so nine equal flat tabs no longer bury the ones people live in.
+                self.show_tab_bar(ui);
+                ui.separator();
+                self.show_update_banner(ui, ctx);
+                let (title, description) = self.active_tab.intro();
+                crate::gui::theme::page_intro(ui, title, description);
+                self.show_tab_content(ui, ctx, &frame, &notify_error);
+            });
+
+        self.flush_pending_save(ctx);
+        self.capture_tour_frame(ctx);
+        self.restart_if_requested();
+
+        // Repaint when next display refresh is due — avoids continuous 60fps rendering.
+        // While a kill countdown is pending, repaint fast enough that the
+        // countdown updates and the SIGTERM actually fires near its deadline
+        // (with a long refresh interval it could otherwise fire seconds late).
+        let repaint_ms = if self.pending_kill.is_some() {
+            250
+        } else {
+            // A 0 (or a hand-edited config with a bogus value) would request a
+            // repaint every frame — unbounded 60fps. Clamp to a sane floor.
+            config.monitor.display_refresh_interval_ms.max(100)
+        };
+        ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
+    }
+}
+
+/// What one frame reads from the shared state, under one short lock.
+/// Expensive clones (log lines, sensors, histories) are made only when a
+/// visible tab or window needs them.
+struct FrameData {
+    snapshot: Arc<Vec<crate::monitor::ProcInfo>>,
+    cpu_pcts: Vec<f32>,
+    cpu_gen: u64,
+    throttled_pids: std::collections::HashSet<u32>,
+    suspended_pids: std::collections::HashSet<u32>,
+    throttle_infos: Vec<crate::probalance::ThrottleInfo>,
+    log_lines: std::collections::VecDeque<String>,
+    config: Config,
+    gaming_active: bool,
+    gaming_changes: u64,
+    hw_monitor: crate::hw_monitor::HwMonitorData,
+    proc_cpu_history: std::collections::HashMap<u32, std::collections::VecDeque<f32>>,
+    cpu_history: std::collections::VecDeque<f32>,
+    disk_io_history: std::collections::VecDeque<(f32, f32)>,
+    net_io_history: std::collections::VecDeque<(f32, f32)>,
+    notable_events: std::collections::VecDeque<String>,
+    cpu_avg: f32,
+}
+
+impl Tab {
+    /// The page title and one-line description shown above the tab.
+    fn intro(&self) -> (&'static str, &'static str) {
+        match self {
+                Tab::Overview => ("Overview", "System activity at a glance."),
+                Tab::Processes => ("Processes", "Inspect running processes. Right-click a row for actions; double-click for details."),
+                Tab::Rules => ("Process rules", "Choose persistent CPU assignments and priorities for matching applications."),
+                Tab::ProBalance => ("ProBalance", "Keep the system responsive by temporarily limiting busy background processes."),
+                Tab::GamingMode => ("Gaming", "CPU control, game profiles, overlay and performance recordings."),
+                Tab::HwMonitor => ("Hardware sensors", "Live readings grouped by component, with session minimums, maximums and averages."),
+                Tab::Benchmark => ("Memory benchmarks", "Measure memory latency and bandwidth. Game recordings are in Gaming → Recording."),
+                Tab::Settings => ("Settings", "Customize Argus and its defaults. Changes that need applying are collected in the bottom bar."),
+                Tab::Log => ("Activity log", "Review process actions, rule changes and hardware alerts."),
+        }
+    }
+}
+
+impl ArgusLassoApp {
+    fn handle_gaming_events(&mut self, ctx: &egui::Context) {
         self.gaming_mode_tab.poll_game_process();
         let events: Vec<GamingEvent> = std::mem::take(&mut self.gaming_mode_tab.events);
         for event in events {
@@ -492,12 +644,9 @@ impl eframe::App for ArgusLassoApp {
             self.update_config(|c| c.gaming_mode.overlay = overlay);
             self.save_config();
         }
-        // --ui-tour drives the UI from a script rather than from the user.
-        // Applied before the frame is built so the capture at the end of it
-        // shows the screen this step is meant to document.
-        if self.tour.is_some() {
-            self.apply_tour_step();
-        }
+    }
+
+    fn log_repaint_rate(&mut self) {
         // Repaint rate diagnostics — log repaints/sec approximately every 10s
         self.repaint_count += 1;
         let elapsed = self.last_repaint_log.elapsed();
@@ -512,9 +661,11 @@ impl eframe::App for ArgusLassoApp {
             self.repaint_count = 0;
             self.last_repaint_log = std::time::Instant::now();
         }
+    }
 
-        // Pull snapshot from shared state — lock held only for this clone block.
-        // Expensive clones (log_lines, hw_monitor) only when the relevant tab is active.
+    /// Pull this frame's data from shared state — lock held only for the
+    /// clones. None if the state lock is poisoned.
+    fn read_frame(&self) -> Option<FrameData> {
         let on_log_tab = self.active_tab == Tab::Log;
         let on_hw_tab = self.active_tab == Tab::HwMonitor;
         let on_pb_tab = self.active_tab == Tab::ProBalance;
@@ -524,120 +675,58 @@ impl eframe::App for ArgusLassoApp {
             || self.active_tab == Tab::Overview
             || self.detail_window.detail_pid.is_some();
         let on_overview_tab = self.active_tab == Tab::Overview;
-        let (
-            snapshot,
-            cpu_pcts,
-            cpu_gen,
-            throttled_pids,
-            suspended_pids,
-            throttle_infos,
-            log_lines,
-            config,
-            gaming_active,
-            gaming_changes,
-            hw_monitor,
-            proc_cpu_history,
-            cpu_history,
-            disk_io_history,
-            net_io_history,
-            notable_events,
-            cpu_avg,
-        ) = {
-            if let Ok(s) = self.state.lock() {
-                (
-                    s.snapshot.clone(),
-                    s.cpu_percents.clone(),
-                    s.cpu_generation,
-                    s.throttled_pids.clone(),
-                    s.suspended_pids.clone(),
-                    if on_pb_tab {
-                        s.throttle_infos.clone()
-                    } else {
-                        Default::default()
-                    },
-                    if on_log_tab {
-                        s.log_lines.clone()
-                    } else {
-                        Default::default()
-                    },
-                    s.config.clone(),
-                    s.gaming_active,
-                    s.gaming_changes,
-                    if on_hw_tab {
-                        s.hw_monitor.clone()
-                    } else {
-                        Default::default()
-                    },
-                    if on_proc_tab {
-                        s.proc_cpu_history.clone()
-                    } else {
-                        Default::default()
-                    },
-                    if on_overview_tab {
-                        s.cpu_history.clone()
-                    } else {
-                        Default::default()
-                    },
-                    if on_overview_tab {
-                        s.disk_io_history.clone()
-                    } else {
-                        Default::default()
-                    },
-                    if on_overview_tab {
-                        s.net_io_history.clone()
-                    } else {
-                        Default::default()
-                    },
-                    s.notable_events.clone(),
-                    s.cpu_avg,
-                )
+        let s = self.state.lock().ok()?;
+        Some(FrameData {
+            snapshot: s.snapshot.clone(),
+            cpu_pcts: s.cpu_percents.clone(),
+            cpu_gen: s.cpu_generation,
+            throttled_pids: s.throttled_pids.clone(),
+            suspended_pids: s.suspended_pids.clone(),
+            throttle_infos: if on_pb_tab {
+                s.throttle_infos.clone()
             } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(500));
-                return;
-            }
-        };
+                Default::default()
+            },
+            log_lines: if on_log_tab {
+                s.log_lines.clone()
+            } else {
+                Default::default()
+            },
+            config: s.config.clone(),
+            gaming_active: s.gaming_active,
+            gaming_changes: s.gaming_changes,
+            hw_monitor: if on_hw_tab {
+                s.hw_monitor.clone()
+            } else {
+                Default::default()
+            },
+            proc_cpu_history: if on_proc_tab {
+                s.proc_cpu_history.clone()
+            } else {
+                Default::default()
+            },
+            cpu_history: if on_overview_tab {
+                s.cpu_history.clone()
+            } else {
+                Default::default()
+            },
+            disk_io_history: if on_overview_tab {
+                s.disk_io_history.clone()
+            } else {
+                Default::default()
+            },
+            net_io_history: if on_overview_tab {
+                s.net_io_history.clone()
+            } else {
+                Default::default()
+            },
+            notable_events: s.notable_events.clone(),
+            cpu_avg: s.cpu_avg,
+        })
+    }
 
-        self.proc_count = snapshot.len();
-        self.throttled_count = throttled_pids.len();
-        // Gaming Mode belongs to the daemon; the tab and the status bar both
-        // show its state rather than keeping their own.
-        self.gaming_mode_tab
-            .sync_gaming_state(gaming_active, gaming_changes);
-
-        // Only push CPU bars + history when the daemon has emitted a new sample.
-        // The hwmon temp scan (a full /sys/class/hwmon walk) also lives here —
-        // it's far too expensive to run on every 60fps repaint.
-        if cpu_gen != self.last_cpu_gen && !cpu_pcts.is_empty() {
-            self.last_cpu_gen = cpu_gen;
-            self.process_tab.update_cpu(cpu_pcts.clone(), cpu_avg);
-            self.cpu_temp = read_cpu_temp();
-        }
-
-        // Poll active dialogs
-        let notif_enabled = config.ui.notifications_enabled;
-        let notify_error = move |msg: &str| {
-            log::error!("{msg}");
-            if notif_enabled {
-                let _ = notify_rust::Notification::new()
-                    .summary("Argus-Lasso Error")
-                    .body(msg)
-                    .timeout(notify_rust::Timeout::Milliseconds(5000))
-                    .show();
-            }
-        };
-        self.dialog_manager.poll_dialogs(
-            ctx,
-            self.opacity,
-            &self.state,
-            &self.cmd_tx,
-            &self.rule_engine,
-            &notify_error,
-        );
-
-        // Per-process details window
-        self.detail_window
-            .show(ctx, &snapshot, &proc_cpu_history, cpu_gen, self.opacity);
-
+    /// Deliver a kill whose undo window has run out.
+    fn deliver_due_kill(&mut self, notifications_enabled: bool) {
         // Check pending kill
         if let Some(ref mut pk) = self.pending_kill {
             if std::time::Instant::now() >= pk.deadline {
@@ -657,7 +746,7 @@ impl eframe::App for ArgusLassoApp {
                     ),
                     Err(e) => format!("Kill failed for {} ({}): {e}", name, pid),
                 };
-                if config.ui.notifications_enabled {
+                if notifications_enabled {
                     let _ = notify_rust::Notification::new()
                         .summary("Argus-Lasso")
                         .body(&msg)
@@ -670,18 +759,15 @@ impl eframe::App for ArgusLassoApp {
                 self.pending_kill = None;
             }
         }
+    }
 
-        // ── Top-level panels ─────────────────────────────────────────────
-        // Build pending-kill display info before the panel closure (avoids borrow issues)
-        let pending_kill_info: Option<(u32, String, u64)> = self.pending_kill.as_ref().map(|pk| {
-            let remaining = pk
-                .deadline
-                .saturating_duration_since(std::time::Instant::now())
-                .as_secs();
-            (pk.pid, pk.name.clone(), remaining)
-        });
-        let mut undo_requested = false;
-
+    fn show_status_bar(
+        &mut self,
+        root_ui: &mut egui::Ui,
+        cpu_avg: f32,
+        gaming_active: bool,
+        notable_events: &std::collections::VecDeque<String>,
+    ) {
         egui::Panel::bottom("status_bar").show_inside(root_ui, |ui| {
             let compact_status = ui.available_width() < 1100.0;
             ui.horizontal(|ui| {
@@ -769,6 +855,19 @@ impl eframe::App for ArgusLassoApp {
                 });
             });
         });
+    }
+
+    /// The undo toast for a pending kill, and its Undo.
+    fn show_kill_toast(&mut self, ctx: &egui::Context) {
+        // Build pending-kill display info before the panel closure (avoids borrow issues)
+        let pending_kill_info: Option<(u32, String, u64)> = self.pending_kill.as_ref().map(|pk| {
+            let remaining = pk
+                .deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .as_secs();
+            (pk.pid, pk.name.clone(), remaining)
+        });
+        let mut undo_requested = false;
 
         // ── Kill-undo toast (bottom-right, above the rule-offer slot) ──────
         if let Some((_, ref kill_name, remaining)) = pending_kill_info {
@@ -809,7 +908,9 @@ impl eframe::App for ArgusLassoApp {
             }
             self.pending_kill = None;
         }
+    }
 
+    fn show_error_banners(&mut self, root_ui: &mut egui::Ui) {
         let operation_error = self
             .state
             .lock()
@@ -842,473 +943,507 @@ impl eframe::App for ArgusLassoApp {
                 });
             });
         }
+    }
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(ctx.global_style().visuals.panel_fill).inner_margin(16))
-            .show_inside(root_ui, |ui| {
-            // Tab bar: five primary workflow tabs on the left; the occasional
-            // tools live behind a "Tools ▾" menu and Settings behind the gear,
-            // so nine equal flat tabs no longer bury the ones people live in.
-            ui.horizontal_wrapped(|ui| {
-                use crate::gui::theme as th;
+    fn show_tab_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            use crate::gui::theme as th;
+            let s = th::sem(ui);
+
+            // One tab: accent background + 2px bottom underline when active,
+            // with an optional count pill badge inside the label.
+            // A plain fn returning "was clicked" — a closure capturing the
+            // result slot would hold a mutable borrow across the whole bar.
+            let active_now = self.active_tab.clone();
+            let mut clicked_tab: Option<Tab> = None;
+            fn tab_button(
+                ui: &mut egui::Ui,
+                label: &str,
+                selected: bool,
+                badge: Option<usize>,
+            ) -> bool {
+                use crate::gui::theme::{self as th, tokens};
                 let s = th::sem(ui);
-
-                // One tab: accent background + 2px bottom underline when active,
-                // with an optional count pill badge inside the label.
-                // A plain fn returning "was clicked" — a closure capturing the
-                // result slot would hold a mutable borrow across the whole bar.
-                let active_now = self.active_tab.clone();
-                let mut clicked_tab: Option<Tab> = None;
-                fn tab_button(
-                    ui: &mut egui::Ui,
-                    label: &str,
-                    selected: bool,
-                    badge: Option<usize>,
-                ) -> bool {
-                    use crate::gui::theme::{self as th, tokens};
-                    let s = th::sem(ui);
-                    let text_col = if selected {
-                        s.accent
-                    } else {
-                        ui.visuals().text_color()
-                    };
-                    let galley = ui.painter().layout_no_wrap(
-                        label.to_string(),
-                        egui::FontId::proportional(tokens::FONT_BODY),
-                        text_col,
-                    );
-                    let badge_txt = badge.map(|n| n.to_string());
-                    let badge_galley = badge_txt.as_ref().map(|t| {
-                        ui.painter().layout_no_wrap(
-                            t.clone(),
-                            egui::FontId::proportional(tokens::FONT_SMALL),
-                            if selected { s.on_accent } else { s.accent },
-                        )
-                    });
-                    let badge_w = badge_galley
-                        .as_ref()
-                        .map(|g| g.size().x + 12.0 + 6.0)
-                        .unwrap_or(0.0);
-                    let pad = egui::vec2(10.0, 5.0);
-                    let size = egui::vec2(
-                        galley.size().x + badge_w + pad.x * 2.0,
-                        galley.size().y + pad.y * 2.0,
-                    );
-                    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-                    if ui.is_rect_visible(rect) {
-                        if selected {
-                            ui.painter().rect_filled(
-                                rect,
-                                egui::CornerRadius {
-                                    nw: 3,
-                                    ne: 3,
-                                    sw: 0,
-                                    se: 0,
-                                },
-                                th::tint(s.accent, 38),
-                            );
-                            // 2px accent underline
-                            ui.painter().rect_filled(
-                                egui::Rect::from_min_size(
-                                    egui::pos2(rect.left(), rect.bottom() - 2.0),
-                                    egui::vec2(rect.width(), 2.0),
-                                ),
-                                0.0,
-                                s.accent,
-                            );
-                        } else if resp.hovered() {
-                            ui.painter().rect_filled(
-                                rect,
-                                egui::CornerRadius::same(3),
-                                ui.visuals().widgets.hovered.bg_fill,
-                            );
-                        }
-                        ui.painter()
-                            .galley(rect.min + pad, galley, egui::Color32::WHITE);
-                        if let Some(bg) = badge_galley {
-                            let bw = bg.size().x + 12.0;
-                            let brect = egui::Rect::from_min_size(
-                                egui::pos2(rect.max.x - pad.x - bw, rect.center().y - 8.0),
-                                egui::vec2(bw, 16.0),
-                            );
-                            let fill = if selected {
-                                s.accent
-                            } else {
-                                th::tint(s.accent, 46)
-                            };
-                            ui.painter()
-                                .rect_filled(brect, egui::CornerRadius::same(8), fill);
-                            let off = (brect.size() - bg.size()) * 0.5;
-                            ui.painter()
-                                .galley(brect.min + off, bg, egui::Color32::WHITE);
-                        }
-                    }
-                    resp.clicked()
-                }
-
-                let pick = |ui: &mut egui::Ui,
-                            label: &str,
-                            tab: Tab,
-                            badge: Option<usize>,
-                            clicked_tab: &mut Option<Tab>| {
-                    if tab_button(ui, label, active_now == tab, badge) {
-                        *clicked_tab = Some(tab);
-                    }
+                let text_col = if selected {
+                    s.accent
+                } else {
+                    ui.visuals().text_color()
                 };
-
-                pick(ui, "Overview", Tab::Overview, None, &mut clicked_tab);
-                pick(
-                    ui,
-                    "Processes",
-                    Tab::Processes,
-                    Some(self.proc_count),
-                    &mut clicked_tab,
+                let galley = ui.painter().layout_no_wrap(
+                    label.to_string(),
+                    egui::FontId::proportional(tokens::FONT_BODY),
+                    text_col,
                 );
-                pick(ui, "Process rules", Tab::Rules, None, &mut clicked_tab);
-                pick(
-                    ui,
-                    "ProBalance",
-                    Tab::ProBalance,
-                    (self.throttled_count > 0).then_some(self.throttled_count),
-                    &mut clicked_tab,
+                let badge_txt = badge.map(|n| n.to_string());
+                let badge_galley = badge_txt.as_ref().map(|t| {
+                    ui.painter().layout_no_wrap(
+                        t.clone(),
+                        egui::FontId::proportional(tokens::FONT_SMALL),
+                        if selected { s.on_accent } else { s.accent },
+                    )
+                });
+                let badge_w = badge_galley
+                    .as_ref()
+                    .map(|g| g.size().x + 12.0 + 6.0)
+                    .unwrap_or(0.0);
+                let pad = egui::vec2(10.0, 5.0);
+                let size = egui::vec2(
+                    galley.size().x + badge_w + pad.x * 2.0,
+                    galley.size().y + pad.y * 2.0,
                 );
-                pick(ui, "Gaming", Tab::GamingMode, None, &mut clicked_tab);
+                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                if ui.is_rect_visible(rect) {
+                    if selected {
+                        ui.painter().rect_filled(
+                            rect,
+                            egui::CornerRadius {
+                                nw: 3,
+                                ne: 3,
+                                sw: 0,
+                                se: 0,
+                            },
+                            th::tint(s.accent, 38),
+                        );
+                        // 2px accent underline
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.left(), rect.bottom() - 2.0),
+                                egui::vec2(rect.width(), 2.0),
+                            ),
+                            0.0,
+                            s.accent,
+                        );
+                    } else if resp.hovered() {
+                        ui.painter().rect_filled(
+                            rect,
+                            egui::CornerRadius::same(3),
+                            ui.visuals().widgets.hovered.bg_fill,
+                        );
+                    }
+                    ui.painter()
+                        .galley(rect.min + pad, galley, egui::Color32::WHITE);
+                    if let Some(bg) = badge_galley {
+                        let bw = bg.size().x + 12.0;
+                        let brect = egui::Rect::from_min_size(
+                            egui::pos2(rect.max.x - pad.x - bw, rect.center().y - 8.0),
+                            egui::vec2(bw, 16.0),
+                        );
+                        let fill = if selected {
+                            s.accent
+                        } else {
+                            th::tint(s.accent, 46)
+                        };
+                        ui.painter()
+                            .rect_filled(brect, egui::CornerRadius::same(8), fill);
+                        let off = (brect.size() - bg.size()) * 0.5;
+                        ui.painter()
+                            .galley(brect.min + off, bg, egui::Color32::WHITE);
+                    }
+                }
+                resp.clicked()
+            }
 
-                let compact_tools = ui.max_rect().width() < 1000.0;
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Right-to-left: Settings first (rightmost), then Tools menu.
-                    pick(ui, "⚙  Settings", Tab::Settings, None, &mut clicked_tab);
-                    let tools_active =
-                        matches!(active_now, Tab::HwMonitor | Tab::Benchmark | Tab::Log);
-                    let tool_name = if compact_tools { "Tools ▾" } else { match active_now {
+            let pick = |ui: &mut egui::Ui,
+                        label: &str,
+                        tab: Tab,
+                        badge: Option<usize>,
+                        clicked_tab: &mut Option<Tab>| {
+                if tab_button(ui, label, active_now == tab, badge) {
+                    *clicked_tab = Some(tab);
+                }
+            };
+
+            pick(ui, "Overview", Tab::Overview, None, &mut clicked_tab);
+            pick(
+                ui,
+                "Processes",
+                Tab::Processes,
+                Some(self.proc_count),
+                &mut clicked_tab,
+            );
+            pick(ui, "Process rules", Tab::Rules, None, &mut clicked_tab);
+            pick(
+                ui,
+                "ProBalance",
+                Tab::ProBalance,
+                (self.throttled_count > 0).then_some(self.throttled_count),
+                &mut clicked_tab,
+            );
+            pick(ui, "Gaming", Tab::GamingMode, None, &mut clicked_tab);
+
+            let compact_tools = ui.max_rect().width() < 1000.0;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right-to-left: Settings first (rightmost), then Tools menu.
+                pick(ui, "⚙  Settings", Tab::Settings, None, &mut clicked_tab);
+                let tools_active = matches!(active_now, Tab::HwMonitor | Tab::Benchmark | Tab::Log);
+                let tool_name = if compact_tools {
+                    "Tools ▾"
+                } else {
+                    match active_now {
                         Tab::HwMonitor => "Hardware sensors ▾",
                         Tab::Benchmark => "Memory benchmarks ▾",
                         Tab::Log => "Activity log ▾",
                         _ => "Tools ▾",
-                    }};
-                    let tools_label = if tools_active { RichText::new(tool_name).color(s.accent).strong() } else { RichText::new(tool_name) };
-                    // menu_button paints a full button frame, which read as
-                    // "this control is pressed" next to the frameless tabs —
-                    // the design review flagged it as looking active with the
-                    // menu closed. Strip the frame so it sits in the bar like
-                    // the tabs do; the accent text still marks a Tools tab.
-                    // Scoped to this one button (a global visuals_mut() here
-                    // would strip every button's frame app-wide).
-                    egui::containers::menu::MenuButton::from_button(
-                        egui::Button::new(tools_label).frame(false),
-                    )
-                    .ui(ui, |ui| {
-                        for (label, tab) in [
-                            ("Hardware sensors", Tab::HwMonitor),
-                            ("Memory benchmarks", Tab::Benchmark),
-                            ("Activity log", Tab::Log),
-                        ] {
-                            if ui.selectable_label(active_now == tab, label).clicked() {
-                                clicked_tab = Some(tab);
-                                ui.close();
-                            }
+                    }
+                };
+                let tools_label = if tools_active {
+                    RichText::new(tool_name).color(s.accent).strong()
+                } else {
+                    RichText::new(tool_name)
+                };
+                // menu_button paints a full button frame, which read as
+                // "this control is pressed" next to the frameless tabs —
+                // the design review flagged it as looking active with the
+                // menu closed. Strip the frame so it sits in the bar like
+                // the tabs do; the accent text still marks a Tools tab.
+                // Scoped to this one button (a global visuals_mut() here
+                // would strip every button's frame app-wide).
+                egui::containers::menu::MenuButton::from_button(
+                    egui::Button::new(tools_label).frame(false),
+                )
+                .ui(ui, |ui| {
+                    for (label, tab) in [
+                        ("Hardware sensors", Tab::HwMonitor),
+                        ("Memory benchmarks", Tab::Benchmark),
+                        ("Activity log", Tab::Log),
+                    ] {
+                        if ui.selectable_label(active_now == tab, label).clicked() {
+                            clicked_tab = Some(tab);
+                            ui.close();
                         }
-                    });
+                    }
                 });
-                if let Some(tab) = clicked_tab {
-                    self.active_tab = tab;
-                }
             });
-            ui.separator();
-
-            // ── Update banner ────────────────────────────────────────────
-            // Poll first: the worker runs off-thread, so without an explicit
-            // repaint the result would sit unseen until the next input event.
-            if self.updates.poll() {
-                ctx.request_repaint();
-            }
-            if let Some(update) = self.updates.available.as_ref() {
-                if !self.updates.banner_dismissed {
-                    let s = crate::gui::theme::sem(ui);
-                    let text = if self.updates.installed {
-                        format!("{} installed — restart to run it", update.tag)
-                    } else {
-                        format!(
-                            "{} is available (you have v{})",
-                            update.tag,
-                            crate::updater::current_version()
-                        )
-                    };
-                    let action = if self.updates.installed {
-                        "Restart now"
-                    } else if self.updates.busy {
-                        "Working…"
-                    } else {
-                        "Update now"
-                    };
-                    ui.add_space(4.0);
-                    let (act, dismiss) = crate::gui::theme::banner_dismissible(
-                        ui,
-                        s.accent,
-                        &text,
-                        Some(action),
-                        true,
-                    );
-                    if dismiss {
-                        self.updates.banner_dismissed = true;
-                    }
-                    if act && !self.updates.busy {
-                        if self.updates.installed {
-                            self.updates.restart_requested = true;
-                        } else {
-                            self.updates.start_install();
-                        }
-                    }
-                    ui.add_space(4.0);
-                }
-            }
-
-            let (title, description) = match self.active_tab {
-                Tab::Overview => ("Overview", "System activity at a glance."),
-                Tab::Processes => ("Processes", "Inspect running processes. Right-click a row for actions; double-click for details."),
-                Tab::Rules => ("Process rules", "Choose persistent CPU assignments and priorities for matching applications."),
-                Tab::ProBalance => ("ProBalance", "Keep the system responsive by temporarily limiting busy background processes."),
-                Tab::GamingMode => ("Gaming", "CPU control, game profiles, overlay and performance recordings."),
-                Tab::HwMonitor => ("Hardware sensors", "Live readings grouped by component, with session minimums, maximums and averages."),
-                Tab::Benchmark => ("Memory benchmarks", "Measure memory latency and bandwidth. Game recordings are in Gaming → Recording."),
-                Tab::Settings => ("Settings", "Customize Argus and its defaults. Changes that need applying are collected in the bottom bar."),
-                Tab::Log => ("Activity log", "Review process actions, rule changes and hardware alerts."),
-            };
-            crate::gui::theme::page_intro(ui, title, description);
-
-            // ── Tab content ──────────────────────────────────────────────
-            match self.active_tab {
-                Tab::Overview => {
-                    self.overview_tab.show(
-                        ui,
-                        &cpu_history,
-                        cpu_avg,
-                        &snapshot,
-                        &disk_io_history,
-                        &net_io_history,
-                        self.cpu_temp,
-                        self.throttled_count,
-                    );
-                }
-
-                Tab::Processes => {
-                    let action = self.process_tab.show(
-                        ui,
-                        &snapshot,
-                        &throttled_pids,
-                        &suspended_pids,
-                        &self.cmd_tx,
-                        &self.rule_engine,
-                        gaming_active,
-                        &proc_cpu_history,
-                    );
-                    let mut trigger_rule = None;
-                    crate::gui::action_handler::ActionHandler::handle(
-                        action,
-                        &snapshot,
-                        &self.state,
-                        &mut self.pending_kill,
-                        &mut self.dialog_manager,
-                        &mut self.detail_window,
-                        &notify_error,
-                        &mut trigger_rule,
-                    );
-                    if let Some(rule) = trigger_rule {
-                        self.rules_tab.open_add_dialog(Some(rule));
-                        self.active_tab = Tab::Rules;
-                    }
-                    // Persist col_widths when user drags a column divider
-                    // (the pending save is flushed independently of the active tab).
-                    if self.process_tab.cols_dirty {
-                        if let Ok(mut s) = self.state.lock() {
-                            s.config.ui.col_widths = self.process_tab.col_widths.clone();
-                        }
-                        self.pending_config_save.dirty = true;
-                    }
-                    // Persist column visibility from the header context menu
-                    if self.process_tab.hidden_dirty {
-                        self.process_tab.hidden_dirty = false;
-                        let mut hidden: Vec<String> =
-                            self.process_tab.hidden_cols.iter().cloned().collect();
-                        hidden.sort();
-                        if let Ok(mut s) = self.state.lock() {
-                            s.config.ui.hidden_columns = hidden;
-                        }
-                        self.save_config();
-                    }
-                }
-
-                Tab::Rules => {
-                    let mut rules_changed = false;
-                    let mut profiles_changed = false;
-                    let mut rule_profiles = config.rule_profiles.clone();
-                    // Process names for the rule dialog's live match count.
-                    self.rules_tab.show(
-                        ui,
-                        ctx,
-                        &self.rule_engine,
-                        &mut rules_changed,
-                        self.opacity,
-                        &snapshot,
-                        &mut rule_profiles,
-                        &mut profiles_changed,
-                    );
-                    if rules_changed {
-                        // Never nest the engine lock inside the state lock —
-                        // the daemon nests them the other way around.
-                        let rules_cfg = self
-                            .rule_engine
-                            .lock()
-                            .map(|re| re.to_config_list())
-                            .unwrap_or_default();
-                        // ReapplyDefaults alone only re-runs the shared
-                        // RuleEngine against known PIDs; the daemon's config
-                        // mirror learns about the rules from ConfigChanged.
-                        self.update_config(|c| c.rules = rules_cfg);
-                        self.send(DaemonCmd::ReapplyDefaults);
-                        self.save_config();
-                    }
-                    if profiles_changed {
-                        self.update_config(|c| c.rule_profiles = rule_profiles);
-                        self.save_config();
-                    }
-                }
-
-                Tab::ProBalance => {
-                    if let Some(pb_cfg) = self.probalance_tab.show(ui, &snapshot, &throttle_infos, cpu_avg) {
-                        self.update_config(|c| c.probalance = pb_cfg);
-                        self.save_config();
-                    }
-                }
-
-                Tab::GamingMode => {
-                    self.gaming_mode_tab.show(ui, ctx, self.opacity);
-                    // Drain events
-                }
-
-                Tab::HwMonitor => {
-                    self.hw_monitor_tab.show(ui, &hw_monitor);
-                    if self.hw_monitor_tab.cols_dirty {
-                        let widths = self.hw_monitor_tab.col_widths.to_vec();
-                        if let Ok(mut s) = self.state.lock() {
-                            s.config.ui.hw_mon_col_widths = widths;
-                        }
-                        self.pending_config_save.dirty = true;
-                    }
-                }
-
-                Tab::Benchmark => {
-                    self.bench_tab.show(ui, self.opacity);
-                }
-
-                Tab::Settings => {
-                    let config_changed =
-                        self.settings_tab
-                            .show(ui, ctx, self.opacity, &mut self.updates);
-
-                    // Live opacity preview — apply every frame the slider moves,
-                    // regardless of whether the Apply button was clicked.
-                    let new_opacity = self.settings_tab.opacity;
-                    if (new_opacity - self.opacity).abs() > 0.001 {
-                        self.opacity = new_opacity;
-                        eprintln!("[opacity] applying opacity={new_opacity:.3}");
-                        if let Some(ref wo) = self.wayland_opacity {
-                            wo.set(new_opacity);
-                        } else {
-                            // Fallback: control opacity via window_fill alpha so the
-                            // compositor sees a semi-transparent clear colour.
-                            let alpha = (new_opacity * 255.0) as u8;
-                            let theme = &self.settings_tab.theme;
-                            ctx.global_style_mut(|s| {
-                                let (r, g, b) = crate::gui::theme::window_bg_rgb(theme);
-                                let col = egui::Color32::from_rgba_unmultiplied(r, g, b, alpha);
-                                s.visuals.window_fill = col;
-                                s.visuals.panel_fill = col;
-                            });
-                        }
-                    }
-
-                    if let Some(updated) = config_changed {
-                        self.update_config(|c| {
-                            c.cpu.default_affinity = updated.cpu.default_affinity;
-                            c.monitor = updated.monitor;
-                            c.hw_alerts = updated.hw_alerts;
-                            c.ui.notifications_enabled = updated.ui.notifications_enabled;
-                            c.ui.check_updates_on_start = updated.ui.check_updates_on_start;
-                            c.ui.theme = updated.ui.theme;
-                            c.ui.opacity = updated.ui.opacity;
-                        });
-                        // Re-apply full theme (resets window_fill to opaque if needed)
-                        crate::gui::theme::apply_theme(
-                            ctx,
-                            self.native_ppp,
-                            &self.settings_tab.theme,
-                        );
-                        // Then re-apply opacity on top of the fresh theme
-                        if let Some(ref wo) = self.wayland_opacity {
-                            wo.set(self.opacity);
-                        }
-                        self.send(DaemonCmd::ReapplyDefaults);
-                        self.last_saved_opacity = self.settings_tab.opacity;
-                        self.last_saved_theme = self.settings_tab.theme.to_str().to_string();
-                        self.save_config();
-                    }
-
-                    // Detect live theme/opacity changes and persist immediately (no Apply needed)
-                    let cur_opacity = self.settings_tab.opacity;
-                    let cur_theme = self.settings_tab.theme.to_str().to_string();
-                    if (cur_opacity - self.last_saved_opacity).abs() > 0.001
-                        || cur_theme != self.last_saved_theme
-                    {
-                        self.last_saved_opacity = cur_opacity;
-                        self.last_saved_theme = cur_theme.clone();
-                        // Through update_config like the Apply handler above:
-                        // without ConfigChanged the daemon's own config
-                        // mirror never learns about the change.
-                        self.update_config(|c| {
-                            c.ui.opacity = cur_opacity;
-                            c.ui.theme = cur_theme;
-                        });
-                        // Same 300ms debounce as column-width dragging:
-                        // egui reports a changed value on every frame of a
-                        // slider drag, so saving unconditionally here would
-                        // fsync the config on every one of those frames.
-                        self.pending_config_save.dirty = true;
-                    }
-                }
-
-                Tab::Log => {
-                    let (clear, save) = self.log_tab.show_with_clear(ui, &log_lines);
-                    if clear {
-                        if let Ok(mut s) = self.state.lock() {
-                            s.log_lines.clear();
-                        }
-                    }
-                    if save {
-                        // Run the picker + write on a background thread — the
-                        // dialog subprocess blocks until closed and would
-                        // freeze the whole UI (same pattern as rules import).
-                        let content = log_lines.iter().cloned().collect::<Vec<_>>().join("\n");
-                        let state = self.state.clone();
-                        std::thread::spawn(move || {
-                            let result = crate::file_dialog::save("argus-lasso.log", "*.log *.txt")
-                                .and_then(|p| p.map(|p| std::fs::write(&p, &content)
-                                    .map(|_| format!("Log saved to {}", p.display()))
-                                    .map_err(|e| format!("Log save failed: {e}"))).transpose());
-                            if let Ok(mut s) = state.lock() {
-                                match result {
-                                    Ok(Some(msg)) => s.append_log(msg),
-                                    Ok(None) => {},
-                                    Err(e) => { s.append_log(e.clone()); s.operation_error = Some(e); }
-                                }
-                            }
-
-                        });
-                    }
-                }
+            if let Some(tab) = clicked_tab {
+                self.active_tab = tab;
             }
         });
+    }
 
+    fn show_update_banner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // ── Update banner ────────────────────────────────────────────
+        // Poll first: the worker runs off-thread, so without an explicit
+        // repaint the result would sit unseen until the next input event.
+        if self.updates.poll() {
+            ctx.request_repaint();
+        }
+        if let Some(update) = self.updates.available.as_ref() {
+            if !self.updates.banner_dismissed {
+                let s = crate::gui::theme::sem(ui);
+                let text = if self.updates.installed {
+                    format!("{} installed — restart to run it", update.tag)
+                } else {
+                    format!(
+                        "{} is available (you have v{})",
+                        update.tag,
+                        crate::updater::current_version()
+                    )
+                };
+                let action = if self.updates.installed {
+                    "Restart now"
+                } else if self.updates.busy {
+                    "Working…"
+                } else {
+                    "Update now"
+                };
+                ui.add_space(4.0);
+                let (act, dismiss) =
+                    crate::gui::theme::banner_dismissible(ui, s.accent, &text, Some(action), true);
+                if dismiss {
+                    self.updates.banner_dismissed = true;
+                }
+                if act && !self.updates.busy {
+                    if self.updates.installed {
+                        self.updates.restart_requested = true;
+                    } else {
+                        self.updates.start_install();
+                    }
+                }
+                ui.add_space(4.0);
+            }
+        }
+    }
+
+    fn show_tab_content(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        frame: &FrameData,
+        notify_error: &impl Fn(&str),
+    ) {
+        let FrameData {
+            ref snapshot,
+            ref throttle_infos,
+            ref hw_monitor,
+            ref cpu_history,
+            ref disk_io_history,
+            ref net_io_history,
+            cpu_avg,
+            ..
+        } = *frame;
+        // ── Tab content ──────────────────────────────────────────────
+        match self.active_tab {
+            Tab::Overview => {
+                self.overview_tab.show(
+                    ui,
+                    cpu_history,
+                    cpu_avg,
+                    snapshot,
+                    disk_io_history,
+                    net_io_history,
+                    self.cpu_temp,
+                    self.throttled_count,
+                );
+            }
+
+            Tab::Processes => self.show_processes_tab(ui, frame, notify_error),
+
+            Tab::Rules => self.show_rules_tab(ui, ctx, frame),
+
+            Tab::ProBalance => {
+                if let Some(pb_cfg) =
+                    self.probalance_tab
+                        .show(ui, snapshot, throttle_infos, cpu_avg)
+                {
+                    self.update_config(|c| c.probalance = pb_cfg);
+                    self.save_config();
+                }
+            }
+
+            Tab::GamingMode => {
+                self.gaming_mode_tab.show(ui, ctx, self.opacity);
+                // Drain events
+            }
+
+            Tab::HwMonitor => {
+                self.hw_monitor_tab.show(ui, hw_monitor);
+                if self.hw_monitor_tab.cols_dirty {
+                    let widths = self.hw_monitor_tab.col_widths.to_vec();
+                    if let Ok(mut s) = self.state.lock() {
+                        s.config.ui.hw_mon_col_widths = widths;
+                    }
+                    self.pending_config_save.dirty = true;
+                }
+            }
+
+            Tab::Benchmark => {
+                self.bench_tab.show(ui, self.opacity);
+            }
+
+            Tab::Settings => self.show_settings_tab(ui, ctx),
+
+            Tab::Log => self.show_log_tab(ui, &frame.log_lines),
+        }
+    }
+
+    fn show_processes_tab(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &FrameData,
+        notify_error: &impl Fn(&str),
+    ) {
+        let FrameData {
+            ref snapshot,
+            ref throttled_pids,
+            ref suspended_pids,
+            gaming_active,
+            ref proc_cpu_history,
+            ..
+        } = *frame;
+        let action = self.process_tab.show(
+            ui,
+            snapshot,
+            throttled_pids,
+            suspended_pids,
+            gaming_active,
+            proc_cpu_history,
+        );
+        let mut trigger_rule = None;
+        crate::gui::action_handler::ActionHandler::handle(
+            action,
+            snapshot,
+            &self.state,
+            &mut self.pending_kill,
+            &mut self.dialog_manager,
+            &mut self.detail_window,
+            &notify_error,
+            &mut trigger_rule,
+        );
+        if let Some(rule) = trigger_rule {
+            self.rules_tab.open_add_dialog(Some(rule));
+            self.active_tab = Tab::Rules;
+        }
+        // Persist col_widths when user drags a column divider
+        // (the pending save is flushed independently of the active tab).
+        if self.process_tab.cols_dirty {
+            if let Ok(mut s) = self.state.lock() {
+                s.config.ui.col_widths = self.process_tab.col_widths.clone();
+            }
+            self.pending_config_save.dirty = true;
+        }
+        // Persist column visibility from the header context menu
+        if self.process_tab.hidden_dirty {
+            self.process_tab.hidden_dirty = false;
+            let mut hidden: Vec<String> = self.process_tab.hidden_cols.iter().cloned().collect();
+            hidden.sort();
+            if let Ok(mut s) = self.state.lock() {
+                s.config.ui.hidden_columns = hidden;
+            }
+            self.save_config();
+        }
+    }
+
+    fn show_rules_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, frame: &FrameData) {
+        let FrameData {
+            ref snapshot,
+            ref config,
+            ..
+        } = *frame;
+        let mut rules_changed = false;
+        let mut profiles_changed = false;
+        let mut rule_profiles = config.rule_profiles.clone();
+        // Process names for the rule dialog's live match count.
+        self.rules_tab.show(
+            ui,
+            ctx,
+            &self.rule_engine,
+            &mut rules_changed,
+            self.opacity,
+            snapshot,
+            &mut rule_profiles,
+            &mut profiles_changed,
+        );
+        if rules_changed {
+            // Never nest the engine lock inside the state lock —
+            // the daemon nests them the other way around.
+            let rules_cfg = self
+                .rule_engine
+                .lock()
+                .map(|re| re.to_config_list())
+                .unwrap_or_default();
+            // ReapplyDefaults alone only re-runs the shared
+            // RuleEngine against known PIDs; the daemon's config
+            // mirror learns about the rules from ConfigChanged.
+            self.update_config(|c| c.rules = rules_cfg);
+            self.send(DaemonCmd::ReapplyDefaults);
+            self.save_config();
+        }
+        if profiles_changed {
+            self.update_config(|c| c.rule_profiles = rule_profiles);
+            self.save_config();
+        }
+    }
+
+    fn show_settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let config_changed = self
+            .settings_tab
+            .show(ui, ctx, self.opacity, &mut self.updates);
+
+        // Live opacity preview — apply every frame the slider moves,
+        // regardless of whether the Apply button was clicked.
+        let new_opacity = self.settings_tab.opacity;
+        if (new_opacity - self.opacity).abs() > 0.001 {
+            self.opacity = new_opacity;
+            eprintln!("[opacity] applying opacity={new_opacity:.3}");
+            if let Some(ref wo) = self.wayland_opacity {
+                wo.set(new_opacity);
+            } else {
+                // Fallback: control opacity via window_fill alpha so the
+                // compositor sees a semi-transparent clear colour.
+                let alpha = (new_opacity * 255.0) as u8;
+                let theme = &self.settings_tab.theme;
+                ctx.global_style_mut(|s| {
+                    let (r, g, b) = crate::gui::theme::window_bg_rgb(theme);
+                    let col = egui::Color32::from_rgba_unmultiplied(r, g, b, alpha);
+                    s.visuals.window_fill = col;
+                    s.visuals.panel_fill = col;
+                });
+            }
+        }
+
+        if let Some(updated) = config_changed {
+            self.update_config(|c| {
+                c.cpu.default_affinity = updated.cpu.default_affinity;
+                c.monitor = updated.monitor;
+                c.hw_alerts = updated.hw_alerts;
+                c.ui.notifications_enabled = updated.ui.notifications_enabled;
+                c.ui.check_updates_on_start = updated.ui.check_updates_on_start;
+                c.ui.theme = updated.ui.theme;
+                c.ui.opacity = updated.ui.opacity;
+            });
+            // Re-apply full theme (resets window_fill to opaque if needed)
+            crate::gui::theme::apply_theme(ctx, self.native_ppp, &self.settings_tab.theme);
+            // Then re-apply opacity on top of the fresh theme
+            if let Some(ref wo) = self.wayland_opacity {
+                wo.set(self.opacity);
+            }
+            self.send(DaemonCmd::ReapplyDefaults);
+            self.last_saved_opacity = self.settings_tab.opacity;
+            self.last_saved_theme = self.settings_tab.theme.to_str().to_string();
+            self.save_config();
+        }
+
+        // Detect live theme/opacity changes and persist immediately (no Apply needed)
+        let cur_opacity = self.settings_tab.opacity;
+        let cur_theme = self.settings_tab.theme.to_str().to_string();
+        if (cur_opacity - self.last_saved_opacity).abs() > 0.001
+            || cur_theme != self.last_saved_theme
+        {
+            self.last_saved_opacity = cur_opacity;
+            self.last_saved_theme = cur_theme.clone();
+            // Through update_config like the Apply handler above:
+            // without ConfigChanged the daemon's own config
+            // mirror never learns about the change.
+            self.update_config(|c| {
+                c.ui.opacity = cur_opacity;
+                c.ui.theme = cur_theme;
+            });
+            // Same 300ms debounce as column-width dragging:
+            // egui reports a changed value on every frame of a
+            // slider drag, so saving unconditionally here would
+            // fsync the config on every one of those frames.
+            self.pending_config_save.dirty = true;
+        }
+    }
+
+    fn show_log_tab(&mut self, ui: &mut egui::Ui, log_lines: &std::collections::VecDeque<String>) {
+        let (clear, save) = self.log_tab.show_with_clear(ui, log_lines);
+        if clear {
+            if let Ok(mut s) = self.state.lock() {
+                s.log_lines.clear();
+            }
+        }
+        if save {
+            // Run the picker + write on a background thread — the
+            // dialog subprocess blocks until closed and would
+            // freeze the whole UI (same pattern as rules import).
+            let content = log_lines.iter().cloned().collect::<Vec<_>>().join("\n");
+            let state = self.state.clone();
+            std::thread::spawn(move || {
+                let result =
+                    crate::file_dialog::save("argus-lasso.log", "*.log *.txt").and_then(|p| {
+                        p.map(|p| {
+                            std::fs::write(&p, &content)
+                                .map(|_| format!("Log saved to {}", p.display()))
+                                .map_err(|e| format!("Log save failed: {e}"))
+                        })
+                        .transpose()
+                    });
+                if let Ok(mut s) = state.lock() {
+                    match result {
+                        Ok(Some(msg)) => s.append_log(msg),
+                        Ok(None) => {}
+                        Err(e) => {
+                            s.append_log(e.clone());
+                            s.operation_error = Some(e);
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    fn flush_pending_save(&mut self, ctx: &egui::Context) {
         // Flush even after a slider stops moving or the user switches tabs.
         let now = std::time::Instant::now();
         if self.pending_config_save.take_due(now) {
@@ -1317,7 +1452,9 @@ impl eframe::App for ArgusLassoApp {
         if let Some(delay) = self.pending_config_save.remaining(now) {
             ctx.request_repaint_after(delay);
         }
+    }
 
+    fn capture_tour_frame(&mut self, ctx: &egui::Context) {
         // ── --ui-tour capture ───────────────────────────────────────────────
         // Last thing in the frame: the screen is fully laid out by now, so the
         // framebuffer egui hands back is the one this step is documenting.
@@ -1343,7 +1480,9 @@ impl eframe::App for ArgusLassoApp {
                 std::process::exit(if failures.is_empty() { 0 } else { 1 });
             }
         }
+    }
 
+    fn restart_if_requested(&mut self) {
         // ── Restart into a freshly installed update ─────────────────────────
         // Both the banner and the Settings card only set the flag; the exec
         // happens here, after the daemon has restored nices, throttles and
@@ -1365,19 +1504,6 @@ impl eframe::App for ArgusLassoApp {
                 crate::updater::restart()
             );
         }
-
-        // Repaint when next display refresh is due — avoids continuous 60fps rendering.
-        // While a kill countdown is pending, repaint fast enough that the
-        // countdown updates and the SIGTERM actually fires near its deadline
-        // (with a long refresh interval it could otherwise fire seconds late).
-        let repaint_ms = if self.pending_kill.is_some() {
-            250
-        } else {
-            // A 0 (or a hand-edited config with a bogus value) would request a
-            // repaint every frame — unbounded 60fps. Clamp to a sane floor.
-            config.monitor.display_refresh_interval_ms.max(100)
-        };
-        ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
     }
 }
 
