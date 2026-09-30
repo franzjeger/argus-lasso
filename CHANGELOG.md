@@ -258,6 +258,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - "Delete rule?" deletes the rule it names; selecting another row while it was
   open switched it to that row. "Show all rules" under Live rule effects clears
   the rule filter again.
+- Dragging a slider or colour in the HUD customization window updates the HUD
+  live but saves the configuration once it settles, and the Activity log records
+  only what changed: it got a "Config updated" line, and the file a save, for
+  every frame of the drag.
 
 ### Changed
 

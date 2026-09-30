@@ -651,7 +651,7 @@ impl ArgusLassoApp {
                         c.gaming_mode.overlay.show_overlay = shown;
                         c.ui.global_overlay = cfg.ui.global_overlay;
                     });
-                    self.save_config();
+                    self.pending_config_save.dirty = true;
                 }
             }
         }
@@ -663,7 +663,9 @@ impl ArgusLassoApp {
                     tab.overlay_shown(overlay.show_overlay, c.gaming_mode.overlay.show_overlay);
                 c.gaming_mode.overlay = overlay;
             });
-            self.save_config();
+            // The HUD follows every frame of a slider or colour drag through
+            // the ConfigChanged above; the file is saved once it settles.
+            self.pending_config_save.dirty = true;
         }
     }
 
