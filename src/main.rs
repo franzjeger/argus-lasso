@@ -165,6 +165,10 @@ enum Cmd {
     },
     /// Toggle the visibility of the overlay HUD
     ToggleOverlay,
+    /// Install or update the CPU control helpers (parking, power profile,
+    /// renice). pkexec asks for authentication: in a dialog on the desktop,
+    /// or in this terminal over SSH.
+    InstallHelpers,
     /// Print a JSON status snapshot (system + top processes) and exit
     Status {
         /// Include only the top N processes by CPU (0 = all)
@@ -366,6 +370,14 @@ fn main() {
                     std::process::exit(1);
                 }
                 println!("Overlay toggle requested.");
+                return;
+            }
+            Cmd::InstallHelpers => {
+                let (installed, message) = cpu_park::install_helper_via_pkexec();
+                println!("{message}");
+                if !installed {
+                    std::process::exit(1);
+                }
                 return;
             }
         }
