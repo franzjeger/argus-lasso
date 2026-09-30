@@ -24,6 +24,10 @@ jobs:
   release:
     name: build & publish (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    # The job that signs. The "release" environment makes it wait for the
+    # maintainer's approval and holds the signing key as its own secret, so
+    # neither pushing a v* tag nor any other workflow gets a release signed.
+    environment: release
     strategy:
       fail-fast: false
       matrix:
