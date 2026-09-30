@@ -1,5 +1,6 @@
 //! Bounded asynchronous per-present recording. Disk I/O and sorting never run
-//! on the presentation thread. Separate files for each swapchain lifetime.
+//! on the presentation thread. Separate files for each swapchain lifetime:
+//! the end of one is never dropped, so a recycled handle starts a new file.
 use argus_ipc::capture::{self, Control, Summary};
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
@@ -23,6 +24,8 @@ struct Sample {
 enum Event {
     Frame(Sample),
     End(u64, u64),
+    /// Answered once everything sent before it has been handled.
+    Barrier(mpsc::Sender<()>),
 }
 pub struct Recorder {
     tx: SyncSender<Event>,
@@ -59,11 +62,27 @@ pub fn record(ticket: u64, at: Instant, swapchain: u64, result: i32) {
         }
     }
 }
+/// A swapchain is gone: finish its recording. Waits for room rather than
+/// dropping the end when the queue is full: a dropped end merged the next
+/// swapchain given the same handle into this recording, one interval
+/// spanning the gap. Called from destroy paths, never while presenting.
 pub fn end(swapchain: u64) {
     if let Some(r) = RECORDER.get() {
         let ticket = r.active.load(Ordering::Acquire);
-        if ticket != 0 && r.tx.try_send(Event::End(ticket, swapchain)).is_err() {
+        if ticket != 0 && r.tx.send(Event::End(ticket, swapchain)).is_err() {
             r.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Wait, at most `timeout`, until the recorder has handled everything sent
+/// so far. A game that exits right after tearing down its device takes the
+/// recorder thread with it, and the recordings it had not written yet.
+pub fn settle(timeout: Duration) {
+    if let Some(r) = RECORDER.get() {
+        let (tx, rx) = mpsc::channel();
+        if r.tx.send(Event::Barrier(tx)).is_ok() {
+            let _ = rx.recv_timeout(timeout);
         }
     }
 }
@@ -84,6 +103,12 @@ impl Recorder {
             loop {
                 if checked.elapsed() >= Duration::from_millis(100) {
                     checked = Instant::now();
+                    // A game killed mid-recording loses at most this much.
+                    for stream in streams.values_mut() {
+                        if stream.writer.flush().is_err() {
+                            stream.io_failed = true;
+                        }
+                    }
                     let next = capture::read_control();
                     let continuing = control.active
                         && next.is_active()
@@ -114,6 +139,9 @@ impl Recorder {
                     }
                 }
                 match rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(Event::Barrier(reply)) => {
+                        let _ = reply.send(());
+                    }
                     Ok(event) => {
                         if let Err(e) =
                             apply(event, &mut streams, &control, generation, &mut sequence, &d)
@@ -204,12 +232,21 @@ impl Stream {
                 .get(&ash::vk::SwapchainKHR::from_raw(sample.swapchain))
                 .map(|s| [s.extent.width, s.extent.height])
         });
-        let metadata = serde_json::json!({"schema":1,"sampled_unix_ms":capture::now_ms(),"protocol":argus_ipc::PROTOCOL_VERSION,"telemetry_at_start":telemetry,"overlay_config":config,"swapchain_extent":extent,"clock":"std::time::Instant monotonic","warmup":"user-controlled before recording","scene":"not automatically known"});
+        let metadata = serde_json::json!({"schema":1,"program":executable,"sampled_unix_ms":capture::now_ms(),"protocol":argus_ipc::PROTOCOL_VERSION,"telemetry_at_start":telemetry,"overlay_config":config,"swapchain_extent":extent,"clock":"std::time::Instant monotonic","warmup":"user-controlled before recording","scene":"not automatically known"});
         fs::write(
             path.with_extension("metadata.json"),
             serde_json::to_vec_pretty(&metadata)?,
         )?;
-        let summary=Summary{schema:1,metric:"CPU intervals between successful vkQueuePresentKHR entry timestamps; not GPU time or displayed/FG FPS".into(),build:argus_ipc::BUILD_ID.into(),session:control.session.clone(),pid:std::process::id(),executable,swapchain:sample.swapchain,..Default::default()};
+        let summary = Summary {
+            schema: 1,
+            metric: capture::METRIC.into(),
+            build: argus_ipc::BUILD_ID.into(),
+            session: control.session.clone(),
+            pid: std::process::id(),
+            executable,
+            swapchain: sample.swapchain,
+            ..Default::default()
+        };
         Ok(Self {
             writer,
             path,
@@ -296,6 +333,14 @@ fn report_error(message: &str) {
     let _ = fs::write(capture::directory().join("latest-error.txt"), message);
 }
 fn finish(mut stream: Stream, dropped: u64) {
+    if stream.intervals.is_empty() && !stream.io_failed {
+        // A swapchain that presented at most once has nothing to report; a
+        // summary of it took a slot in the list and was paired by "Compare
+        // latest two".
+        let _ = fs::remove_file(stream.path.with_extension("csv.partial"));
+        let _ = fs::remove_file(stream.path.with_extension("metadata.json"));
+        return;
+    }
     let (avg, low, p99) = capture::statistics(&mut stream.intervals);
     stream.summary.frames = stream.intervals.len();
     stream.summary.duration_seconds = stream.intervals.iter().map(|v| *v as f64 / 1e9).sum();

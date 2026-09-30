@@ -5,7 +5,9 @@
 //!        vkCreateSwapchainKHR/vkDestroySwapchainKHR, vkQueuePresentKHR.
 
 // Every unsafe block states why it is sound; CI treats a missing comment as
-// an error (clippy -D warnings).
+// an error (clippy -D warnings). The hooks are unsafe fns whose bodies call
+// unsafe code directly (edition 2021); what makes those calls sound is the
+// contract in each hook's `# Safety` section, which the loader upholds.
 #![warn(clippy::undocumented_unsafe_blocks)]
 
 mod activation;
@@ -595,9 +597,10 @@ pub unsafe extern "system" fn argus_vkCreateDevice(
     guard(
         "vkCreateDevice",
         std::panic::AssertUnwindSafe(|| {
-            // Unknown only if the handle bypassed both enumerate paths. That
-            // costs the HUD, not the device: a null instance still resolves
-            // vkCreateDevice further down the chain.
+            // Unknown only if the handle bypassed both enumerate paths. The
+            // spec lets a layer below answer GIPA(NULL, "vkCreateDevice")
+            // with NULL, in which case creation fails with
+            // VK_ERROR_INITIALIZATION_FAILED below instead of crashing.
             let instance = PHYS_TO_INST
                 .read_or_recover()
                 .get(&physical_device)
@@ -690,12 +693,40 @@ unsafe fn record_device(
         .write_or_recover()
         .insert(device, (physical_device, ash_dev));
 
-    // Record the first queue family requested
+    // The HUD records its commands for a graphics queue: the first family
+    // requested that has graphics. The first family requested at all left
+    // the HUD off, with nothing logged, for a device listing a compute or
+    // transfer family first.
     let ci = &*p_create_info;
     if ci.queue_create_info_count > 0 && !ci.p_queue_create_infos.is_null() {
+        let requested = std::slice::from_raw_parts(
+            ci.p_queue_create_infos,
+            ci.queue_create_info_count as usize,
+        );
+        let properties = PHYS_TO_INST
+            .read_or_recover()
+            .get(&physical_device)
+            .and_then(|instance| {
+                ASH_INSTANCES
+                    .read_or_recover()
+                    .get(instance)
+                    .map(|inst| inst.get_physical_device_queue_family_properties(physical_device))
+            });
+        let graphics = |family: u32| {
+            properties.as_ref().is_none_or(|props| {
+                props
+                    .get(family as usize)
+                    .is_some_and(|p| p.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            })
+        };
+        let family = requested
+            .iter()
+            .map(|info| info.queue_family_index)
+            .find(|&family| graphics(family))
+            .unwrap_or(requested[0].queue_family_index);
         DEVICE_QUEUE_FAMILY
             .write_or_recover()
-            .insert(device, (*ci.p_queue_create_infos).queue_family_index);
+            .insert(device, family);
     }
 }
 
@@ -729,7 +760,7 @@ pub unsafe extern "system" fn argus_vkDestroyDevice(
 /// recycled addresses: a stale entry would hand the next device this one's
 /// function table and HUD state.
 unsafe fn forget_device(device: vk::Device) {
-    let leftovers: Vec<OverlayState> = {
+    let leftovers: Vec<(vk::SwapchainKHR, OverlayState)> = {
         let mut states = OVERLAY_STATES.lock_or_recover();
         let swapchains: Vec<_> = states
             .iter()
@@ -738,11 +769,24 @@ unsafe fn forget_device(device: vk::Device) {
             .collect();
         swapchains
             .iter()
-            .filter_map(|swapchain| states.remove(swapchain))
+            .filter_map(|&swapchain| states.remove(&swapchain).map(|state| (swapchain, state)))
             .collect()
     };
-    if let Some((_, dev)) = DEVICE_MAP.write_or_recover().remove(&device) {
-        for state in &leftovers {
+    if capture::enabled() {
+        // Recordings end with the device. A game that exits right after
+        // tearing it down takes the recorder thread with it, so wait
+        // (bounded) until they are written.
+        use ash::vk::Handle;
+        for (swapchain, _) in &leftovers {
+            capture::end(swapchain.as_raw());
+        }
+        capture::settle(std::time::Duration::from_millis(500));
+    }
+    // Out of the map first: destroying waits on fences, which must not
+    // happen under the lock every present and swapchain call takes.
+    let removed = DEVICE_MAP.write_or_recover().remove(&device);
+    if let Some((_, dev)) = removed {
+        for (_, state) in &leftovers {
             state.destroy(&dev);
         }
     }
@@ -923,6 +967,29 @@ unsafe fn init_overlay(
         || ci.flags.contains(vk::SwapchainCreateFlagsKHR::PROTECTED)
     {
         eprintln!("[Argus-Layer] HUD skipped: unsupported swapchain usage/layers/protection");
+        return;
+    }
+    // Images may have no memory until first acquired, and the HUD makes its
+    // views now. A mutable-format image's views inherit its storage usage,
+    // which the sRGB formats do not support.
+    if ci
+        .flags
+        .contains(vk::SwapchainCreateFlagsKHR::DEFERRED_MEMORY_ALLOCATION_EXT)
+        || (ci
+            .flags
+            .contains(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
+            && ci.image_usage.contains(vk::ImageUsageFlags::STORAGE))
+    {
+        eprintln!("[Argus-Layer] HUD skipped: deferred-memory or mutable-format storage swapchain");
+        return;
+    }
+    // The HUD's colours are display-encoded sRGB. Under HDR10 (PQ) they
+    // would mean up to thousands of nits, under scRGB something else again.
+    if ci.image_color_space != vk::ColorSpaceKHR::SRGB_NONLINEAR {
+        eprintln!(
+            "[Argus-Layer] HUD skipped: colour space {:?} is not sRGB",
+            ci.image_color_space
+        );
         return;
     }
     let Some((physical_device, ash_dev)) = DEVICE_MAP
@@ -1368,17 +1435,18 @@ mod tests {
 
     #[test]
     fn clamp_string_truncates_long_strings_to_a_char_boundary() {
-        // 600 copies of a 3-byte UTF-8 character: truncating at a raw byte
-        // offset of 512 would land mid-character without the boundary walk.
-        let mut s = "é".repeat(600);
-        assert_eq!(s.len(), 1200); // 'é' is 2 bytes in UTF-8 here
+        // 600 copies of a 3-byte UTF-8 character: 512 is not a multiple of
+        // 3, so truncating at that raw byte offset would land mid-character
+        // without the boundary walk. (A 2-byte one never exercised it.)
+        let mut s = "€".repeat(600);
+        assert_eq!(s.len(), 1800);
         clamp_string(&mut s, MAX_TELEMETRY_STRING_LEN);
         assert!(s.len() <= MAX_TELEMETRY_STRING_LEN);
         assert!(s.is_char_boundary(s.len()));
-        // Every remaining character must be a complete, valid 'é' — a
+        // Every remaining character must be a complete, valid '€' — a
         // boundary miscalculation would instead leave a truncated byte
         // sequence that isn't valid UTF-8 at all.
-        assert!(s.chars().all(|c| c == 'é'));
+        assert!(s.chars().all(|c| c == '€'));
     }
 
     #[test]
@@ -1483,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    fn next_gipa_round_trips_through_the_atomic_and_starts_unset() {
+    fn next_gipa_round_trips_through_the_atomic() {
         // Runs in whatever order the test harness picks, so only assert the
         // round-trip, not the initial None (another test in this binary may
         // have already set it — these globals are process-wide by design).

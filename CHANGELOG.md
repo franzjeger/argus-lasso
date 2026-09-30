@@ -327,6 +327,20 @@ current source, release and verification status, see [docs/status.md](docs/statu
   process of the user could replace a staged file with a FIFO that hung root or a
   device node; home directories with spaces or non-ASCII characters no longer stop
   the install.
+- A recording is no longer lost when the game exits or crashes before finishing
+  it. The layer writes rows out every 100 ms and finishes recordings when the game
+  tears down its device; a recording left unfinished is listed as incomplete, with
+  the rows it has, once the game has exited. The list keeps whole sessions instead
+  of the 30 newest files, so a session with many swapchains no longer hides every
+  earlier one, and swapchains that presented at most once are not listed.
+- The HUD appears on devices that list a compute or transfer queue family before
+  the graphics one; it used the first family requested and stayed off, with
+  nothing logged.
+- The HUD is drawn with the right colours on sRGB swapchains, where its colours
+  were encoded twice and looked washed out, and is left off HDR swapchains (HDR10
+  or scRGB), where its sRGB colours meant up to thousands of nits. It is also left
+  off swapchains whose images may have no memory yet or whose image views would
+  inherit a storage usage their format does not support.
 
 ### Changed
 

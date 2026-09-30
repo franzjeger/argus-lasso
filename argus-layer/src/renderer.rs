@@ -59,6 +59,14 @@ pub struct OverlayState {
     last_graph: Option<std::time::Instant>,
 }
 
+/// Whether writes to `format` are encoded to sRGB by the hardware.
+fn is_srgb(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB | vk::Format::A8B8G8R8_SRGB_PACK32
+    )
+}
+
 unsafe fn create_shader_module(device: &ash::Device, spv: &[u8]) -> Option<vk::ShaderModule> {
     let code = ash::util::read_spv(&mut std::io::Cursor::new(spv)).ok()?;
     device
@@ -411,6 +419,15 @@ impl OverlayState {
         vert_module: vk::ShaderModule,
         frag_module: vk::ShaderModule,
     ) -> Option<vk::Pipeline> {
+        // overlay.frag's TARGET_IS_SRGB (constant_id 0), a 32-bit bool.
+        let target_is_srgb = vk::Bool32::from(is_srgb(self.format));
+        let specialization_entry = vk::SpecializationMapEntry::default()
+            .constant_id(0)
+            .offset(0)
+            .size(std::mem::size_of::<vk::Bool32>());
+        let specialization = vk::SpecializationInfo::default()
+            .map_entries(std::slice::from_ref(&specialization_entry))
+            .data(bytemuck::bytes_of(&target_is_srgb));
         let shader_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -419,7 +436,8 @@ impl OverlayState {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .module(frag_module)
-                .name(c"main"),
+                .name(c"main")
+                .specialization_info(&specialization),
         ];
 
         let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
