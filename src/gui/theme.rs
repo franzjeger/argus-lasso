@@ -1375,6 +1375,7 @@ pub fn apply_adwaita(ctx: &Context, dark: bool) {
 #[cfg(test)]
 mod viewport_opacity_tests {
     use super::*;
+    use crate::gui::TestFrame as _;
 
     #[test]
     fn bundled_fonts_are_installed_for_each_independent_context() {
@@ -1382,7 +1383,7 @@ mod viewport_opacity_tests {
             let ctx = egui::Context::default();
             apply_theme(&ctx, &AppTheme::BreezeDark);
             apply_theme(&ctx, &AppTheme::BreezeDark);
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let output = ctx.test_frame(egui::RawInput::default(), |ui| {
                 ui.label(bold(ui, "Heading", 16.0));
             });
             assert!(output.shapes.iter().any(|s| matches!(&s.shape,
@@ -1397,10 +1398,10 @@ mod viewport_opacity_tests {
             apply_theme(&ctx, &theme);
             let original = ctx.global_style().visuals.panel_fill;
             for opacity in [0.35, 0.78, 1.0] {
-                let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let output = ctx.test_frame(egui::RawInput::default(), |ui| {
                     apply_viewport_opacity(ui, opacity);
                     assert_eq!(ui.visuals().panel_fill.a(), (opacity * 255.0).round() as u8);
-                    egui::CentralPanel::default().show_inside(ui, |_| {});
+                    egui::CentralPanel::default().show(ui, |_| {});
                 });
                 let panel_alpha = output.shapes.iter().find_map(|s| match &s.shape {
                     egui::Shape::Rect(rect) if rect.fill.a() != 0 => Some(rect.fill.a()),
@@ -1416,6 +1417,7 @@ mod viewport_opacity_tests {
 #[cfg(test)]
 mod accessibility_tests {
     use super::*;
+    use crate::gui::TestFrame as _;
     use egui::accesskit::{Role, Toggled};
 
     /// Hand-painted controls report a name and state, or a screen reader
@@ -1425,8 +1427,8 @@ mod accessibility_tests {
         let ctx = egui::Context::default();
         apply_theme(&ctx, &AppTheme::BreezeDark);
         ctx.enable_accesskit();
-        let output = ctx.run_ui(Default::default(), |root| {
-            egui::CentralPanel::default().show_inside(root, |ui| {
+        let output = ctx.test_frame(Default::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
                 toggle(ui, &mut true, "Rule enabled");
                 segmented(ui, &["Performance", "Balanced"], 1);
                 category_chip(ui, "Rules", false, Color32::RED);
@@ -1456,13 +1458,13 @@ mod accessibility_tests {
         let ctx = egui::Context::default();
         let mut value = 50.0_f32;
         let run = |events: Vec<egui::Event>, focus: bool, value: &mut f32| {
-            let _ = ctx.run_ui(
+            let _ = ctx.test_frame(
                 egui::RawInput {
                     events,
                     ..Default::default()
                 },
                 |root| {
-                    egui::CentralPanel::default().show_inside(root, |ui| {
+                    egui::CentralPanel::default().show(root, |ui| {
                         let field = ui.add(super::number(value).range(20.0..=110.0));
                         if focus {
                             field.request_focus();
@@ -1508,7 +1510,7 @@ mod accessibility_tests {
         let ctx = egui::Context::default();
         // A new zoom takes effect with the next frame.
         let frame = |ctx: &egui::Context| {
-            let _ = ctx.run_ui(Default::default(), |_| {});
+            let _ = ctx.test_frame(Default::default(), |_| {});
         };
         ctx.set_zoom_factor(1.5);
         frame(&ctx);

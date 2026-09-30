@@ -178,6 +178,12 @@ impl Tour {
         // unconditional form — request_repaint_after() let the app fall back
         // to its idle cadence and the tour stopped advancing altogether.
         ctx.request_repaint();
+        // Screens are captured a few frames after they change, and a window
+        // still fading in would be photographed half transparent. Themes
+        // applied by the steps reset the style, so this is kept up each frame.
+        if ctx.global_style().animation_time != 0.0 {
+            ctx.global_style_mut(|style| style.animation_time = 0.0);
+        }
 
         if !self.warmed_up {
             if has_data {

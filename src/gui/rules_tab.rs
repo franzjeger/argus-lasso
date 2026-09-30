@@ -884,6 +884,7 @@ fn import_summary(imported: usize, skipped: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::config::RuleConfig;
+    use crate::gui::TestFrame as _;
     use std::collections::HashMap;
 
     /// The rules tab rendered headless, clicked by accessible label.
@@ -898,6 +899,9 @@ mod tests {
         fn new(rules: &[RuleConfig]) -> Self {
             let ctx = egui::Context::default();
             theme::apply_theme(&ctx, &theme::AppTheme::BreezeDark);
+            // Headless frames have no clock; an opening section would stay
+            // mid-animation, its contents clipped, for the clicks below.
+            ctx.global_style_mut(|style| style.animation_time = 0.0);
             ctx.enable_accesskit();
             let mut engine = RuleEngine::new();
             engine.load_rules(rules);
@@ -920,8 +924,8 @@ mod tests {
             };
             let (mut changed, mut profiles_changed) = (false, false);
             let (tab, engine, profiles) = (&mut self.tab, &self.engine, &mut self.profiles);
-            self.ctx.run_ui(input, |root| {
-                egui::CentralPanel::default().show_inside(root, |ui| {
+            self.ctx.test_frame(input, |root| {
+                egui::CentralPanel::default().show(root, |ui| {
                     let ctx = ui.ctx().clone();
                     tab.show(
                         ui,

@@ -428,6 +428,7 @@ fn add_chip(ui: &mut Ui, label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::TestFrame as _;
 
     /// Clicks the labelled control in the tab, rendered headless, and
     /// returns what `show` reported.
@@ -445,8 +446,8 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            ctx.run_ui(input, |root| {
-                egui::CentralPanel::default().show_inside(root, |ui| {
+            ctx.test_frame(input, |root| {
+                egui::CentralPanel::default().show(root, |ui| {
                     if let Some(cfg) = tab.show(ui, &[], &[], 0.0) {
                         reported = Some(cfg);
                     }

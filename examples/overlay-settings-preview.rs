@@ -17,7 +17,7 @@ impl eframe::App for Preview {
     }
     fn ui(&mut self, root_ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
-        egui::CentralPanel::default().show_inside(root_ui, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             theme::page_intro(
                 ui,
                 "Overlay",

@@ -19,6 +19,23 @@ pub mod overlay_settings;
 
 /// The GUI context, once eframe has created it. Shared with the threads that
 /// can ask for the window (tray, monitor).
+/// Headless frames for tests. egui insists that each frame's texture
+/// updates are applied or dropped on purpose; with no renderer, they are
+/// dropped.
+#[cfg(test)]
+pub(crate) trait TestFrame {
+    fn test_frame(&self, input: egui::RawInput, ui: impl FnMut(&mut egui::Ui)) -> egui::FullOutput;
+}
+
+#[cfg(test)]
+impl TestFrame for egui::Context {
+    fn test_frame(&self, input: egui::RawInput, ui: impl FnMut(&mut egui::Ui)) -> egui::FullOutput {
+        let mut output = self.run_ui(input, ui);
+        output.textures_delta.clear();
+        output
+    }
+}
+
 pub type SharedContext = std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>;
 
 /// Show, un-minimize and focus the main window, from any thread: the tray's

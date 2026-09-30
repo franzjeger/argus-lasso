@@ -325,7 +325,7 @@ impl BenchTab {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         close_requested = true;
                     }
-                    egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                    egui::CentralPanel::default().show(vp_ui, |ui| {
                         new_hover =
                             show_results(ui, &points, &cache, old_hover, csv_tx_clone.clone());
                     });

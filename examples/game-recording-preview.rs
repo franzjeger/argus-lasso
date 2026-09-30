@@ -23,7 +23,7 @@ impl eframe::App for Preview {
         if self.compare_requested && self.bench.compare_recent() {
             self.compare_requested = false;
         }
-        egui::CentralPanel::default().show_inside(root, |ui| {
+        egui::CentralPanel::default().show(root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 self.bench.show(ui);
                 ui.separator();

@@ -321,7 +321,11 @@ pub struct AffinityDialog {
 impl AffinityDialog {
     /// `owner` tells this dialog's window apart from another one open at
     /// the same time.
-    pub fn new(current_affinity: &str, title: &str, owner: impl std::hash::Hash) -> Self {
+    pub fn new(
+        current_affinity: &str,
+        title: &str,
+        owner: impl std::hash::Hash + std::fmt::Debug,
+    ) -> Self {
         let cpu_count = get_cpu_count();
         let offline = get_offline_cpus();
         let topo = detect_topology();
@@ -394,7 +398,7 @@ impl AffinityDialog {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         close_as = Some(false);
                     }
-                    egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                    egui::CentralPanel::default().show(vp_ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         if !offline.is_empty() {
                             let offline_str = cpuset_to_cpulist(offline);
@@ -587,7 +591,7 @@ impl NiceDialog {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         close_as = Some(false);
                     }
-                    egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                    egui::CentralPanel::default().show(vp_ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.label(
                             "Lower nice values give higher CPU priority. Raising priority may require system authentication.",
@@ -688,7 +692,7 @@ impl IoNiceDialog {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         close_as = Some(false);
                     }
-                    egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                    egui::CentralPanel::default().show(vp_ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.label("I/O class: Realtime requires root. Level 0=highest, 7=lowest.");
                         egui::ComboBox::from_label("I/O Class")
@@ -824,7 +828,7 @@ impl RuleEditDialog {
                     // Action bar first: a bottom panel keeps Cancel/Save
                     // pinned to the dialog's edge instead of floating after
                     // however tall the form happened to be.
-                    egui::Panel::bottom("rule_actions").show_inside(vp_ui, |ui| {
+                    egui::Panel::bottom("rule_actions").show(vp_ui, |ui| {
                         let s = th::sem(ui);
                         ui.add_space(tokens::SPACE_XS);
                         ui.horizontal(|ui| {
@@ -868,7 +872,7 @@ impl RuleEditDialog {
                         ui.add_space(tokens::SPACE_XS);
                     });
 
-                    egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                    egui::CentralPanel::default().show(vp_ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         let s = th::sem(ui);
                         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1295,7 +1299,7 @@ impl RulePresetsDialog {
                     // Actions in a bottom panel, pinned to the dialog edge —
                     // same shape as the rule editor, so the two dialogs do not
                     // put the same controls in different places.
-                    egui::Panel::bottom("preset_actions").show_inside(vp_ui, |ui| {
+                    egui::Panel::bottom("preset_actions").show(vp_ui, |ui| {
                         let s = th::sem(ui);
                         ui.add_space(tokens::SPACE_XS);
                         ui.horizontal(|ui| {
@@ -1327,7 +1331,7 @@ impl RulePresetsDialog {
                         ui.add_space(tokens::SPACE_XS);
                     });
 
-                    egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                    egui::CentralPanel::default().show(vp_ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.label(
                             egui::RichText::new(
@@ -1517,7 +1521,7 @@ impl SteamGamePickerDialog {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         cancelled = true;
                     }
-                    egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                    egui::CentralPanel::default().show(vp_ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.label("Filter:");
@@ -1653,7 +1657,7 @@ impl LutrisGamePickerDialog {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         cancelled = true;
                     }
-                    egui::CentralPanel::default().show_inside(vp_ui, |ui| {
+                    egui::CentralPanel::default().show(vp_ui, |ui| {
                         ui.set_min_width(ui.available_width());
                         ui.horizontal(|ui| {
                             ui.label("Filter:");
