@@ -586,7 +586,14 @@ impl SettingsTab {
                                 "Check now"
                             };
                             if ui
-                                .add_enabled(!updates.busy, egui::Button::new(label))
+                                .add_enabled(
+                                    !updates.busy && !updates.installed,
+                                    egui::Button::new(label),
+                                )
+                                .on_disabled_hover_text(
+                                    "Restart Argus first: it is still running the version \
+                                     it replaced.",
+                                )
                                 .clicked()
                             {
                                 updates.start_check();

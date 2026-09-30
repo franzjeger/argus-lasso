@@ -784,8 +784,32 @@ pub fn restart() -> String {
 mod tests {
     use super::{
         check_reported_version_is_an_upgrade, current_version, extract_binary, is_newer,
-        sha256_hex, strip_deleted_suffix, verify_signature,
+        sha256_hex, strip_deleted_suffix, verify_signature, Update, UpdateState,
     };
+
+    /// "Check now" after an install used to clear `installed`, compare the
+    /// release with the still-running old version, offer it again, and let
+    /// a second install back up the new binary as the "previous" one.
+    #[test]
+    fn nothing_is_checked_or_installed_again_before_a_restart() {
+        let mut state = UpdateState {
+            available: Some(Update {
+                tag: "v9.9.9".into(),
+                version: "9.9.9".into(),
+                page_url: String::new(),
+                tarball_url: String::new(),
+                sha256_url: String::new(),
+                signature_url: None,
+            }),
+            installed: true,
+            ..UpdateState::default()
+        };
+        state.start_check();
+        assert!(!state.busy && state.installed);
+        state.start_install();
+        assert!(!state.busy && state.installed);
+        assert!(!state.poll(), "no job was started");
+    }
 
     /// The whole point of this check: a validly-signed OLD build re-offered
     /// under a fabricated newer release tag must still be refused, because
@@ -1091,7 +1115,12 @@ pub struct UpdateState {
     pub message: String,
     /// True while a check or install is running.
     pub busy: bool,
-    /// Set once the new binary is in place and a restart is all that is left.
+    /// Set once a new (or, after a rollback, the previous) binary is in
+    /// place and a restart is all that is left. Until then this process is
+    /// not the installed version: a check would compare the release against
+    /// the wrong version and offer the installed one again, and installing
+    /// it again would back up the new binary as "previous", losing the real
+    /// previous version from rollback. So neither is started.
     pub installed: bool,
     /// The user closed the banner for this release.
     pub banner_dismissed: bool,
@@ -1103,11 +1132,10 @@ pub struct UpdateState {
 
 impl UpdateState {
     pub fn start_check(&mut self) {
-        if self.busy {
+        if self.busy || self.installed {
             return;
         }
         self.busy = true;
-        self.installed = false;
         self.message = "Checking for updates…".into();
         self.job = Some(check());
     }
@@ -1132,7 +1160,7 @@ impl UpdateState {
         let Some(update) = self.available.clone() else {
             return;
         };
-        if self.busy {
+        if self.busy || self.installed {
             return;
         }
         self.busy = true;

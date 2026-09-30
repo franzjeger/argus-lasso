@@ -154,6 +154,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   against the values from startup, and keeps a choice not yet applied. Power
   changes in Settings and Gaming run in the background, so the window keeps
   responding while an authentication dialog is open.
+- After an update or rollback is installed, "Check now" waits for the restart.
+  Checking from the old process offered the just-installed release again and
+  hid "Restart now", and installing it a second time saved the new binary as
+  the previous one, so "Restore previous app and overlay" restored the update.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
