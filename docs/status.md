@@ -1,10 +1,32 @@
 # Project status
 
-Reviewed on **2026-09-30** for release **1.4.0**: package version `1.4.0`, IPC
-protocol 6. The version and changelog section are prepared in the release pull
-request; the tag and the published archives are recorded here once the release
-workflow has run and they have been checked on GitHub. Until then the latest
-published release is v1.3.1.
+Reviewed on **2026-09-30**. Release
+[v1.4.0](https://github.com/franzjeger/argus-lasso/releases/tag/v1.4.0) is
+published and is GitHub's latest release: package version `1.4.0`, IPC protocol
+6, tagged on
+[`c753c5c`](https://github.com/franzjeger/argus-lasso/commit/c753c5c5c7be62c29e2c1043b29e08ddf59d31e1),
+the merge of [#103](https://github.com/franzjeger/argus-lasso/pull/103).
+
+## Published archives
+
+The [release run](https://github.com/franzjeger/argus-lasso/actions/runs/36763083800)
+built, signed and published both architectures after approval in the `release`
+environment, and wrote the notes from the 1.4.0 changelog section. The published
+x86_64 and aarch64 archives were downloaded and checked on 2026-09-30:
+
+- Each matches its `.sha256` file, and its `.minisig` signature verifies with
+  `minisign-verify` (the library the updater uses) against `dist/argus-lasso.pub`
+  (key `D53DAD0590FF1744`). Against the replaced 1.3.1 key the same signatures are
+  refused, as the updater of 1.3.1 and older will refuse them.
+- `bundle.json` and `BUILD_ID` name build `c753c5c5c7be…` (the tagged commit),
+  version 1.4.0 and protocol 6. The x86_64 app and layer match the SHA-256 values
+  in `bundle.json`, and the app's `build-info` agrees with it.
+- The download URLs in [binary archives](installation.md#binary-archives)
+  resolve for the archive, checksum and signature.
+
+The in-app updater has not yet installed a published release on a real
+installation; the first such update will be from a build that already carries the
+new key.
 
 ## Release candidate verification
 
@@ -30,9 +52,10 @@ to `master` at
 ## Installation and releases
 
 `master` at `a07aa0b` is installed locally as build `a07aa0b5919d-d4efb49d238b`
-(protocol 6) and runs as the user service. It reports version 1.3.1, the
-version before this release. Games running an earlier layer show "Telemetry
-disconnected" until restarted.
+(protocol 6) and runs as the user service. It is the 1.4.0 source apart from
+the version number and documentation, reports version 1.3.1, and already
+carries the new release key, so its updater can install v1.4.0. Games running
+an earlier layer show "Telemetry disconnected" until restarted.
 
 Releases from 1.4.0 on are signed with a new key (ID `D53DAD0590FF1744`). The
 updater of 1.3.1 and older checks against the replaced key and refuses them, so
