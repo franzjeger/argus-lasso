@@ -133,7 +133,17 @@ fn decide(
             {
                 entry.consecutive_high += tick_seconds;
                 if entry.consecutive_high >= cfg.consecutive_seconds {
-                    let new_nice = (proc.nice + cfg.nice_adjustment).min(cfg.nice_floor);
+                    // Never below the process's own value: a hog already at
+                    // nice 19 would be "throttled" to the floor of 15, that
+                    // is, given more CPU.
+                    let new_nice = (proc.nice + cfg.nice_adjustment)
+                        .min(cfg.nice_floor)
+                        .max(proc.nice);
+                    if new_nice == proc.nice && cfg.method == "nice" {
+                        // Nothing a nice change can do; cgroup methods still
+                        // can.
+                        return Decision::None;
+                    }
                     // Capture the pre-throttle nice so we can restore it later,
                     // even if the syscall fails and we retry on a future tick.
                     entry.original_nice = Some(proc.nice);
@@ -287,8 +297,8 @@ impl ProBalance {
         let entries: Vec<(u32, ProcEntry)> = self.states.drain().collect();
         for (pid, entry) in entries {
             if entry.state == ProcState::Throttled {
-                let orig = entry.original_nice.unwrap_or(0);
-                self.undo_applied(pid, entry.applied.as_ref(), orig, reason, &mut pending_logs);
+                let now = utils::get_nice(pid);
+                self.undo_applied(pid, &entry, now, reason, &mut pending_logs);
             }
         }
         // Successfully restored units were removed by release_unit; entries
@@ -300,21 +310,29 @@ impl ProBalance {
 
     /// Undo one throttle using the mechanism that applied it. `None` applied
     /// means a legacy/nice entry.
+    /// `current_nice` is the process's nice now. A nice throttle is only put
+    /// back while it is still the value ProBalance set: a manual change, a
+    /// rule or another tool that changed it since owns it now.
     fn undo_applied(
         &mut self,
         pid: u32,
-        applied: Option<&Applied>,
-        original_nice: i32,
+        entry: &ProcEntry,
+        current_nice: Option<i32>,
         reason: &str,
         logs: &mut Vec<String>,
     ) {
-        match applied {
+        let original_nice = entry.original_nice.unwrap_or(0);
+        match &entry.applied {
             Some(Applied::Cgroup { unit }) => {
                 let unit = unit.clone();
                 self.release_unit(&unit, reason, logs);
             }
             Some(Applied::Nice) | None => {
-                if utils::set_nice(pid, original_nice).is_ok() {
+                if let Some(now) = current_nice.filter(|now| Some(*now) != entry.throttle_nice) {
+                    logs.push(format!(
+                        "[ProBalance] RESTORE ({reason}) PID {pid} left at nice {now}: changed since the throttle"
+                    ));
+                } else if utils::set_nice(pid, original_nice).is_ok() {
                     logs.push(format!(
                         "[ProBalance] RESTORE ({reason}) PID {pid} nice→{original_nice}"
                     ));
@@ -469,6 +487,9 @@ impl ProBalance {
         }
 
         // Nice path (method="nice", or auto-fallback)
+        if new_nice <= proc.nice {
+            return None; // already at least this low in priority
+        }
         if utils::set_nice(proc.pid, new_nice).is_ok() {
             logs.push(format!(
                 "[ProBalance] THROTTLE {}({}) cpu={:.1}% nice {}→{}",
@@ -581,11 +602,10 @@ impl ProBalance {
                 // not silently abandoned in its throttled state.
                 if let Some(entry) = self.states.remove(&proc.pid) {
                     if entry.state == ProcState::Throttled {
-                        let orig = entry.original_nice.unwrap_or(0);
                         self.undo_applied(
                             proc.pid,
-                            entry.applied.as_ref(),
-                            orig,
+                            &entry,
+                            Some(proc.nice),
                             "exempted",
                             &mut pending_logs,
                         );
@@ -616,14 +636,15 @@ impl ProBalance {
                     }
                 }
                 Decision::Restore { original_nice } => {
-                    let applied = self.states.get(&proc.pid).and_then(|e| e.applied.clone());
-                    self.undo_applied(
-                        proc.pid,
-                        applied.as_ref(),
-                        original_nice,
-                        "calmed down",
-                        &mut pending_logs,
-                    );
+                    if let Some(entry) = self.states.get(&proc.pid).cloned() {
+                        self.undo_applied(
+                            proc.pid,
+                            &entry,
+                            Some(proc.nice),
+                            "calmed down",
+                            &mut pending_logs,
+                        );
+                    }
                     if let Some(entry) = self.states.get_mut(&proc.pid) {
                         finalize_restore(entry, original_nice);
                         entry.applied = None;
@@ -813,6 +834,73 @@ mod tests {
         let entry = &pb.states[&4242];
         assert_eq!(entry.start_ticks, 200);
         assert_eq!(entry.original_nice, Some(7));
+    }
+
+    /// A hog already niced to 19 was "throttled" to the floor of 15, that
+    /// is, given more CPU.
+    #[test]
+    fn a_throttle_never_lowers_nice() {
+        let mut cfg = cfg_for_state_tests();
+        cfg.nice_adjustment = 10;
+        cfg.nice_floor = 15;
+        cfg.method = "nice".into();
+        let mut e = ProcEntry::new(19);
+        for _ in 0..5 {
+            assert_eq!(
+                decide(&mut e, &snap(1, 90.0, 19), 1.0, &cfg),
+                Decision::None
+            );
+        }
+        cfg.method = "auto".into();
+        let mut e = ProcEntry::new(19);
+        let decisions: Vec<Decision> = (0..5)
+            .map(|_| decide(&mut e, &snap(1, 90.0, 19), 1.0, &cfg))
+            .collect();
+        assert!(
+            decisions.contains(&Decision::Throttle { new_nice: 19 }),
+            "cgroup can still act"
+        );
+        assert!(!decisions.contains(&Decision::Throttle { new_nice: 15 }));
+    }
+
+    /// A manual nice change on a throttled process was undone when it was
+    /// exempted (the manual change marks it protected) or calmed down.
+    #[test]
+    fn a_restore_leaves_a_nice_changed_since_alone() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = crate::fast_proc::read_stat(pid, &mut [0; 1024])
+            .unwrap()
+            .starttime;
+        utils::set_nice(pid, 15).unwrap();
+
+        let mut pb = ProBalance::new(ProBalanceConfig::default());
+        // An original above the current value, so that putting it back is
+        // allowed without privilege and the test means the same everywhere.
+        let mut entry = ProcEntry::new(19);
+        entry.original_nice = Some(19);
+        entry.start_ticks = start;
+        entry.state = ProcState::Throttled;
+        entry.throttle_nice = Some(10);
+        entry.applied = Some(Applied::Nice);
+        pb.states.insert(pid, entry);
+        let now = ProcSnapshot {
+            pid,
+            start_ticks: start,
+            name: "sleep".into(),
+            cpu_percent: 0.0,
+            nice: 15,
+        };
+        pb.tick(&[now], 1.0, Some(10.0), &[pid].into());
+        let after = utils::get_nice(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(after, Some(15));
+        assert!(pb.throttled_pids().is_empty());
     }
 
     #[test]

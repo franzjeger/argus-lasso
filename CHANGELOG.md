@@ -270,6 +270,11 @@ current source, release and verification status, see [docs/status.md](docs/statu
   different scale.
 - A process's details window closes when the process exits even if its PID is
   reused at once, instead of showing the new process under the old one's name.
+- ProBalance never lowers a process's nice value: a CPU hog already at nice 19 was
+  "throttled" to the floor of 15, that is, given more CPU, or retried every second
+  when that was refused. A nice throttle is put back only while the process still
+  has the value ProBalance set, so a manual change made meanwhile (which also
+  exempts the process) or a rule's is no longer undone.
 
 ### Changed
 
