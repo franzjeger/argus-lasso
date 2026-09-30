@@ -44,6 +44,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- The launcher no longer takes an exited, unreaped process of the game's name for
+  the running game, and when several processes carry the name it watches the one
+  started first instead of whichever `/proc` listed first.
 - Running the test suite no longer adds made-up lines ("[Rule:x] Set nice=5 on
   game(42)", "Termination requested for game (42)") to the real log in
   `~/.local/share/argus-lasso/`, and neither does `--ui-tour`. Only the app itself
