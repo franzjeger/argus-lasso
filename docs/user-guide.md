@@ -28,8 +28,11 @@ memory bandwidth benchmarks report decimal GB/s. Temperature readings use °C.
 | Settings → Notifications | Desktop notifications and hardware alerts |
 | Settings → Startup & updates | Tray/startup behavior and release checks |
 
-Appearance and HUD edits save immediately. Forms with an **Apply changes** button
-use a draft until applied. Settings and Gaming preserve each other's saved fields.
+Settings, appearance and HUD edits take effect and save as they change: choices
+and switches at once, number fields when the drag is released or the value is
+entered, and a typed CPU list on Enter once it is valid. ProBalance's thresholds
+and limits have to make sense together, so they are a draft until **Apply
+changes**; its on/off switch acts at once. Settings and Gaming preserve each other's saved fields.
 One monitor-thread writer persists the latest shared configuration. A failed save
 appears in a persistent banner with **Retry saving**; it is not silently treated
 as a successful disk write.

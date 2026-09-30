@@ -20,17 +20,16 @@ pub enum SettingsSection {
 
 pub struct SettingsTab {
     pub section: SettingsSection,
+    /// The settings as in effect; every change is stored at once.
     pub config: Config,
-    /// Snapshot of the last-saved config — drives the dirty indicator and Discard.
-    pub saved: Config,
     pub default_affinity_enabled: bool,
     pub default_affinity_text: String,
+    /// Why the typed CPU list was not used.
+    affinity_error: Option<String>,
     pub cpu_dialog: Option<AffinityDialog>,
     pub opacity: f32,
     pub native_ppp: f32,
     pub autostart_enabled: bool,
-    /// Autostart state as last written to disk.
-    saved_autostart: bool,
     pub status: String,
     /// Active theme — changes are applied immediately in show().
     pub theme: AppTheme,
@@ -39,9 +38,6 @@ pub struct SettingsTab {
     pub available_governors: Vec<String>,
     pub cpu_epp: String,
     pub available_epps: Vec<String>,
-    /// Governor/EPP as sysfs last reported them.
-    saved_governor: String,
-    saved_epp: String,
     pub power_status: String,
     /// A governor/EPP change in progress: pkexec can wait on an
     /// authentication dialog, so it runs off the UI thread.
@@ -66,19 +62,16 @@ impl SettingsTab {
             section: SettingsSection::default(),
             default_affinity_text: current_affinity,
             default_affinity_enabled,
+            affinity_error: None,
             cpu_dialog: None,
-            saved: config.clone(),
             config,
             opacity,
             native_ppp: 1.0,
             autostart_enabled,
-            saved_autostart: autostart_enabled,
             status: String::new(),
             theme,
-            saved_governor: governor.clone(),
             cpu_governor: governor,
             available_governors: read_available_governors(),
-            saved_epp: epp.clone(),
             cpu_epp: epp,
             available_epps: read_available_epps(),
             power_status: String::new(),
@@ -88,119 +81,78 @@ impl SettingsTab {
         }
     }
 
-    /// Default affinity as it would be stored in the config.
-    fn edited_affinity(&self) -> Option<String> {
-        if self.default_affinity_enabled {
-            let t = self.default_affinity_text.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t.to_string())
+    /// The default affinity the controls describe, or why the typed CPU
+    /// list cannot be used.
+    fn edited_affinity(&self) -> Result<Option<String>, String> {
+        let text = self.default_affinity_text.trim();
+        if !self.default_affinity_enabled || text.is_empty() {
+            return Ok(None);
+        }
+        let count = crate::utils::get_cpu_count();
+        match crate::utils::cpulist_to_set(text) {
+            Ok(cpus) if !cpus.is_empty() && cpus.iter().all(|&cpu| cpu < count) => {
+                Ok(Some(text.to_string()))
             }
+            _ => Err(format!(
+                "\"{text}\" is not a CPU list for this machine (CPUs 0–{})",
+                count.saturating_sub(1)
+            )),
+        }
+    }
+
+    /// Store the default affinity the controls describe, if it is usable.
+    /// Returns whether the configuration changed.
+    fn commit_affinity(&mut self) -> bool {
+        let affinity = match self.edited_affinity() {
+            Ok(affinity) => affinity,
+            Err(e) => {
+                self.affinity_error = Some(e);
+                return false;
+            }
+        };
+        self.affinity_error = None;
+        if affinity == self.config.cpu.default_affinity {
+            return false;
+        }
+        self.status = match &affinity {
+            Some(list) => format!("Default affinity → {list}"),
+            None => "Default affinity off".into(),
+        };
+        self.config.cpu.default_affinity = affinity;
+        true
+    }
+
+    /// Register or remove autostart as the checkbox now says, then show
+    /// what is actually in place.
+    fn commit_autostart(&mut self) {
+        let result = if self.autostart_enabled {
+            write_autostart()
         } else {
-            None
-        }
+            disable_autostart()
+        };
+        self.status = match result {
+            Ok(note) => note,
+            Err(e) => format!("Autostart failed: {e}"),
+        };
+        self.autostart_enabled = check_autostart_enabled();
     }
 
-    /// True when the edited state differs from the last-saved state.
-    /// Opacity/theme are deliberately excluded — they are live-preview fields
-    /// that app.rs applies and persists on every frame.
-    fn is_dirty(&self) -> bool {
-        let a = &self.config;
-        let b = &self.saved;
-        self.edited_affinity() != b.cpu.default_affinity
-            || a.monitor.display_refresh_interval_ms != b.monitor.display_refresh_interval_ms
-            || a.monitor.rule_enforce_interval_ms != b.monitor.rule_enforce_interval_ms
-            || a.ui.notifications_enabled != b.ui.notifications_enabled
-            || a.ui.check_updates_on_start != b.ui.check_updates_on_start
-            || a.hw_alerts.enabled != b.hw_alerts.enabled
-            || (a.hw_alerts.temp_threshold_celsius - b.hw_alerts.temp_threshold_celsius).abs()
-                > 0.01
-            || a.hw_alerts.cooldown_secs != b.hw_alerts.cooldown_secs
-            || self.autostart_enabled != self.saved_autostart
-            || self.cpu_governor != self.saved_governor
-            || self.cpu_epp != self.saved_epp
+    /// Set a governor or EPP just picked. pkexec can wait on an
+    /// authentication dialog, so it runs off the UI thread; see poll_power.
+    fn commit_power(&mut self, governor: Option<String>, epp: Option<String>) {
+        if self.power_job.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.power_job = Some(rx);
+        self.power_status = "Applying CPU power settings…".into();
+        std::thread::spawn(move || {
+            let _ = tx.send(apply_power(governor, epp));
+        });
     }
 
-    /// Restore every edited field from the saved snapshot.
-    fn discard(&mut self) {
-        self.config = self.saved.clone();
-        let aff = self.saved.cpu.default_affinity.clone().unwrap_or_default();
-        self.default_affinity_enabled = !aff.is_empty();
-        self.default_affinity_text = aff;
-        self.autostart_enabled = self.saved_autostart;
-        self.cpu_governor = self.saved_governor.clone();
-        self.cpu_epp = self.saved_epp.clone();
-        self.status = "Changes discarded.".into();
-        self.power_status.clear();
-    }
-
-    /// Commit the edited state: write affinity into the config, push
-    /// governor/EPP to sysfs and (de)register autostart. Returns the config
-    /// that the caller should persist.
-    fn apply(&mut self, ctx: &egui::Context) -> Config {
-        let mut msgs: Vec<String> = Vec::new();
-
-        // Default affinity
-        self.config.cpu.default_affinity = self.edited_affinity();
-        match &self.config.cpu.default_affinity {
-            Some(list) => msgs.push(format!("Default affinity → {list}")),
-            None if self.default_affinity_enabled => {
-                msgs.push("Default affinity → all CPUs".into())
-            }
-            None => msgs.push("Default affinity disabled".into()),
-        }
-
-        // Live-preview fields are persisted alongside everything else.
-        self.config.ui.opacity = self.opacity;
-        self.config.ui.theme = self.theme.to_str().into();
-        theme::apply_theme(ctx, self.native_ppp, &self.theme);
-
-        // CPU power, reported when done (see poll_power).
-        let governor = (!self.available_governors.is_empty()
-            && self.cpu_governor != self.saved_governor)
-            .then(|| self.cpu_governor.clone());
-        let epp = (!self.available_epps.is_empty() && self.cpu_epp != self.saved_epp)
-            .then(|| self.cpu_epp.clone());
-        if (governor.is_some() || epp.is_some()) && self.power_job.is_none() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.power_job = Some(rx);
-            self.power_status = "Applying CPU power settings…".into();
-            msgs.push(self.power_status.clone());
-            std::thread::spawn(move || {
-                let _ = tx.send(apply_power(governor, epp));
-            });
-        }
-
-        // Autostart
-        if self.autostart_enabled != self.saved_autostart {
-            if self.autostart_enabled {
-                match write_autostart() {
-                    Ok(note) => {
-                        msgs.push(note);
-                        self.saved_autostart = true;
-                    }
-                    Err(e) => msgs.push(format!("Autostart failed: {e}")),
-                }
-            } else {
-                match disable_autostart() {
-                    Ok(note) => {
-                        msgs.push(note);
-                        self.saved_autostart = false;
-                    }
-                    Err(e) => msgs.push(format!("Disable failed: {e}")),
-                }
-            }
-        }
-
-        self.status = msgs.join("  ·  ");
-        self.saved = self.config.clone();
-        self.config.clone()
-    }
-
-    /// Collect a finished governor/EPP change. Until it is done the choice
-    /// stays unsaved, and a refused one stays that way so it can be retried
-    /// or discarded.
+    /// Collect a finished governor/EPP change. The pickers then show what
+    /// the kernel has, so a refused choice goes back to the value in effect.
     fn poll_power(&mut self, ctx: &egui::Context) {
         use std::sync::mpsc::TryRecvError;
         let Some(job) = &self.power_job else {
@@ -220,26 +172,17 @@ impl SettingsTab {
         self.status = self.power_status.clone();
     }
 
-    /// Follow governor and EPP as the kernel reports them. Gaming → Power
-    /// profile changes both, and a governor change can change EPP; a choice
-    /// the user has not applied yet is kept.
+    /// Follow governor and EPP as the kernel reports them: Gaming → Power
+    /// profile changes both, and a governor change can change EPP.
     fn sync_power(&mut self) {
-        self.follow_power(read_governor(), read_epp());
-    }
-
-    fn follow_power(&mut self, governor: String, epp: String) {
-        if self.cpu_governor == self.saved_governor {
-            self.cpu_governor = governor.clone();
-        }
-        if self.cpu_epp == self.saved_epp {
-            self.cpu_epp = epp.clone();
-        }
-        self.saved_governor = governor;
-        self.saved_epp = epp;
+        self.cpu_governor = read_governor();
+        self.cpu_epp = read_epp();
         self.power_synced = Some(std::time::Instant::now());
     }
 
-    /// Returns Some(updated_config) when "Apply changes" is clicked.
+    /// Returns the settings when one changed this frame; each change takes
+    /// effect and is saved at once. Theme and opacity are read from the tab
+    /// by the caller.
     pub fn show(
         &mut self,
         ui: &mut Ui,
@@ -247,7 +190,7 @@ impl SettingsTab {
         opacity: f32,
         updates: &mut crate::updater::UpdateState,
     ) -> Option<Config> {
-        let mut applied: Option<Config> = None;
+        let mut changed = false;
         self.poll_power(ctx);
         let stale = self
             .power_synced
@@ -267,12 +210,8 @@ impl SettingsTab {
                 (SettingsSection::Startup, "Startup & updates"),
             ],
         );
-        // Reserve room for the apply bar, then scroll everything above it.
-        let bar_h = 44.0;
-        let body_h = (ui.available_height() - bar_h).max(120.0);
         egui::ScrollArea::vertical()
             .id_salt(("settings_body", self.section as u8))
-            .max_height(body_h)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if self.section == SettingsSection::Processes {
@@ -293,13 +232,23 @@ impl SettingsTab {
                         ui.add_space(tokens::SPACE_S);
 
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.default_affinity_enabled, "Enabled");
-                            ui.add(
+                            if ui.checkbox(&mut self.default_affinity_enabled, "Enabled").changed() {
+                                changed |= self.commit_affinity();
+                            }
+                            // Typed lists take effect on Enter or leaving the
+                            // field, not with every keystroke.
+                            let typed = ui.add(
                                 egui::TextEdit::singleline(&mut self.default_affinity_text)
                                     .hint_text("e.g. 8-15,24-31")
                                     .desired_width(130.0)
                                     .interactive(self.default_affinity_enabled),
                             );
+                            if typed.changed() {
+                                self.affinity_error = None;
+                            }
+                            if typed.lost_focus() {
+                                changed |= self.commit_affinity();
+                            }
                             if ui
                                 .add_enabled(
                                     self.default_affinity_enabled,
@@ -329,6 +278,7 @@ impl SettingsTab {
                                 ) {
                                     self.default_affinity_text = pref;
                                     self.default_affinity_enabled = true;
+                                    changed |= self.commit_affinity();
                                 }
                                 if theme::chip(
                                     ui,
@@ -337,13 +287,18 @@ impl SettingsTab {
                                 ) {
                                     self.default_affinity_text = npref;
                                     self.default_affinity_enabled = true;
+                                    changed |= self.commit_affinity();
                                 }
                             }
                             if theme::chip(ui, "All CPU threads", on && current.is_empty()) {
                                 self.default_affinity_text = String::new();
                                 self.default_affinity_enabled = true;
+                                changed |= self.commit_affinity();
                             }
                         });
+                        if let Some(e) = &self.affinity_error {
+                            ui.colored_label(theme::sem(ui).negative, e);
+                        }
                     });
 
                     // Handle Pick CPUs dialog
@@ -351,6 +306,7 @@ impl SettingsTab {
                         if let Some(result) = dlg.show(ctx, opacity) {
                             if !result.is_empty() {
                                 self.default_affinity_text = result;
+                                changed |= self.commit_affinity();
                             }
                             self.cpu_dialog = None;
                         }
@@ -368,11 +324,11 @@ impl SettingsTab {
                         ui.add_space(tokens::SPACE_S);
 
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Apply rules every", |ui| {
-                            ui.add(
+                            changed |= committed(&ui.add(
                                 egui::DragValue::new(&mut self.config.monitor.rule_enforce_interval_ms)
                                     .range(100..=10000)
                                     .suffix(" ms"),
-                            );
+                            ));
                         });
 
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Refresh process list", |ui| {
@@ -383,6 +339,7 @@ impl SettingsTab {
                                 .unwrap_or(usize::MAX);
                             if let Some(i) = theme::segmented(ui, &["0.5 s", "1 s", "2 s", "5 s"], sel) {
                                 self.config.monitor.display_refresh_interval_ms = PICKS[i];
+                                changed = true;
                             }
                         });
                     });
@@ -395,7 +352,7 @@ impl SettingsTab {
                     theme::card(ui, "Appearance", |ui| {
                         help_text(
                             ui,
-                            "Theme and window opacity are saved immediately. Game overlay appearance is in Gaming → Overlay.",
+                            "Game overlay appearance is in Gaming → Overlay.",
                         );
                         ui.add_space(tokens::SPACE_S);
 
@@ -443,7 +400,7 @@ impl SettingsTab {
                 }
                 if self.section == SettingsSection::Power {
                     theme::card(ui, "CPU power management", |ui| {
-                        help_text(ui, "Controls CPU frequency policy and the balance between performance and energy use. Changes take effect with Apply changes.");
+                        help_text(ui, "Controls CPU frequency policy and the balance between performance and energy use.");
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Frequency policy (governor)", |ui| {
                             if self.available_governors.is_empty() {
                                 ui.label(
@@ -452,6 +409,7 @@ impl SettingsTab {
                                         .color(ui.visuals().weak_text_color()),
                                 );
                             } else {
+                                let before = self.cpu_governor.clone();
                                 ui.add_enabled_ui(self.power_job.is_none(), |ui| {
                                 egui::ComboBox::from_id_salt("gov_picker")
                                     .selected_text(&self.cpu_governor)
@@ -465,6 +423,9 @@ impl SettingsTab {
                                         }
                                     });
                                 });
+                                if self.cpu_governor != before {
+                                    self.commit_power(Some(self.cpu_governor.clone()), None);
+                                }
                             }
                         });
 
@@ -476,6 +437,7 @@ impl SettingsTab {
                                         .color(ui.visuals().weak_text_color()),
                                 );
                             } else {
+                                let before = self.cpu_epp.clone();
                                 ui.add_enabled_ui(self.power_job.is_none(), |ui| {
                                 egui::ComboBox::from_id_salt("epp_picker")
                                     .selected_text(&self.cpu_epp)
@@ -489,6 +451,9 @@ impl SettingsTab {
                                         }
                                     });
                                 });
+                                if self.cpu_epp != before {
+                                    self.commit_power(None, Some(self.cpu_epp.clone()));
+                                }
                             }
                         });
 
@@ -511,16 +476,18 @@ impl SettingsTab {
                         ui.add_space(tokens::SPACE_S);
 
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Desktop notifications", |ui| {
-                            ui.checkbox(&mut self.config.ui.notifications_enabled, "Enabled");
+                            changed |= ui
+                                .checkbox(&mut self.config.ui.notifications_enabled, "Enabled")
+                                .changed();
                         });
 
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Temperature alerts", |ui| {
-                            ui.checkbox(&mut self.config.hw_alerts.enabled, "Enabled");
+                            changed |= ui.checkbox(&mut self.config.hw_alerts.enabled, "Enabled").changed();
                             let on = self.config.hw_alerts.enabled;
                             let weak = ui.visuals().weak_text_color();
                             ui.add_enabled_ui(on, |ui| {
                                 ui.label("at");
-                                ui.add(
+                                changed |= committed(&ui.add(
                                     egui::DragValue::new(
                                         &mut self.config.hw_alerts.temp_threshold_celsius,
                                     )
@@ -528,14 +495,14 @@ impl SettingsTab {
                                     .speed(1.0)
                                     .fixed_decimals(0)
                                     .suffix(" °C"),
-                                );
+                                ));
                                 ui.colored_label(weak, "·  at least");
-                                ui.add(
+                                changed |= committed(&ui.add(
                                     egui::DragValue::new(&mut self.config.hw_alerts.cooldown_secs)
                                         .range(10..=300)
                                         .speed(5.0)
                                         .suffix(" s"),
-                                );
+                                ));
                                 ui.colored_label(weak, "between alerts");
                             });
                         });
@@ -545,10 +512,15 @@ impl SettingsTab {
                 if self.section == SettingsSection::Startup {
                     theme::card(ui, "Startup", |ui| {
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Start with session", |ui| {
-                            ui.checkbox(
-                                &mut self.autostart_enabled,
-                                "Launch Argus-Lasso automatically with your desktop session",
-                            );
+                            if ui
+                                .checkbox(
+                                    &mut self.autostart_enabled,
+                                    "Launch Argus-Lasso automatically with your desktop session",
+                                )
+                                .changed()
+                            {
+                                self.commit_autostart();
+                            }
                         });
                     });
 
@@ -637,7 +609,9 @@ impl SettingsTab {
                         help_text(ui, "A previous installation is retained after an update. Restart games to load the matching overlay. Local service customizations are preserved.");
 
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Check on startup", |ui| {
-                            ui.checkbox(&mut self.config.ui.check_updates_on_start, "Enabled");
+                            changed |= ui
+                                .checkbox(&mut self.config.ui.check_updates_on_start, "Enabled")
+                                .changed();
                         });
                     });
 
@@ -648,18 +622,15 @@ impl SettingsTab {
                 }
             });
 
-        // ── Single bottom apply bar (§5) ──────────────────────────────────
-        let dirty = self.is_dirty();
-        let (discard, apply) = theme::apply_bar(ui, dirty);
-        if discard {
-            self.discard();
-        }
-        if apply {
-            applied = Some(self.apply(ctx));
-        }
-
-        applied
+        changed.then(|| self.config.clone())
     }
+}
+
+/// A number field's edit is finished: the drag was released, or a typed or
+/// stepped value was entered. Storing on every frame of a drag would save
+/// the configuration dozens of times a second.
+fn committed(response: &egui::Response) -> bool {
+    response.drag_stopped() || (response.changed() && !response.dragged())
 }
 
 /// Weak, small help line under a group title (§7).
@@ -1026,26 +997,93 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Gaming → Power profile changes governor and EPP behind this tab's
-    /// back; the tab used to keep showing, and comparing against, what it
-    /// read at startup.
+    /// Clicks in the tab, rendered headless; returns what `show` reported.
+    fn click(tab: &mut super::SettingsTab, label: &str) -> Option<crate::config::Config> {
+        let ctx = egui::Context::default();
+        crate::gui::theme::apply_theme(&ctx, 1.0, &crate::gui::theme::AppTheme::BreezeDark);
+        ctx.enable_accesskit();
+        let mut updates = crate::updater::UpdateState::default();
+        let mut reported = None;
+        let mut frame = |events: Vec<egui::Event>, tab: &mut super::SettingsTab| {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1100.0, 700.0),
+                )),
+                ..Default::default()
+            };
+            ctx.run_ui(input, |root| {
+                egui::CentralPanel::default().show_inside(root, |ui| {
+                    let ctx = ui.ctx().clone();
+                    if let Some(config) = tab.show(ui, &ctx, 1.0, &mut updates) {
+                        reported = Some(config);
+                    }
+                });
+            })
+        };
+        frame(vec![], tab);
+        let output = frame(vec![], tab);
+        let update = output
+            .platform_output
+            .accesskit_update
+            .expect("accesskit update");
+        assert!(
+            !update
+                .nodes
+                .iter()
+                .any(|(_, n)| n.label() == Some("Apply changes")),
+            "settings have no apply step"
+        );
+        let bounds = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some(label))
+            .and_then(|(_, node)| node.bounds())
+            .unwrap_or_else(|| panic!("nothing labelled {label}"));
+        let pos = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(vec![egui::Event::PointerMoved(pos), button(true)], tab);
+        frame(vec![button(false)], tab);
+        frame(vec![], tab);
+        reported
+    }
+
+    /// Settings used to wait for "Apply changes" while theme and opacity
+    /// on the same page took effect at once.
     #[test]
-    fn power_settings_follow_the_kernel_but_keep_an_unapplied_choice() {
+    fn a_setting_takes_effect_when_it_is_changed() {
         let mut tab = super::SettingsTab::new(crate::config::Config::default());
-        tab.follow_power("powersave".into(), "balance_power".into());
-        tab.follow_power("performance".into(), "performance".into());
-        assert_eq!(tab.cpu_governor, "performance");
-        assert_eq!(tab.cpu_epp, "performance");
-        assert!(!tab.is_dirty());
+        tab.section = super::SettingsSection::Processes;
+        let reported = click(&mut tab, "5 s").expect("the change is reported at once");
+        assert_eq!(reported.monitor.display_refresh_interval_ms, 5000);
+    }
 
-        tab.cpu_governor = "powersave".into();
-        tab.follow_power("performance".into(), "balance_performance".into());
-        assert_eq!(tab.cpu_governor, "powersave", "the user's choice stays");
-        assert_eq!(tab.cpu_epp, "balance_performance");
-        assert!(tab.is_dirty(), "and can still be applied");
+    #[test]
+    fn a_typed_cpu_list_is_checked_before_it_is_used() {
+        let mut tab = super::SettingsTab::new(crate::config::Config::default());
+        tab.default_affinity_enabled = true;
+        tab.default_affinity_text = "abc".into();
+        assert!(!tab.commit_affinity());
+        assert!(tab.affinity_error.is_some());
+        assert_eq!(tab.config.cpu.default_affinity, None);
 
-        // Applied, and the kernel took it.
-        tab.follow_power("powersave".into(), "balance_performance".into());
-        assert!(!tab.is_dirty());
+        tab.default_affinity_text = "0".into();
+        assert!(tab.commit_affinity());
+        assert_eq!(tab.config.cpu.default_affinity.as_deref(), Some("0"));
+        assert!(tab.affinity_error.is_none());
+        assert!(!tab.commit_affinity(), "nothing new to store");
+
+        tab.default_affinity_enabled = false;
+        assert!(tab.commit_affinity());
+        assert_eq!(tab.config.cpu.default_affinity, None);
     }
 }

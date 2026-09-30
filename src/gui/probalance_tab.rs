@@ -51,6 +51,7 @@ impl ProBalanceTab {
         // the bar's height and scrolling the body is what pins it.
         let bar_h = 44.0;
         let body_h = (ui.available_height() - bar_h).max(120.0);
+        let mut switched = false;
         egui::ScrollArea::vertical()
             .id_salt("probalance_body")
             .max_height(body_h)
@@ -60,7 +61,7 @@ impl ProBalanceTab {
             // ── Status card: state, plain-language summary, live count ────────
             crate::gui::theme::card_untitled(ui, |ui| {
                 ui.horizontal(|ui| {
-                    th::toggle(ui, &mut self.cfg.enabled, "ProBalance enabled");
+                    switched = th::toggle(ui, &mut self.cfg.enabled, "ProBalance enabled");
                     ui.add_space(tokens::SPACE_S);
                     ui.vertical(|ui| {
                         ui.label(
@@ -319,6 +320,13 @@ impl ProBalanceTab {
         });
 
         // ── Apply bar ─────────────────────────────────────────────────────
+        // The on/off switch acts at once, as a switch does, and says so in
+        // the card above. The thresholds and limits below it stay a draft
+        // until applied: they have to make sense together (restore below
+        // activation), so each edit on its way there must not go live.
+        if switched {
+            self.saved.enabled = self.cfg.enabled;
+        }
         self.cfg.normalize();
         let dirty = self.cfg != self.saved;
         let (discard, apply) = th::apply_bar(ui, dirty);
@@ -329,8 +337,7 @@ impl ProBalanceTab {
             self.saved = self.cfg.clone();
             return Some(self.cfg.clone());
         }
-
-        None
+        switched.then(|| self.saved.clone())
     }
 }
 

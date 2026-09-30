@@ -238,6 +238,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Changed
 
+- Settings take effect as they change, like theme and opacity already did, instead
+  of waiting for **Apply changes** on the same page. Number fields are stored when
+  the drag is released or the value entered, a typed CPU list on Enter once it is
+  valid (an invalid one says why), and a governor or EPP when picked; the picker
+  then shows what the kernel has. ProBalance's on/off switch acts at once; its
+  thresholds keep **Apply changes**, since they must be valid together.
 - The tray menu has "Open Argus-Lasso", and a left click on the tray icon does
   the same. Launching Argus from the app menu while it already runs brings the
   running window to the front instead of only printing "already running".
