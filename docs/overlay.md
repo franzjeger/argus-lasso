@@ -78,6 +78,10 @@ Recording toggles a shared request. Loaded application/swapchain streams write
 separate bounded captures with CSV intervals, metadata and summaries under the
 Argus data directory (`~/.local/share/argus-lasso/benchmarks` by default).
 Queue overflow, present failures or output errors mark a capture incomplete.
+A game that exits mid-recording without tearing down its device leaves the rows
+written so far (every 100 ms) and a checkpoint of those counters; once the game is
+gone, Argus summarizes the rows and marks them complete only if the checkpoint
+shows nothing was lost.
 
 | Metric | Definition |
 |---|---|

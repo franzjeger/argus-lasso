@@ -1,13 +1,13 @@
 //! Bounded asynchronous per-present recording. Disk I/O and sorting never run
 //! on the presentation thread. Separate files for each swapchain lifetime:
 //! the end of one is never dropped, so a recycled handle starts a new file.
-use argus_ipc::capture::{self, Control, Summary};
+use argus_ipc::capture::{self, Checkpoint, Control, Summary};
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
     io::{self, BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender},
@@ -108,6 +108,7 @@ impl Recorder {
                         if stream.writer.flush().is_err() {
                             stream.io_failed = true;
                         }
+                        stream.checkpoint(d.load(Ordering::Relaxed));
                     }
                     let next = capture::read_control();
                     let continuing = control.active
@@ -175,6 +176,8 @@ struct Stream {
     last: Option<Instant>,
     intervals: Vec<u64>,
     io_failed: bool,
+    /// The counters as last written for recovery; see [`Checkpoint`].
+    checkpointed: Checkpoint,
 }
 /// The program a recording is of. Under Wine and Proton /proc/self/exe is
 /// Wine's loader (wine64-preloader), the same for every game; the Windows
@@ -204,9 +207,8 @@ fn program_name<'a>(exe: &'a str, argv0: &'a str, comm: &'a str) -> &'a str {
 }
 
 impl Stream {
-    fn new(sample: &Sample, control: &Control, sequence: u32) -> io::Result<Self> {
-        let dir = capture::directory();
-        fs::create_dir_all(&dir)?;
+    fn new(dir: &Path, sample: &Sample, control: &Control, sequence: u32) -> io::Result<Self> {
+        fs::create_dir_all(dir)?;
         let name = format!(
             "{}-{}-{:x}-{sequence}",
             control.session,
@@ -237,6 +239,13 @@ impl Stream {
             path.with_extension("metadata.json"),
             serde_json::to_vec_pretty(&metadata)?,
         )?;
+        // Written before any row: its presence tells recovery that this layer
+        // keeps the counters, so a clean one can be trusted.
+        let checkpointed = Checkpoint {
+            build: argus_ipc::BUILD_ID.into(),
+            ..Default::default()
+        };
+        capture::write_checkpoint(&path, &checkpointed)?;
         let summary = Summary {
             schema: 1,
             metric: capture::METRIC.into(),
@@ -255,7 +264,25 @@ impl Stream {
             last: None,
             intervals: Vec::new(),
             io_failed: false,
+            checkpointed,
         })
+    }
+    /// Write the counters out for recovery when they have changed since the
+    /// last time. A failed write fails the recording like a failed row, and
+    /// is not retried every 100 ms.
+    fn checkpoint(&mut self, dropped: u64) {
+        let now = Checkpoint {
+            build: self.summary.build.clone(),
+            failed_presents: self.summary.failed_presents,
+            dropped_samples: dropped,
+            io_failed: self.io_failed,
+        };
+        if now != self.checkpointed {
+            if capture::write_checkpoint(&self.path, &now).is_err() {
+                self.io_failed = true;
+            }
+            self.checkpointed = now;
+        }
     }
     fn frame(&mut self, s: Sample) {
         if s.result != 0 && s.result != 1_000_001_003 {
@@ -313,7 +340,10 @@ fn apply(
                     ));
                 }
                 *sequence += 1;
-                streams.insert(sample.swapchain, Stream::new(&sample, control, *sequence)?);
+                streams.insert(
+                    sample.swapchain,
+                    Stream::new(&capture::directory(), &sample, control, *sequence)?,
+                );
             }
             if let Some(stream) = streams.get_mut(&sample.swapchain) {
                 stream.frame(sample);
@@ -339,6 +369,7 @@ fn finish(mut stream: Stream, dropped: u64) {
         // latest two".
         let _ = fs::remove_file(stream.path.with_extension("csv.partial"));
         let _ = fs::remove_file(stream.path.with_extension("metadata.json"));
+        let _ = fs::remove_file(stream.path.with_extension("checkpoint.json"));
         return;
     }
     let (avg, low, p99) = capture::statistics(&mut stream.intervals);
@@ -366,8 +397,12 @@ fn finish(mut stream: Stream, dropped: u64) {
         fs::write(&tmp, serde_json::to_vec_pretty(&stream.summary)?)?;
         fs::rename(tmp, stream.path.with_extension("summary.json"))
     })();
-    if let Err(e) = result {
-        report_error(&format!("Finalization failed: {e}"));
+    match result {
+        // The summary says everything the checkpoint did.
+        Ok(()) => {
+            let _ = fs::remove_file(stream.path.with_extension("checkpoint.json"));
+        }
+        Err(e) => report_error(&format!("Finalization failed: {e}")),
     }
 }
 
@@ -393,6 +428,50 @@ mod tests {
         );
         assert_eq!(program_name("/proton/bin/wine", "", ""), "/proton/bin/wine");
     }
+    /// A game that exits without tearing down its device leaves only what is
+    /// on disk, so the counters that decide completeness have to be there.
+    #[test]
+    fn a_recording_keeps_its_counters_on_disk_until_it_is_finished() {
+        let dir =
+            std::env::temp_dir().join(format!("argus-layer-checkpoint-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let control = Control {
+            session: "1790000000000-1".into(),
+            active: true,
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let sample = |ms: u64, result: i32| Sample {
+            ticket: 1,
+            at: start + Duration::from_millis(ms),
+            swapchain: 7,
+            result,
+        };
+        let mut stream = Stream::new(&dir, &sample(0, 0), &control, 1).unwrap();
+        let path = stream.path.with_extension("checkpoint.json");
+        let read = || serde_json::from_slice::<Checkpoint>(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            read(),
+            Checkpoint {
+                build: argus_ipc::BUILD_ID.into(),
+                ..Default::default()
+            },
+            "written before the first row"
+        );
+
+        stream.frame(sample(0, 0));
+        stream.frame(sample(10, 0));
+        stream.frame(sample(20, -4)); // VK_ERROR_DEVICE_LOST
+        stream.checkpoint(0);
+        assert_eq!(read().failed_presents, 1);
+
+        let summary = stream.path.with_extension("summary.json");
+        finish(stream, 0);
+        assert!(summary.exists());
+        assert!(!path.exists(), "the summary replaces the checkpoint");
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn stopped_or_old_generation_cannot_reopen_a_capture() {
         let mut streams = HashMap::new();

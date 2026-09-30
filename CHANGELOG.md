@@ -33,6 +33,11 @@ current source, release and verification status, see [docs/status.md](docs/statu
   a queue without graphics, or more than one queue) gets a log line saying so,
   once per swapchain. The HUD stayed off there without a word, as if it had never
   started.
+- A recording from a game that exits without tearing down its device, as many
+  Proton games do, is listed Complete when nothing was lost. It was always
+  Incomplete: the counters that decide it lived only in the game. The layer now
+  keeps them in a checkpoint next to the rows, and recovery uses it. Recordings
+  made by an older layer, which writes no checkpoint, stay Incomplete.
 - `--ui-tour` captures the window opaque. It used the window opacity of whoever
   ran it, and at 80 % every screenshot was drawn over black: dark themes came out
   a muddy brown-grey and light themes grey.

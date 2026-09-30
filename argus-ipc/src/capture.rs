@@ -161,6 +161,43 @@ pub struct Summary {
     pub failed_presents: u64,
     pub complete: bool,
 }
+/// The counters a recording's summary is judged by, while the recording is
+/// still being written. They live in the game's memory, so a game that exited
+/// without tearing down its device left rows but no way to tell an intact
+/// recording from a damaged one: every such recording was listed Incomplete.
+/// The layer writes this next to the rows when a recording starts and again
+/// whenever a counter changes; recovery builds the summary from it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub build: String,
+    pub failed_presents: u64,
+    pub dropped_samples: u64,
+    pub io_failed: bool,
+}
+
+/// Write `checkpoint` for the recording whose files share `stem` (a path
+/// without extension), replacing the previous one in one step.
+pub fn write_checkpoint(stem: &Path, checkpoint: &Checkpoint) -> io::Result<()> {
+    let path = stem.with_extension("checkpoint.json");
+    let temp = stem.with_extension("checkpoint.json.tmp");
+    let bytes = serde_json::to_vec(checkpoint).map_err(io::Error::other)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temp)?;
+    io::Write::write_all(&mut file, &bytes)?;
+    fs::rename(temp, path)
+}
+
+fn read_checkpoint(dir: &Path, stem: &str) -> Option<Checkpoint> {
+    let bytes = read_regular_capped(&dir.join(format!("{stem}.checkpoint.json")), 4 * 1024)
+        .ok()
+        .flatten()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// The file name of a program path, Unix or Windows: Wine and Proton
 /// games are recorded by their Windows path (`Z:\\games\\Game.exe`).
 pub fn program_file_name(path: &str) -> &str {
@@ -227,7 +264,13 @@ fn delete_recording_in(dir: &Path, summary: &Path) -> io::Result<()> {
         })?;
     // The summary goes last: until it does, a deletion that failed half way
     // is still listed and can be tried again.
-    for suffix in [".csv", ".csv.partial", ".metadata.json", ".summary.json"] {
+    for suffix in [
+        ".csv",
+        ".csv.partial",
+        ".metadata.json",
+        ".checkpoint.json",
+        ".summary.json",
+    ] {
         match fs::remove_file(dir.join(format!("{stem}{suffix}"))) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}
@@ -296,8 +339,8 @@ fn load_summaries_in(dir: &Path) -> Vec<(PathBuf, Summary)> {
 
 /// A game that exits or crashes mid-recording never writes a summary; its
 /// rows stay in a `.csv.partial`, unlisted and never cleaned up. Once the
-/// process is gone, give each such file an incomplete summary built from
-/// the rows it wrote.
+/// process is gone, give each such file a summary built from the rows it
+/// wrote, complete only if the layer's [`Checkpoint`] shows nothing was lost.
 fn recover_orphans(dir: &Path, alive: impl Fn(u32) -> bool) {
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = entry.file_name();
@@ -314,10 +357,12 @@ fn recover_orphans(dir: &Path, alive: impl Fn(u32) -> bool) {
         if alive(pid) {
             continue; // possibly still recording
         }
+        let checkpoint = dir.join(format!("{stem}.checkpoint.json"));
         let Some(summary) = recovered_summary(dir, stem, session, pid, swapchain) else {
             // Nothing recorded: nothing to keep.
             let _ = fs::remove_file(dir.join(format!("{stem}.csv.partial")));
             let _ = fs::remove_file(dir.join(format!("{stem}.metadata.json")));
+            let _ = fs::remove_file(&checkpoint);
             continue;
         };
         let temp = dir.join(format!("{stem}.summary.json.tmp"));
@@ -335,7 +380,18 @@ fn recover_orphans(dir: &Path, alive: impl Fn(u32) -> bool) {
             .and_then(|()| fs::rename(&temp, &summary_path));
         if written.is_err() {
             let _ = fs::remove_file(&temp);
+            continue;
         }
+        // After the summary, which is what lists the recording: complete rows
+        // lose the .partial like those finished on device teardown, and the
+        // graph reads either name.
+        if summary.complete {
+            let _ = fs::rename(
+                dir.join(format!("{stem}.csv.partial")),
+                dir.join(format!("{stem}.csv")),
+            );
+        }
+        let _ = fs::remove_file(&checkpoint);
     }
 }
 
@@ -383,10 +439,19 @@ fn recovered_summary(
     let frames = intervals.len();
     let duration_seconds = intervals.iter().map(|ns| *ns as f64 / 1e9).sum();
     let (average_fps, low_1_fps, p99_frametime_ms) = statistics(&mut intervals);
+    // Rows are written out every 100 ms, so an exit loses at most the last
+    // of them, never a gap. With the layer's counters clean, the recording is
+    // as intact as one finished on device teardown. A layer too old to write
+    // a checkpoint leaves no way to tell, and its recording stays incomplete.
+    let checkpoint = read_checkpoint(dir, stem);
+    let complete = checkpoint
+        .as_ref()
+        .is_some_and(|c| !c.io_failed && c.failed_presents == 0 && c.dropped_samples == 0);
+    let checkpoint = checkpoint.unwrap_or_default();
     Some(Summary {
         schema: 1,
         metric: METRIC.into(),
-        build: String::new(),
+        build: checkpoint.build,
         session,
         pid,
         executable,
@@ -396,9 +461,9 @@ fn recovered_summary(
         average_fps,
         low_1_fps,
         p99_frametime_ms,
-        dropped_samples: 0,
-        failed_presents: 0,
-        complete: false,
+        dropped_samples: checkpoint.dropped_samples,
+        failed_presents: checkpoint.failed_presents,
+        complete,
     })
 }
 #[cfg(test)]
@@ -530,19 +595,25 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let files = |stem: &str| {
-            [".summary.json", ".csv", ".csv.partial", ".metadata.json"]
-                .map(|s| dir.join(format!("{stem}{s}")))
+            [
+                ".summary.json",
+                ".csv",
+                ".csv.partial",
+                ".metadata.json",
+                ".checkpoint.json",
+            ]
+            .map(|s| dir.join(format!("{stem}{s}")))
         };
         for path in files("1-2-a-1").iter().chain(&files("1-2-b-2")) {
             fs::write(path, b"x").unwrap();
         }
         fs::write(dir.join("control.json"), b"{}").unwrap();
-        assert_eq!(disk_use_in(&dir), 10);
+        assert_eq!(disk_use_in(&dir), 12);
 
         delete_recording_in(&dir, &dir.join("1-2-a-1.summary.json")).unwrap();
         assert!(files("1-2-a-1").iter().all(|p| !p.exists()));
         assert!(files("1-2-b-2").iter().all(|p| p.exists()));
-        assert_eq!(disk_use_in(&dir), 6);
+        assert_eq!(disk_use_in(&dir), 7);
 
         for refused in [
             dir.join("control.json"),
@@ -629,6 +700,57 @@ mod tests {
             !dir.join(format!("{empty}.csv.partial")).exists(),
             "nothing to keep"
         );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A game that exits without tearing down its device leaves rows that are
+    /// whole but for the last 100 ms. The layer's checkpoint says whether
+    /// anything else was lost, and only a clean one makes them complete.
+    #[test]
+    fn a_recording_left_by_an_exit_is_judged_by_its_checkpoint() {
+        let dir = scratch("argus-ipc-checkpoints");
+        let clean = "1790000000000-1-900-ab-1";
+        let failed = "1790000000000-1-900-cd-2";
+        let rows = "present_begin_ns,interval_ns,vulkan_result\n0,10000000,0\n10,20000000,0\n";
+        for stem in [clean, failed] {
+            fs::write(dir.join(format!("{stem}.csv.partial")), rows).unwrap();
+        }
+        let checkpoint = |stem: &str, failed_presents| {
+            write_checkpoint(
+                &dir.join(stem),
+                &Checkpoint {
+                    build: "abc".into(),
+                    failed_presents,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        };
+        checkpoint(clean, 0);
+        checkpoint(failed, 2);
+
+        recover_orphans(&dir, |_| false);
+
+        let summary = read_summary_capped(&dir.join(format!("{clean}.summary.json"))).unwrap();
+        assert!(summary.complete);
+        assert_eq!(summary.build, "abc");
+        assert!(
+            dir.join(format!("{clean}.csv")).exists(),
+            "named as finished"
+        );
+        assert!(!dir.join(format!("{clean}.csv.partial")).exists());
+
+        let summary = read_summary_capped(&dir.join(format!("{failed}.summary.json"))).unwrap();
+        assert!(!summary.complete);
+        assert_eq!(summary.failed_presents, 2);
+        assert!(dir.join(format!("{failed}.csv.partial")).exists());
+
+        for stem in [clean, failed] {
+            assert!(
+                !dir.join(format!("{stem}.checkpoint.json")).exists(),
+                "the summary replaces the checkpoint"
+            );
+        }
         fs::remove_dir_all(&dir).ok();
     }
 
