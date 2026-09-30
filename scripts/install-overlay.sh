@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Build and atomically install a matching daemon/layer pair. Existing mapped
-# libraries are immutable; restart games after installation.
+# Build and install a matching daemon/layer pair. Each file is replaced
+# atomically, but the pair is not one transaction. Existing mapped libraries
+# are immutable; restart games after installation.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export ARGUS_BUILD_ID

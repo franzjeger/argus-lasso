@@ -122,3 +122,9 @@ sudo systemctl daemon-reload
 ```
 
 This does not remove the distinct CPU control helpers or your recorded data.
+`make uninstall` prints the commands for the helpers when they are installed:
+
+```bash
+sudo rm -rf /usr/local/lib/argus-lasso
+sudo rm -f /usr/share/polkit-1/actions/io.github.franzjeger.argus-lasso.policy
+```

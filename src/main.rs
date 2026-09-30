@@ -425,10 +425,9 @@ fn main() {
                 std::process::exit(1);
             }
             Ok(false) => {}
-            Err(e) => {
-                eprintln!("Update recovery failed: {e}");
-                std::process::exit(1);
-            }
+            // Exiting here failed every start (a restart loop under
+            // systemd) with no way out; the running binary is complete.
+            Err(e) => eprintln!("Warning: update recovery skipped: {e}"),
         }
     }
 
@@ -436,7 +435,9 @@ fn main() {
     let icon_rgba = make_icon_rgba();
 
     // Load config
-    let (cfg, load_error) = config::load();
+    // The tour renders a throwaway session: it must not write a config,
+    // which migrating an old one would.
+    let (cfg, load_error) = config::load(args.ui_tour.is_none());
     // Set the unreadable file aside before anything can save over it — but
     // never from the read-only tour, which must not write configuration.
     let load_notice = match load_error {

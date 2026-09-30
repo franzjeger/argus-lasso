@@ -53,7 +53,9 @@ Rollback validates the backup binary's checksum and retains its recovery record
 until both restores succeed. It restores the prior manifest, or removes the
 manifest if none existed before installation. It does not downgrade configuration
 files, restore desktop/icon artwork, or replace the privileged sensor service.
-Old versioned layer files are retained because games may still have them mapped.
+Layer directories nothing refers to any more are removed; the live one and the one
+rollback would restore are kept. A game that still has a removed library mapped
+keeps using it until it exits.
 
 Before a restart, pending GUI termination actions are cancelled, settings saves
 are queued ahead of shutdown, and the monitor is asked to restore scheduling

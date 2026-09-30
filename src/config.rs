@@ -327,29 +327,55 @@ pub fn config_path() -> PathBuf {
 
 // ── Load / Save ───────────────────────────────────────────────────────────────
 
-/// Migrate config from the old process-lasso-rs path to the new argus-lasso path.
+/// Migrate config from the old process-lasso-rs path to the new argus-lasso
+/// path, once.
 fn migrate_old_config() {
     let Ok(home) = std::env::var("HOME") else {
         return;
     };
-    let base = PathBuf::from(home);
-    let old_path = base
+    let old_path = PathBuf::from(home)
         .join(".config")
         .join("process-lasso-rs")
         .join("config.toml");
-    let new_path = config_path();
-    if old_path.exists() && !new_path.exists() {
-        if let Some(parent) = new_path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if fs::copy(&old_path, &new_path).is_ok() {
-            log::info!(
+    migrate_config(&old_path, &config_path());
+}
+
+/// Copy `old` to `new` if there is no configuration at `new` and this has
+/// not happened before. A marker next to `new` records that it has: when a
+/// broken config was later set aside (preserve_unreadable), the next start
+/// migrated the old file again and enforced its long-stale rules.
+fn migrate_config(old: &Path, new: &Path) {
+    let marker = new.with_file_name(".migrated-from-process-lasso-rs");
+    if is_present(&marker) || !is_present(old) {
+        return;
+    }
+    if !is_present(new) {
+        let copied = fs::read(old).and_then(|bytes| {
+            if let Some(parent) = new.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_write(new, &bytes)
+        });
+        match copied {
+            Ok(()) => log::info!(
                 "Migrated config from {} to {}",
-                old_path.display(),
-                new_path.display()
-            );
+                old.display(),
+                new.display()
+            ),
+            Err(e) => {
+                log::warn!("Could not migrate config from {}: {e}", old.display());
+                return;
+            }
         }
     }
+    let _ = fs::write(&marker, b"");
+}
+
+/// Whether anything is at `path`, a dangling symlink included. Only "not
+/// found" means absent: `Path::exists` is false for a dangling symlink and
+/// for any error, and treating those as "no config" saved defaults over it.
+fn is_present(path: &Path) -> bool {
+    !matches!(fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Load config from disk, filling missing keys with defaults via serde.
@@ -358,13 +384,15 @@ fn migrate_old_config() {
 /// the error. The caller must not let the next save replace that file before
 /// `preserve_unreadable` has moved it aside: saving the defaults over it
 /// would silently delete every rule and profile it held.
-pub fn load() -> (Config, Option<String>) {
-    migrate_old_config();
+pub fn load(migrate: bool) -> (Config, Option<String>) {
+    if migrate {
+        migrate_old_config();
+    }
     load_from(&config_path())
 }
 
 fn load_from(path: &Path) -> (Config, Option<String>) {
-    if !path.exists() {
+    if !is_present(path) {
         return (Config::default(), None);
     }
     let error = match fs::read_to_string(path) {
@@ -687,5 +715,46 @@ mod cpu_policy_config_tests {
         cfg.normalize();
         assert_eq!(cfg.system_restore_threshold_percent, 19.0);
         assert_eq!(cfg.process_min_cpu_percent, 1.0);
+    }
+
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("argus-cfg-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A config symlinked to a file that is not there yet (dotfiles on an
+    /// unmounted disk) read as "no config", and the first save replaced the
+    /// symlink with defaults.
+    #[test]
+    fn a_dangling_config_symlink_is_not_an_absent_config() {
+        let dir = scratch();
+        let path = dir.join("config.toml");
+        std::os::unix::fs::symlink(dir.join("not-mounted/config.toml"), &path).unwrap();
+        let (_, error) = load_from(&path);
+        assert!(
+            error.is_some(),
+            "reported, so it is set aside, not overwritten"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The old config was migrated again whenever the new one was missing,
+    /// such as after a broken one had been set aside.
+    #[test]
+    fn the_old_config_is_migrated_once() {
+        let dir = scratch();
+        let (old, new) = (dir.join("old.toml"), dir.join("new/config.toml"));
+        fs::write(&old, "[probalance]\nenabled = true\n").unwrap();
+        migrate_config(&old, &new);
+        assert_eq!(
+            fs::read_to_string(&new).unwrap(),
+            "[probalance]\nenabled = true\n"
+        );
+
+        fs::remove_file(&new).unwrap();
+        migrate_config(&old, &new);
+        assert!(!new.exists());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

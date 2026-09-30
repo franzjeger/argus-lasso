@@ -56,7 +56,9 @@ uninstall:
 	rm -f $(HOME)/.local/share/vulkan/implicit_layer.d/ArgusOverlay.json
 	rm -rf $(HOME)/.local/share/argus-lasso/layers
 	rm -f $(DESKTOPDIR)/io.github.franzjeger.ArgusLasso.desktop
-	rm -f $(BINDIR)/argus-lasso
+	rm -f $(BINDIR)/argus-lasso $(BINDIR)/.argus-lasso-rollback.json
+	rm -rf $(BINDIR)/.argus-update-*
+	rm -f $(HOME)/.config/autostart/argus-lasso.desktop
 	find $(ICONBASE) -name "argus-lasso.png" -delete 2>/dev/null || true
 	rm -f $(ICONBASE)/scalable/apps/argus-lasso.svg
 	rm -f $(DESKTOPDIR)/argus-lasso.desktop
@@ -64,6 +66,12 @@ uninstall:
 	rm -f $(SYSTEMDDIR)/argus-lasso.service
 	systemctl --user daemon-reload
 	@echo "Uninstalled."
+	@if [ -e /usr/local/lib/argus-lasso ] || [ -e /usr/share/polkit-1/actions/io.github.franzjeger.argus-lasso.policy ]; then \
+		echo "The CPU control helpers are installed system-wide and still grant their"; \
+		echo "actions to local users. Remove them with:"; \
+		echo "  sudo rm -rf /usr/local/lib/argus-lasso"; \
+		echo "  sudo rm -f /usr/share/polkit-1/actions/io.github.franzjeger.argus-lasso.policy"; \
+	fi
 
 enable:
 	systemctl --user enable --now argus-lasso.service
