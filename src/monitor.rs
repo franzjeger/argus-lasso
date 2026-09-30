@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::cpu_park;
 use crate::hw_monitor::{HwCollector, HwMonitorData};
 use crate::probalance::{ProBalance, ProcSnapshot};
-use crate::rules::{Policy, RuleEngine, RuleState, Target};
+use crate::rules::{Owner, Policy, RuleEngine, RuleState, Target};
 use crate::utils;
 
 // ── Commands from GUI → daemon ────────────────────────────────────────────────
@@ -593,10 +593,6 @@ struct GamingState {
     auto: bool,
     /// Consecutive snapshots without a detected game before auto-disabling
     absent_snapshots: u32,
-    /// pid → (start_ticks, original nice before we elevated). start_ticks pins
-    /// this to the specific process instance, not just the pid number — see
-    /// `Daemon::prune_dead` and restore_gaming_nices.
-    niced: HashMap<u32, (u64, i32)>,
     launch_profiles: Vec<argus_ipc::LaunchProfile>,
 }
 
@@ -627,8 +623,6 @@ struct Daemon {
     prev_sys_total: u64,
     known_pids: HashSet<u32>,
     first_snapshot: bool,
-    /// pid → original affinity set before we changed it; pruned every snapshot cycle
-    original_affinities: HashMap<u32, HashSet<u32>>,
     /// pid → expiry Instant (suppress rule re-enforcement after manual change)
     manual_overrides: HashMap<u32, Instant>,
     /// What rule enforcement changed, to put back when no rule asks for it
@@ -704,7 +698,6 @@ impl Daemon {
             prev_sys_total: 0,
             known_pids: HashSet::new(),
             first_snapshot: true,
-            original_affinities: HashMap::new(),
             manual_overrides: HashMap::new(),
             rule_state: RuleState::default(),
             fresh_pids: HashSet::new(),
@@ -857,8 +850,10 @@ impl Daemon {
                 // not later auto-disable a manually (re-)enabled mode.
                 gaming.auto = false;
                 gaming.absent_snapshots = 0;
-                if !active && !gaming.niced.is_empty() {
-                    restore_gaming_nices(&mut gaming.niced, &self.log);
+                if active {
+                    self.boost_running();
+                } else {
+                    self.rule_state.end(Owner::Gaming, &self.log);
                 }
                 publish_gaming_state(&self.state, active);
             }
@@ -867,7 +862,10 @@ impl Daemon {
                     .insert(pid, Instant::now() + Duration::from_secs_f64(duration_secs));
             }
             DaemonCmd::ResetAffinities => {
-                reset_all_affinities(&mut self.original_affinities, &self.log);
+                let restored = self.rule_state.restore_all_affinities();
+                (self.log)(format!(
+                    "[Reset] Restored the affinity of {restored} processes Argus had changed."
+                ));
             }
             DaemonCmd::ReapplyDefaults => self.reapply_rules(),
             DaemonCmd::Shutdown => {
@@ -892,9 +890,7 @@ impl Daemon {
             cpu_park::unpark_all(&self.log);
         }
         self.probalance.shutdown();
-        if !self.gaming.niced.is_empty() {
-            restore_gaming_nices(&mut self.gaming.niced, &self.log);
-        }
+        self.rule_state.end(Owner::Gaming, &self.log);
         if let Ok(mut s) = self.state.lock() {
             s.shutdown_complete = true;
         }
@@ -931,20 +927,30 @@ impl Daemon {
 
         // ── New PIDs: apply rules or default affinity ───────────────────
         self.fresh_pids = current_pids.difference(&self.known_pids).copied().collect();
-        for proc in self
-            .raw_snapshot
-            .iter()
-            .filter(|p| self.fresh_pids.contains(&p.pid))
-        {
-            apply_new_pid(
-                proc,
-                &self.config,
-                &self.rule_engine,
-                &mut self.original_affinities,
-                &mut self.gaming,
-                &mut self.rule_state,
-                &self.log,
-            );
+        if !self.fresh_pids.is_empty() {
+            // One copy of the rules for the whole batch: the first snapshot
+            // holds every process, and the GUI locks the engine to edit.
+            let rules = self.rules();
+            let policy = Policy {
+                rules: &rules,
+                default_affinity: default_affinity(&self.config),
+            };
+            let boost = (self.gaming.active && self.gaming.elevate_nice).then(|| GamingBoost {
+                preferred: preferred_cores(),
+            });
+            for proc in self
+                .raw_snapshot
+                .iter()
+                .filter(|p| self.fresh_pids.contains(&p.pid))
+            {
+                apply_new_pid(
+                    proc,
+                    &policy,
+                    boost.as_ref(),
+                    &mut self.rule_state,
+                    &self.log,
+                );
+            }
         }
         if self.first_snapshot {
             (self.log)(format!(
@@ -960,29 +966,14 @@ impl Daemon {
         }
     }
 
-    /// Prune dead PIDs from per-PID maps: avoids unbounded growth, and — for
-    /// the Gaming Mode nices — stops a reused PID from getting an unrelated
-    /// process's nice restored onto it when Gaming Mode is disabled.
+    /// Prune dead PIDs from per-PID maps: avoids unbounded growth, and stops
+    /// a reused PID from getting an unrelated process's value put back.
     ///
-    /// Those additionally key on start_ticks, not just pid liveness:
-    /// current_pids.contains(pid) is true again the instant a dead pid is
-    /// reused by an unrelated process, which — within one scan interval —
-    /// could otherwise inherit the previous occupant's nice-restore entry.
-    /// Two processes can't share a start time, so comparing it catches reuse
-    /// that a liveness check alone would miss.
+    /// The records of what Argus changed key on start_ticks, not just pid
+    /// liveness: current_pids.contains(pid) is true again the instant a dead
+    /// pid is reused by an unrelated process. Two processes can't share a
+    /// start time, so comparing it catches reuse that liveness alone misses.
     fn prune_dead(&mut self, current_pids: &HashSet<u32>) {
-        self.original_affinities
-            .retain(|pid, _| current_pids.contains(pid));
-        let niced = &mut self.gaming.niced;
-        if !niced.is_empty() {
-            let live_start_ticks: HashMap<u32, u64> = self
-                .raw_snapshot
-                .iter()
-                .filter(|p| niced.contains_key(&p.pid))
-                .map(|p| (p.pid, p.start_ticks))
-                .collect();
-            niced.retain(|pid, entry| live_start_ticks.get(pid).copied() == Some(entry.0));
-        }
         self.caches.retain_live(current_pids);
         let live: HashMap<u32, u64> = self
             .raw_snapshot
@@ -1012,6 +1003,8 @@ impl Daemon {
                     apply_gaming_parking(true, &Parking::NonPreferred, &self.log);
                 }
                 publish_gaming_state(&self.state, true);
+                // The game that turned it on is running already.
+                self.boost_running();
             }
         } else if gaming.auto && gaming.active {
             // Require a couple of game-free snapshots before restoring,
@@ -1022,14 +1015,28 @@ impl Daemon {
                 gaming.auto = false;
                 gaming.absent_snapshots = 0;
                 (self.log)("[Gaming Mode] Auto-disabled — game exited.".into());
-                if !gaming.niced.is_empty() {
-                    restore_gaming_nices(&mut gaming.niced, &self.log);
-                }
+                self.rule_state.end(Owner::Gaming, &self.log);
                 if self.config.gaming_mode.auto_park {
                     apply_gaming_parking(false, &Parking::Keep, &self.log);
                 }
                 publish_gaming_state(&self.state, false);
             }
+        }
+    }
+
+    /// Apply Gaming Mode's boost to the processes already running, as it is
+    /// turned on: new processes get it as they appear, but the game that
+    /// was running when it was enabled never did.
+    fn boost_running(&mut self) {
+        if !(self.gaming.active && self.gaming.elevate_nice) {
+            return;
+        }
+        let rules = self.rules();
+        let boost = GamingBoost {
+            preferred: preferred_cores(),
+        };
+        for proc in &self.raw_snapshot {
+            gaming_boost(proc, &rules, &boost, &mut self.rule_state, &self.log);
         }
     }
 
@@ -1771,42 +1778,83 @@ fn config_change_notes(before: &Config, after: &Config) -> Vec<String> {
 
 // ── New PID handling ──────────────────────────────────────────────────────────
 
+/// Rules, or the default affinity, for a process seen for the first time,
+/// then Gaming Mode's boost if it is on.
 fn apply_new_pid(
     proc: &ProcInfo,
-    config: &Config,
-    rule_engine: &Arc<Mutex<RuleEngine>>,
-    original_affinities: &mut HashMap<u32, HashSet<u32>>,
-    gaming: &mut GamingState,
+    policy: &Policy,
+    gaming: Option<&GamingBoost>,
     rule_state: &mut RuleState,
     log_cb: &impl Fn(String),
 ) {
-    let pid = proc.pid;
-    capture_original(pid, original_affinities);
-    let target = target(proc, utils::get_nice(pid));
-    let matched = apply_matching_rules(rule_engine, config, target, rule_state, log_cb);
-
-    if matched {
-        // Rule matched — if gaming mode + elevate_nice, apply nice -1 and pin to preferred cores
-        if gaming.active && gaming.elevate_nice && !gaming.niced.contains_key(&pid) {
-            let orig_nice = proc.nice;
-            if cpu_park::set_process_nice_via_helper(pid, proc.start_ticks, -1) {
-                gaming.niced.insert(pid, (proc.start_ticks, orig_nice));
-                log_cb(format!("[Gaming Mode] nice -1 → {}({})", proc.name, pid));
-            }
-            // Pin game process to preferred cores (P-cores / V-Cache CCD)
-            let topo = cpu_park::detect_topology();
-            if topo.has_asymmetry() {
-                let preferred_list = utils::cpuset_to_cpulist(&topo.preferred);
-                if utils::set_affinity_if_changed(pid, &preferred_list) {
-                    log_cb(format!(
-                        "[Gaming Mode] affinity → {} ({}) for {}({})",
-                        topo.preferred_label, preferred_list, proc.name, pid
-                    ));
-                }
-            }
+    let target = target(proc, utils::get_nice(proc.pid));
+    let ionice = || utils::get_ionice_raw(proc.pid);
+    crate::rules::apply_rules(policy, target, ionice, rule_state, log_cb);
+    // "Matched" comes from the rule patterns, not from whether applying
+    // changed anything: an already-correct process is still rule-managed.
+    if !crate::rules::any_matches(policy.rules, &proc.name) {
+        if let Some(affinity) = policy.default_affinity {
+            rule_state.apply_default_affinity(target, affinity, log_cb);
         }
-    } else if let Some(affinity) = default_affinity(config) {
-        rule_state.apply_default_affinity(target, affinity, log_cb);
+    }
+    if let Some(boost) = gaming {
+        gaming_boost(proc, policy.rules, boost, rule_state, log_cb);
+    }
+}
+
+/// Gaming Mode's priority for games: -1, above everything else the user runs.
+const GAMING_NICE: i32 = -1;
+
+/// What Gaming Mode applies while it is on.
+struct GamingBoost {
+    /// The preferred cores (P-cores or the V-Cache CCD), on asymmetric CPUs.
+    preferred: Option<String>,
+}
+
+fn preferred_cores() -> Option<String> {
+    let topo = cpu_park::detect_topology();
+    topo.has_asymmetry()
+        .then(|| utils::cpuset_to_cpulist(&topo.preferred))
+}
+
+/// Gaming Mode's changes to a process a rule matches or a detected game:
+/// nice -1 and the preferred cores, each only where no rule sets that value
+/// itself (the rule's value stands, rather than the two fighting every
+/// pass), and the nice only ever as a raise in priority. Recorded as Gaming
+/// Mode's, so turning it off puts back what it changed.
+fn gaming_boost(
+    proc: &ProcInfo,
+    rules: &[crate::rules::Rule],
+    boost: &GamingBoost,
+    rule_state: &mut RuleState,
+    log_cb: &impl Fn(String),
+) {
+    let effect = crate::rules::preview_effect(rules, &proc.name);
+    if effect.matches.is_empty() && !is_game_process(proc) {
+        return;
+    }
+    let target = target(proc, Some(proc.nice));
+    if effect.nice.is_none()
+        && proc.nice > GAMING_NICE
+        && cpu_park::set_process_nice_via_helper(proc.pid, proc.start_ticks, GAMING_NICE)
+    {
+        rule_state.record_gaming_nice(target, proc.nice, GAMING_NICE);
+        log_cb(format!(
+            "[Gaming Mode] nice {GAMING_NICE} → {}({})",
+            proc.name, proc.pid
+        ));
+    }
+    if let Some(cpus) = boost
+        .preferred
+        .as_deref()
+        .filter(|_| effect.affinity.is_none())
+    {
+        if rule_state.gaming_pin(target, cpus) {
+            log_cb(format!(
+                "[Gaming Mode] affinity → {cpus} for {}({})",
+                proc.name, proc.pid
+            ));
+        }
     }
 }
 
@@ -1827,87 +1875,6 @@ fn default_affinity(config: &Config) -> Option<&str> {
         .default_affinity
         .as_deref()
         .filter(|affinity| !affinity.is_empty())
-}
-
-fn capture_original(pid: u32, original_affinities: &mut HashMap<u32, HashSet<u32>>) {
-    if original_affinities.contains_key(&pid) {
-        return;
-    }
-    use nix::sched::{sched_getaffinity, CpuSet};
-    use nix::unistd::Pid;
-    if let Ok(cpu_set) = sched_getaffinity(Pid::from_raw(pid as i32)) {
-        let mut cpus = HashSet::new();
-        for i in 0..CpuSet::count() {
-            if cpu_set.is_set(i).unwrap_or(false) {
-                cpus.insert(i as u32);
-            }
-        }
-        original_affinities.insert(pid, cpus);
-    }
-}
-
-// ── Reset all affinities ──────────────────────────────────────────────────────
-
-fn reset_all_affinities(
-    original_affinities: &mut HashMap<u32, HashSet<u32>>,
-    log_cb: &impl Fn(String),
-) {
-    use nix::sched::{sched_setaffinity, CpuSet};
-    use nix::unistd::Pid;
-
-    let online = utils::get_cpu_count();
-    let all_cpus: HashSet<u32> = (0..online).collect();
-    let mut count = 0;
-
-    for (pid, orig) in original_affinities.iter() {
-        let mask = if orig.is_empty() { &all_cpus } else { orig };
-        let mut cpu_set = CpuSet::new();
-        for &c in mask {
-            let _ = cpu_set.set(c as usize);
-        }
-        if sched_setaffinity(Pid::from_raw(*pid as i32), &cpu_set).is_ok() {
-            count += 1;
-        }
-        // Also reset all threads
-        let tids = utils::get_tids(*pid);
-        for tid in tids {
-            if tid != *pid {
-                let _ = sched_setaffinity(Pid::from_raw(tid as i32), &cpu_set);
-            }
-        }
-    }
-    original_affinities.clear();
-    log_cb(format!(
-        "[Reset] Restored affinity on {count} processes to original state."
-    ));
-}
-
-// ── Rules on one process ──────────────────────────────────────────────────────
-
-/// Apply every matching rule to one process, reading its current I/O
-/// priority live. Returns whether any rule matches.
-///
-/// "Matched" comes from the rule patterns, NOT from whether applying produced
-/// actions: a matching rule whose settings are already correct returns no
-/// actions, and treating that as "unmatched" would clobber the rule's
-/// affinity with the default affinity.
-fn apply_matching_rules(
-    rule_engine: &Arc<Mutex<RuleEngine>>,
-    config: &Config,
-    target: Target,
-    rule_state: &mut RuleState,
-    log_cb: &impl Fn(String),
-) -> bool {
-    let Ok(re) = rule_engine.lock() else {
-        return false;
-    };
-    let policy = Policy {
-        rules: re.get_rules(),
-        default_affinity: default_affinity(config),
-    };
-    let ionice = || utils::get_ionice_raw(target.pid);
-    crate::rules::apply_rules(&policy, target, ionice, rule_state, log_cb);
-    re.matches_any(target.name)
 }
 
 // ── HW temperature alerts ────────────────────────────────────────────────────
@@ -1962,19 +1929,6 @@ fn check_hw_alerts(
 }
 
 // ── Restore gaming nices ──────────────────────────────────────────────────────
-
-fn restore_gaming_nices(gaming_niced: &mut HashMap<u32, (u64, i32)>, log_cb: &impl Fn(String)) {
-    let mut count = 0;
-    for (&pid, &(start_ticks, orig_nice)) in gaming_niced.iter() {
-        if cpu_park::set_process_nice_via_helper(pid, start_ticks, orig_nice) {
-            count += 1;
-        }
-    }
-    gaming_niced.clear();
-    log_cb(format!(
-        "[Gaming Mode] Restored nice for {count} processes."
-    ));
-}
 
 #[cfg(test)]
 mod tests {

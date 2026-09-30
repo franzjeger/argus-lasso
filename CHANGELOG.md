@@ -283,6 +283,15 @@ current source, release and verification status, see [docs/status.md](docs/statu
   now records the value from before ProBalance's throttle as the one to put back,
   and ProBalance leaves processes whose nice a rule sets alone. Deleting such a
   rule left the process at the throttle value for good.
+- Gaming Mode puts back what it changed on each process when it ends: the
+  preferred-core pin stayed after Gaming Mode was off, and its -1 nice was
+  restored even over a change made since. It changes only what no rule sets (a
+  rule's nice or affinity used to be overridden until the next pass), only ever
+  raises priority, and also boosts the detected game and processes already
+  running when it is turned on, not only processes started afterwards.
+- "Restore all CPU assignments" restores the processes Argus changed, to what
+  they had before. It reset every process ever seen, pinning those first seen
+  while CPUs were parked to the CPUs online then.
 
 ### Changed
 
