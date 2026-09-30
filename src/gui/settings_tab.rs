@@ -928,6 +928,7 @@ fn disable_autostart() -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::gui::TestFrame as _;
 
     #[test]
     fn exec_paths_are_quoted_for_a_desktop_entry() {
@@ -1047,8 +1048,8 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            ctx.run_ui(input, |root| {
-                egui::CentralPanel::default().show_inside(root, |ui| {
+            ctx.test_frame(input, |root| {
+                egui::CentralPanel::default().show(root, |ui| {
                     let ctx = ui.ctx().clone();
                     if let Some(config) = tab.show(ui, &ctx, 1.0, &mut updates) {
                         reported = Some(config);

@@ -2,10 +2,10 @@
 name = "argus-lasso"
 version = "1.3.1"
 edition = "2021"
-# The floor the dependency tree actually imposes — the egui 0.34 stack
-# declares 1.92. Enforced by cargo, and checked in CI so it cannot drift
+# The floor the dependency tree actually imposes — the egui 0.36 stack
+# declares 1.95. Enforced by cargo, and checked in CI so it cannot drift
 # back into being a guess.
-rust-version = "1.92"
+rust-version = "1.95"
 description = "Argus-Lasso — Linux process manager with CPU affinity, ProBalance, Gaming Mode, and HW monitoring"
 authors = ["franzjeger"]
 
@@ -19,11 +19,11 @@ argus-ipc = { path = "argus-ipc" }
 # 0.34 flipped the default renderer to wgpu. glow is selected explicitly to
 # keep the OpenGL backend this app has always used — wgpu pulls a much larger
 # tree and changes the surface eframe hands to the Wayland opacity code.
-eframe      = { version = "0.34", default-features = false, features = [
+eframe      = { version = "0.36", default-features = false, features = [
     "accesskit", "default_fonts", "glow", "wayland", "x11",
 ] }
-egui        = "0.34"
-egui_extras = "0.34"
+egui        = "0.36"
+egui_extras = "0.36"
 # GNOME's Mutter never draws server-side window decorations on Wayland, and
 # eframe's "wayland" feature does not enable winit's client-side fallback —
 # so on GNOME the window rendered with no titlebar, border, or close button.
@@ -37,7 +37,7 @@ winit = { version = "0.30", default-features = false, features = [
 # Process enumeration
 
 # Syscalls: sched_setaffinity, signal
-nix = { version = "0.29", features = ["sched", "process", "signal", "fs"] }
+nix = { version = "0.31", features = ["sched", "process", "signal", "fs"] }
 
 # Serialisation
 serde = { version = "1", features = ["derive"] }
@@ -70,7 +70,7 @@ notify-rust = { version = "4", features = ["z"] }
 serde_json = "1"
 
 # NVIDIA GPU monitoring via NVML (no nvidia-smi process spawn)
-nvml-wrapper = "0.12"
+nvml-wrapper = "0.13"
 
 # Wayland compositor-side opacity via wp_alpha_modifier_v1
 # "system" enables Backend::from_foreign_display + ObjectId::from_ptr
@@ -83,7 +83,7 @@ wayland-sys      = { version = "0.31", features = ["client"] }
 raw-window-handle = "0.6"
 
 # PNG writing for --ui-tour captures (also a build-dep, for icon embedding)
-png = "0.17"
+png = "0.18"
 ureq = { version = "3.3.0", features = ["rustls"] }
 sha2 = "0.11.0"
 minisign-verify = "0.2.5"
@@ -95,7 +95,7 @@ shlex = "2"
 semver = "1"
 
 [build-dependencies]
-png = "0.17"
+png = "0.18"
 
 [profile.release]
 opt-level     = 3

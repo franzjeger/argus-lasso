@@ -246,7 +246,7 @@ pub fn window(
             if class == egui::ViewportClass::EmbeddedWindow {
                 egui::Window::new("Overlay settings").open(open).vscroll(true).show(root_ui.ctx(), contents);
             } else {
-                egui::CentralPanel::default().show_inside(root_ui, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, &mut contents);
                 });
             }

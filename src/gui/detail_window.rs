@@ -73,7 +73,7 @@ impl DetailWindow {
                 if root_ui.input(|i| i.viewport().close_requested()) {
                     open = false;
                 }
-                egui::CentralPanel::default().show_inside(root_ui, |ui| {
+                egui::CentralPanel::default().show(root_ui, |ui| {
                     egui::Grid::new("detail_grid")
                         .num_columns(2)
                         .spacing([12.0, 3.0])

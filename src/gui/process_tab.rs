@@ -1299,42 +1299,44 @@ fn row_tooltip(ui: &egui::Ui, ctx: &RowCtx, proc: &ProcInfo, row_rect: egui::Rec
         .unwrap_or(egui::Rect::NOTHING);
     if ptr.is_some_and(|p| name_rect.contains(p)) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
-        #[allow(deprecated)]
-        egui::show_tooltip_at_pointer(
-            ui.ctx(),
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
             ui.layer_id(),
             egui::Id::new(("proc_tip", pid)),
-            |ui| {
+            egui::PopupAnchor::Pointer,
+        )
+        .gap(12.0)
+        .show(|ui| {
+            ui.label(
+                egui::RichText::new(proc.name.as_ref())
+                    .font(theme::bold_font(theme::tokens::FONT_BODY)),
+            );
+            if !proc.cmdline.is_empty() {
                 ui.label(
-                    egui::RichText::new(proc.name.as_ref())
-                        .font(theme::bold_font(theme::tokens::FONT_BODY)),
+                    egui::RichText::new(proc.cmdline.as_str())
+                        .size(theme::tokens::FONT_HELP)
+                        .color(ui.visuals().weak_text_color()),
                 );
-                if !proc.cmdline.is_empty() {
-                    ui.label(
-                        egui::RichText::new(proc.cmdline.as_str())
-                            .size(theme::tokens::FONT_HELP)
-                            .color(ui.visuals().weak_text_color()),
-                    );
-                }
-                ui.separator();
-                ui.label(format!("PID: {}   PPID: {}", pid, proc.ppid));
-                ui.label(format!(
-                    "Disk R: {}   W: {}",
-                    fmt_bps(proc.disk_read_bps),
-                    fmt_bps(proc.disk_write_bps)
-                ));
-            },
-        );
+            }
+            ui.separator();
+            ui.label(format!("PID: {}   PPID: {}", pid, proc.ppid));
+            ui.label(format!(
+                "Disk R: {}   W: {}",
+                fmt_bps(proc.disk_read_bps),
+                fmt_bps(proc.disk_write_bps)
+            ));
+        });
     } else if ptr.is_some_and(|p| aff_rect.contains(p)) && aff_full.len() > AFF_MAX {
-        #[allow(deprecated)]
-        egui::show_tooltip_at_pointer(
-            ui.ctx(),
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
             ui.layer_id(),
             egui::Id::new(("aff_tip", pid)),
-            |ui| {
-                ui.label(aff_full);
-            },
-        );
+            egui::PopupAnchor::Pointer,
+        )
+        .gap(12.0)
+        .show(|ui| {
+            ui.label(aff_full);
+        });
     }
 }
 
@@ -1404,6 +1406,7 @@ fn row_menu(ui: &mut egui::Ui, proc: &ProcInfo, is_suspended: bool) -> Option<Ta
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::TestFrame as _;
 
     fn proc(pid: u32, ppid: u32, name: &str, cpu: f32) -> ProcInfo {
         ProcInfo {
@@ -1451,8 +1454,8 @@ mod tests {
         ctx.enable_accesskit();
         let mut tab = ProcessTab::new(&[], &[]);
         tab.chip_throttled = true;
-        let output = ctx.run_ui(Default::default(), |root| {
-            egui::CentralPanel::default().show_inside(root, |ui| {
+        let output = ctx.test_frame(Default::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
                 tab.show(
                     ui,
                     &[],
@@ -1550,8 +1553,8 @@ mod tests {
             let mut output = None;
             // Let scroll geometry settle, as it does between native repaints.
             for _ in 0..3 {
-                output = Some(ctx.run_ui(input.clone(), |root| {
-                    egui::CentralPanel::default().show_inside(root, |ui| {
+                output = Some(ctx.test_frame(input.clone(), |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
                         tab.show(
                             ui,
                             &snapshot,

@@ -1302,6 +1302,19 @@ mod tests {
 
     /// With an integrated GPU listed first, every value must still come
     /// from the discrete card, never a mix of the two.
+    /// Reads this machine's NVIDIA GPUs through NVML, as the HUD and the
+    /// hardware tab do. Run it after updating nvml-wrapper.
+    #[test]
+    #[ignore = "requires an NVIDIA GPU and driver"]
+    fn nvidia_gpus_are_read_through_nvml() {
+        let groups = collect_nvidia_nvml();
+        assert!(!groups.is_empty(), "no GPU read through NVML");
+        for (_, name, sensors) in &groups {
+            eprintln!("{name}: {sensors:?}");
+            assert!(!sensors.is_empty(), "{name}: no readings");
+        }
+    }
+
     #[test]
     fn hud_reads_one_gpu_the_one_with_most_video_memory() {
         let data = HwMonitorData {

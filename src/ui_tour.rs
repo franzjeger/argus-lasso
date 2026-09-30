@@ -178,6 +178,12 @@ impl Tour {
         // unconditional form — request_repaint_after() let the app fall back
         // to its idle cadence and the tour stopped advancing altogether.
         ctx.request_repaint();
+        // Screens are captured a few frames after they change, and a window
+        // still fading in would be photographed half transparent. Themes
+        // applied by the steps reset the style, so this is kept up each frame.
+        if ctx.global_style().animation_time != 0.0 {
+            ctx.global_style_mut(|style| style.animation_time = 0.0);
+        }
 
         if !self.warmed_up {
             if has_data {
@@ -326,9 +332,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!("argus-tour-test-{}.png", std::process::id()));
         write_png(&path, &img).expect("write");
 
-        let decoder = png::Decoder::new(std::fs::File::open(&path).unwrap());
+        let decoder =
+            png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap()));
         let mut reader = decoder.read_info().unwrap();
-        let mut buf = vec![0; reader.output_buffer_size()];
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut buf).unwrap();
         assert_eq!((info.width, info.height), (2, 1));
         assert_eq!(&buf[..8], &[255, 0, 0, 255, 0, 255, 0, 255]);

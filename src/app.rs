@@ -535,7 +535,7 @@ impl eframe::App for ArgusLassoApp {
         let panel_fill = root_ui.visuals().panel_fill;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(panel_fill).inner_margin(16))
-            .show_inside(root_ui, |ui| {
+            .show(root_ui, |ui| {
                 // Tab bar: five primary workflow tabs on the left; the occasional
                 // tools live behind a "Tools ▾" menu and Settings behind the gear,
                 // so nine equal flat tabs no longer bury the ones people live in.
@@ -788,7 +788,7 @@ impl ArgusLassoApp {
         gaming_active: bool,
         notable_events: &std::collections::VecDeque<String>,
     ) {
-        egui::Panel::bottom("status_bar").show_inside(root_ui, |ui| {
+        egui::Panel::bottom("status_bar").show(root_ui, |ui| {
             let compact_status = ui.available_width() < 1100.0;
             ui.horizontal(|ui| {
                 ui.label(format!("Processes: {}", self.proc_count));
@@ -943,7 +943,7 @@ impl ArgusLassoApp {
             .ok()
             .and_then(|s| s.operation_error.clone());
         if let Some(error) = operation_error {
-            egui::Panel::top("operation_error").show_inside(root_ui, |ui| {
+            egui::Panel::top("operation_error").show(root_ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(crate::gui::theme::sem(ui).negative, error);
                     if ui.button("Dismiss").clicked() {
@@ -960,7 +960,7 @@ impl ArgusLassoApp {
             .ok()
             .and_then(|s| s.config_save_error.clone());
         if let Some(error) = save_error {
-            egui::Panel::top("config_save_error").show_inside(root_ui, |ui| {
+            egui::Panel::top("config_save_error").show(root_ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(crate::gui::theme::sem(ui).negative, error);
                     if ui.button("Retry saving").clicked() {

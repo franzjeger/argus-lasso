@@ -16,3 +16,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # ci.yml pins this action's ref to the minimum supported Rust
+      # (rust-version in Cargo.toml); it is a toolchain, not an action
+      # version, and only moves when the MSRV does.
+      - dependency-name: dtolnay/rust-toolchain

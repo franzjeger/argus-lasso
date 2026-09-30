@@ -11,7 +11,7 @@ cargo test --workspace --locked
 cargo build --release --workspace --locked
 ```
 
-The CI workflow is configured to check Rust 1.92 and build/test on x86_64 and
+The CI workflow is configured to check Rust 1.95 and build/test on x86_64 and
 aarch64. An architecture build is not proof of game/driver compatibility. Shader compilation requires
 `glslangValidator` (Debian/Ubuntu package `glslang-tools`).
 
