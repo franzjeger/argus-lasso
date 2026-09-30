@@ -311,6 +311,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   installer removes the record, and a record for another path or a damaged one no
   longer stops every start (a restart loop under systemd). The installer also
   keeps only the current and previous layer builds instead of every one.
+- A configuration that is a symlink to a missing file, or that cannot be checked,
+  is reported and set aside rather than taken as absent and replaced with
+  defaults. The old `process-lasso-rs` configuration is migrated once, atomically,
+  and never again over a newer one; `--ui-tour` no longer migrates it.
 
 ### Changed
 
