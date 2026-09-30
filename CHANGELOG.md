@@ -161,6 +161,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Window opacity without the compositor's alpha modifier (X11, or compositors
   without `wp_alpha_modifier_v1`) is applied at startup and kept through theme
   changes and Apply, instead of only while the slider moves.
+- Showing or hiding the HUD with `argus-lasso toggle-overlay` or the shortcut is
+  reflected in Gaming → Overlay, and changing another overlay setting afterwards
+  no longer turns the HUD back to what the Gaming page last knew.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

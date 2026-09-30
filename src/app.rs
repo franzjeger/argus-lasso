@@ -491,6 +491,8 @@ impl eframe::App for ArgusLassoApp {
         // show its state rather than keeping their own.
         self.gaming_mode_tab
             .sync_gaming_state(gaming_active, gaming_changes);
+        self.gaming_mode_tab
+            .follow_overlay_shown(config.gaming_mode.overlay.show_overlay);
 
         // Only push CPU bars + history when the daemon has emitted a new sample.
         // The hwmon temp scan (a full /sys/class/hwmon walk) also lives here —
@@ -641,8 +643,14 @@ impl ArgusLassoApp {
                     }
                 }
                 GamingEvent::ConfigChanged(cfg) => {
+                    let tab = &self.gaming_mode_tab;
                     self.update_config(|c| {
+                        let shown = tab.overlay_shown(
+                            cfg.gaming_mode.overlay.show_overlay,
+                            c.gaming_mode.overlay.show_overlay,
+                        );
                         c.gaming_mode = cfg.gaming_mode;
+                        c.gaming_mode.overlay.show_overlay = shown;
                         c.ui.global_overlay = cfg.ui.global_overlay;
                     });
                     self.save_config();
@@ -650,8 +658,13 @@ impl ArgusLassoApp {
             }
         }
         if self.gaming_mode_tab.overlay_window(ctx, self.opacity) {
-            let overlay = self.gaming_mode_tab.config.gaming_mode.overlay.clone();
-            self.update_config(|c| c.gaming_mode.overlay = overlay);
+            let tab = &self.gaming_mode_tab;
+            let mut overlay = tab.config.gaming_mode.overlay.clone();
+            self.update_config(|c| {
+                overlay.show_overlay =
+                    tab.overlay_shown(overlay.show_overlay, c.gaming_mode.overlay.show_overlay);
+                c.gaming_mode.overlay = overlay;
+            });
             self.save_config();
         }
     }

@@ -74,6 +74,9 @@ pub struct GamingModeTab {
     pub section: GamingSection,
     overlay_install_status: String,
     pub config: Config,
+    /// The shared overlay visibility as this tab last took it (see
+    /// `follow_overlay_shown`).
+    overlay_shown_seen: bool,
     pub topo: Option<CpuTopology>,
     pub topo_description: String,
     /// Mirrors the daemon, which owns Gaming Mode (see `sync_gaming_state`).
@@ -166,6 +169,7 @@ impl GamingModeTab {
         let helper_ok = is_helper_current() && is_helper_authorized();
 
         let mut tab = Self {
+            overlay_shown_seen: config.gaming_mode.overlay.show_overlay,
             config,
             topo: Some(topo),
             topo_description,
@@ -429,6 +433,25 @@ impl GamingModeTab {
                     self.watch_status = String::new();
                 }
             }
+        }
+    }
+
+    /// Overlay visibility also changes outside this tab, from the CLI and
+    /// the shortcut. Take the shared value every frame, so the checkbox
+    /// shows it and later edits do not carry a stale one.
+    pub fn follow_overlay_shown(&mut self, shared: bool) {
+        self.config.gaming_mode.overlay.show_overlay = shared;
+        self.overlay_shown_seen = shared;
+    }
+
+    /// The overlay visibility to store with a config this tab sent: its own
+    /// if it changed the value since it last took the shared one, otherwise
+    /// the shared value, which may have changed in between.
+    pub fn overlay_shown(&self, sent: bool, shared: bool) -> bool {
+        if sent != self.overlay_shown_seen {
+            sent
+        } else {
+            shared
         }
     }
 
@@ -1321,5 +1344,29 @@ mod launcher_tests {
         );
         assert!(parse_launch_command("game 'unterminated").is_err());
         assert!(parse_launch_command("  ").is_err());
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::GamingModeTab;
+
+    /// `argus-lasso toggle-overlay` hid the HUD, then the next change to any
+    /// overlay setting sent this tab's stale copy and showed it again.
+    #[test]
+    fn a_toggle_made_elsewhere_survives_the_next_overlay_edit() {
+        let mut config = crate::config::Config::default();
+        config.gaming_mode.overlay.show_overlay = true;
+        let mut tab = GamingModeTab::new(config);
+
+        // The CLI hides it; the next frame takes that over.
+        tab.follow_overlay_shown(false);
+        assert!(!tab.config.gaming_mode.overlay.show_overlay);
+
+        // An edit of another setting sends `false` back unchanged, while
+        // the shortcut has meanwhile shown it again: the shared value wins.
+        assert!(tab.overlay_shown(false, true));
+        // The user switching it on in this tab wins over the shared value.
+        assert!(tab.overlay_shown(true, false));
     }
 }
