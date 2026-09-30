@@ -567,8 +567,8 @@ impl RuleState {
                 target.name, target.pid
             ));
         } else if let Some(original) = self.inherited(target, affinity) {
-            // Started by a process Argus pinned, it has the mask already;
-            // without a record, clearing the default would leave it pinned.
+            // It has the mask already; without a record, clearing the
+            // default would leave it pinned.
             let slot = &mut self.changes(target).affinity;
             Undo::record(
                 slot,
@@ -580,15 +580,23 @@ impl RuleState {
         }
     }
 
-    /// The parent's original affinity, when a process without a record of
-    /// its own has `affinity` because its parent was given it.
+    /// What a process that already has `affinity`, with no record of its
+    /// own, had before. Its parent's original when the parent was given this
+    /// mask; otherwise every CPU, since its pinning parent has exited (or it
+    /// was reparented), or an earlier run of Argus pinned it, and nothing
+    /// else would release it.
     fn inherited(&self, target: Target, affinity: &str) -> Option<String> {
-        if self.recorded(target).is_some_and(|c| c.affinity.is_some()) {
+        if self.recorded(target).is_some_and(|c| c.affinity.is_some())
+            || !utils::affinity_matches(target.pid, affinity)
+        {
             return None;
         }
-        let parent = self.changes.get(&target.ppid)?.affinity.as_ref()?;
-        (parent.applied == affinity && utils::affinity_matches(target.pid, affinity))
-            .then(|| parent.original.clone())
+        let parent = self
+            .changes
+            .get(&target.ppid)
+            .and_then(|c| c.affinity.as_ref())
+            .filter(|parent| parent.applied == affinity);
+        Some(parent.map_or_else(utils::every_cpu, |parent| parent.original.clone()))
     }
 
     /// Drop a process's record once nothing is left to undo.
@@ -1488,5 +1496,27 @@ mod tests {
 
         child.enforce(&only(&[]), &mut state);
         assert_eq!(utils::get_affinity_str(child.0.id()), affinity);
+    }
+
+    /// A process that has the default mask with no record behind it — its
+    /// pinning parent exited, or an earlier run pinned it — stayed pinned
+    /// after the default was cleared.
+    #[test]
+    fn a_default_affinity_nobody_recorded_is_released_to_every_cpu() {
+        let orphan = Sleeper::spawn();
+        let affinity = utils::get_affinity_str(orphan.0.id());
+        let cpus = utils::cpulist_to_set(&affinity).unwrap();
+        let Some(cpu) = cpus.iter().min().filter(|_| cpus.len() > 1) else {
+            eprintln!("needs two CPUs to change affinity");
+            return;
+        };
+        let cpu = cpu.to_string();
+        utils::set_affinity(orphan.0.id(), &cpu).unwrap();
+        let mut state = RuleState::default();
+        state.apply_default_affinity(orphan.target(), &cpu, &|_| {});
+
+        orphan.enforce(&only(&[]), &mut state);
+        let released = utils::cpulist_to_set(&utils::get_affinity_str(orphan.0.id())).unwrap();
+        assert_eq!(released, utils::get_online_cpus());
     }
 }

@@ -212,9 +212,14 @@ pub fn affinity_matches(pid: u32, cpulist: &str) -> bool {
 pub fn get_affinity_to_restore(pid: u32) -> String {
     let current = get_affinity_str(pid);
     if cpulist_to_set(&current).is_ok_and(|cpus| cpus == get_online_cpus()) {
-        return cpuset_to_cpulist(&(0..get_cpu_count()).collect());
+        return every_cpu();
     }
     current
+}
+
+/// Every CPU present, parked or not, as a CPU list.
+pub fn every_cpu() -> String {
+    cpuset_to_cpulist(&(0..get_cpu_count()).collect())
 }
 
 /// Apply affinity to every thread whose CPU mask differs from `cpulist`.
