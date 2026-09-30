@@ -60,7 +60,10 @@ Throttled units and their original values are also recorded, before the change
 is made, in `$XDG_RUNTIME_DIR/argus-lasso/cgroup-throttles.json`. A throttle
 outlives Argus being killed or crashing (systemd keeps runtime properties until
 logout); the next run takes the recorded units over and restores them on its
-first tick, instead of reading the throttled values as the units' own.
+first tick, instead of reading the throttled values as the units' own. Nice
+throttles are recorded there too, with each thread's value from before, as soon
+as they are made; the next run puts one back only on the same process (same
+start time) while it still has the throttled value.
 
 Failed throttle targets are remembered to avoid repeating failed commands every
 tick. Configuration updates clear failure sets. Failed-PID log suppression is

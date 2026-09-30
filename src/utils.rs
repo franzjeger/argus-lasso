@@ -349,7 +349,7 @@ fn set_thread_nice(tid: u32, nice: i32) -> std::io::Result<()> {
 /// Every thread's nice value, to put back as it was. A process's threads
 /// can differ (browsers lower their background threads), and restoring them
 /// all to the main thread's value raised those.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadNices {
     main: i32,
     threads: HashMap<u32, i32>,

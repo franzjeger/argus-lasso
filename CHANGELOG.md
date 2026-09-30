@@ -44,6 +44,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- ProBalance's nice throttles are recorded like its unit throttles, so the next
+  run puts them back after a crash or kill instead of leaving them for good.
 - A rule's I/O priority is put back per thread, as its nice value already was,
   instead of giving every thread the main thread's old value.
 - Clearing the default affinity also releases processes that had it with no
