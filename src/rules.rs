@@ -1423,9 +1423,18 @@ mod tests {
             nices.sort();
             nices
         };
+        // The child starts at this test binary's nice, which other tests
+        // raise; its worker lowers itself to 10.
+        let base = utils::get_nice(pid).unwrap_or(0);
+        if base >= 10 {
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("needs the test process below nice 10");
+            return;
+        }
         // Until python has started the thread and lowered it.
         for _ in 0..100 {
-            if thread_nices() == [0, 10] {
+            if thread_nices() == [base, 10] {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1445,9 +1454,9 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
-        assert_eq!(before, [0, 10], "the setup");
+        assert_eq!(before, [base, 10], "the setup");
         assert_eq!(during, [12, 12]);
-        // Needs lowering 12 back to 0 and 10, allowed where RLIMIT_NICE is.
+        // Needs lowering 12 back to base and 10, allowed where RLIMIT_NICE is.
         if after != [12, 12] {
             assert_eq!(after, before);
         }
