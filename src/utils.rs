@@ -399,33 +399,69 @@ pub fn set_nice(pid: u32, nice: i32) -> std::io::Result<()> {
 /// Set the I/O priority of every thread of `pid` via the `ioprio_set` syscall.
 /// class: 1=realtime, 2=best-effort, 3=idle. level: 0-7 (RT and BE only).
 pub fn set_ionice(pid: u32, class: i32, level: Option<i32>) -> std::io::Result<()> {
-    use nix::libc;
-    let class_val = (class as u32) & 0x7;
-    let data_val = (level.unwrap_or(0) as u32) & 0x1fff;
-    let prio = (class_val << 13) | data_val;
-
+    let level = level.unwrap_or(0);
     let result = set_every_thread(pid, "ioprio_set", |tid| {
-        // SAFETY: only plain integers cross the FFI boundary; no pointers or
-        // lifetimes are involved.
-        let res = unsafe {
-            libc::syscall(
-                libc::SYS_ioprio_set,
-                1, // IOPRIO_WHO_PROCESS — which, despite the name, is one thread
-                tid as libc::c_int,
-                prio as libc::c_int,
-            )
-        };
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+        set_thread_ioprio(tid, (class, level))
     });
     match &result {
         Ok(()) => log::debug!("ioprio_set pid={pid} class={class} level={level:?}: OK"),
         Err(err) => log::warn!("ioprio_set pid={pid} class={class} failed: {err}"),
     }
     result
+}
+
+fn set_thread_ioprio(tid: u32, (class, level): (i32, i32)) -> std::io::Result<()> {
+    use nix::libc;
+    let prio = ((class as u32 & 0x7) << 13) | (level as u32 & 0x1fff);
+    // SAFETY: only plain integers cross the FFI boundary; no pointers or
+    // lifetimes are involved.
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            1, // IOPRIO_WHO_PROCESS — which, despite the name, is one thread
+            tid as libc::c_int,
+            prio as libc::c_int,
+        )
+    };
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Every thread's I/O priority (class, level), to put back as it was: like
+/// nice, a process's threads can differ, and restoring them all to the main
+/// thread's value changed the others.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadIoprios {
+    main: (i32, i32),
+    threads: HashMap<u32, (i32, i32)>,
+}
+
+impl ThreadIoprios {
+    pub fn read(pid: u32) -> Option<Self> {
+        let main = get_ionice_raw(pid)?;
+        let mut threads = HashMap::new();
+        for_each_thread(pid, |tid| {
+            if let Some(prio) = get_ionice_raw(tid) {
+                threads.insert(tid, prio);
+            }
+        });
+        Some(Self { main, threads })
+    }
+
+    pub fn main(&self) -> (i32, i32) {
+        self.main
+    }
+
+    /// Put each thread back to its value; a thread started since gets the
+    /// main thread's.
+    pub fn restore(&self, pid: u32) -> std::io::Result<()> {
+        set_every_thread(pid, "ioprio_set", |tid| {
+            set_thread_ioprio(tid, *self.threads.get(&tid).unwrap_or(&self.main))
+        })
+    }
 }
 
 // ── Dirty-check reads (avoid redundant syscalls) ─────────────────────────────
@@ -933,6 +969,37 @@ mod tests {
         set_ionice(pid, 2, Some(7)).unwrap();
         assert_eq!(get_ionice_raw(worker.tid), Some((2, 7)));
         let _ = set_ionice(pid, before.0, Some(before.1));
+    }
+
+    /// Restoring a rule's I/O priority used to give every thread the main
+    /// thread's old value. Tested on a child with a thread of its own, so
+    /// the test process's threads, which other tests change, are left alone.
+    #[test]
+    fn io_priorities_are_put_back_per_thread() {
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", "import threading, time\nthreading.Thread(target=time.sleep, args=(30,)).start()\ntime.sleep(30)"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let worker = (0..400).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            get_tids(pid).into_iter().find(|&tid| tid != pid)
+        });
+        let result = std::panic::catch_unwind(|| {
+            let worker = worker.expect("the child's thread started");
+            // Best-effort and idle need no privilege.
+            set_thread_ioprio(pid, (2, 1)).unwrap();
+            set_thread_ioprio(worker, (2, 6)).unwrap();
+            let before = ThreadIoprios::read(pid).unwrap();
+            set_ionice(pid, 3, None).unwrap();
+            assert_eq!(get_ionice_raw(worker), Some((3, 0)));
+            before.restore(pid).unwrap();
+            assert_eq!(get_ionice_raw(pid), Some((2, 1)));
+            assert_eq!(get_ionice_raw(worker), Some((2, 6)));
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        result.unwrap();
     }
 
     #[test]

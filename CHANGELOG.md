@@ -44,6 +44,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- A rule's I/O priority is put back per thread, as its nice value already was,
+  instead of giving every thread the main thread's old value.
 - The launcher no longer takes an exited, unreaped process of the game's name for
   the running game, and when several processes carry the name it watches the one
   started first instead of whichever `/proc` listed first.

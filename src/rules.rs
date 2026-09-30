@@ -403,7 +403,8 @@ struct Changes {
     affinity: Option<Undo<String>>,
     /// Each thread's value from before, since they can differ.
     nice: Option<Undo<i32, utils::ThreadNices>>,
-    ionice: Option<Undo<(i32, i32)>>,
+    /// Each thread's value from before, as for nice.
+    ionice: Option<Undo<(i32, i32), utils::ThreadIoprios>>,
 }
 
 impl Changes {
@@ -705,13 +706,14 @@ pub fn apply_rules(
         };
         if !current.is_some_and(|c| ionice_reached(c, wanted)) {
             let (class, level) = wanted;
+            let before = utils::ThreadIoprios::read(pid);
             match utils::set_ionice(pid, class, Some(level)) {
                 Ok(()) => {
                     let by = format!("[Rule:{}]", rule.name);
                     report(format!(
                         "{by} Set ionice class={class} level={level} on {name}({pid})"
                     ));
-                    if let Some(original) = current {
+                    if let Some(original) = before {
                         let slot = &mut state.changes(target).ionice;
                         Undo::record(slot, original, wanted, by, Owner::Rules);
                     }
@@ -727,8 +729,8 @@ pub fn apply_rules(
         }
     } else if let Some(undo) = state.take(target, |c| &mut c.ionice, Owner::Rules) {
         if current_ionice().is_some_and(|c| ionice_reached(c, undo.applied)) {
-            let ((class, level), by) = (undo.original, &undo.by);
-            report(match utils::set_ionice(pid, class, Some(level)) {
+            let ((class, level), by) = (undo.original.main(), &undo.by);
+            report(match undo.original.restore(pid) {
                 Ok(()) => format!("{by} Restored ionice class={class} level={level} on {name}({pid})"),
                 Err(e) => format!(
                     "{by} Restoring ionice class={class} level={level} FAILED for {name}({pid}): {e}"
