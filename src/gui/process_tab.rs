@@ -126,6 +126,41 @@ pub enum ExportFormat {
     Json,
 }
 
+// ── Pending pause/resume ──────────────────────────────────────────────────────
+
+/// Pause and resume requests not yet visible in a snapshot, so the table
+/// shows the change at once instead of on the next refresh. Keyed by PID and
+/// start time; an entry goes once the snapshot agrees or the process is gone.
+#[derive(Default)]
+pub struct PendingStops(HashMap<u32, (u64, bool)>);
+
+impl PendingStops {
+    pub fn record(&mut self, pid: u32, start_ticks: u64, stopped: bool) {
+        self.0.insert(pid, (start_ticks, stopped));
+    }
+
+    /// The PIDs to show as suspended: stopped per the kernel, as of the
+    /// snapshot, with requests it does not reflect yet applied on top.
+    pub fn stopped_pids(&mut self, snapshot: &[ProcInfo]) -> HashSet<u32> {
+        let mut still_pending = HashMap::new();
+        let mut stopped = HashSet::new();
+        for p in snapshot {
+            let mut is_stopped = p.stopped;
+            if let Some(&(start_ticks, wanted)) = self.0.get(&p.pid) {
+                if start_ticks == p.start_ticks && wanted != p.stopped {
+                    is_stopped = wanted;
+                    still_pending.insert(p.pid, (start_ticks, wanted));
+                }
+            }
+            if is_stopped {
+                stopped.insert(p.pid);
+            }
+        }
+        self.0 = still_pending;
+        stopped
+    }
+}
+
 // ── Pending kill (undo support) ───────────────────────────────────────────────
 
 pub struct PendingKill {
@@ -1366,6 +1401,33 @@ mod tests {
             cpu_percent: cpu,
             ..Default::default()
         }
+    }
+
+    /// A pause shows at once, then defers to the kernel's state; an entry
+    /// never carries over to a process that reused the PID.
+    #[test]
+    fn pending_stops_bridge_the_gap_until_the_snapshot_agrees() {
+        let running = |pid, start_ticks| ProcInfo {
+            pid,
+            start_ticks,
+            ..Default::default()
+        };
+        let mut pending = PendingStops::default();
+        pending.record(7, 100, true);
+        // Snapshot taken before the SIGSTOP landed: show it paused anyway.
+        assert!(pending.stopped_pids(&[running(7, 100)]).contains(&7));
+        // The snapshot now agrees, so the entry is dropped...
+        let stopped = ProcInfo {
+            stopped: true,
+            ..running(7, 100)
+        };
+        assert!(pending.stopped_pids(&[stopped]).contains(&7));
+        // ...and a resume made elsewhere shows.
+        assert!(pending.stopped_pids(&[running(7, 100)]).is_empty());
+
+        pending.record(8, 100, true);
+        // PID 8 now belongs to a different process.
+        assert!(pending.stopped_pids(&[running(8, 999)]).is_empty());
     }
 
     #[test]

@@ -4,6 +4,8 @@ use std::io::{Read, Write};
 #[derive(Debug, Default)]
 pub struct FastStat {
     pub comm: String,
+    /// Field 3, the state letter: b'R' running, b'S' sleeping, b'T' stopped…
+    pub state: u8,
     pub ppid: u32,
     pub utime: u64,
     pub stime: u64,
@@ -59,7 +61,7 @@ pub fn read_stat(pid: u32, buf: &mut [u8; 1024]) -> Option<FastStat> {
     let mut parts = rest.split(|&b| b == b' ');
 
     // Field 3: state -> parts[0]
-    let _state = parts.next()?;
+    let state = *parts.next()?.first()?;
     // Field 4: ppid -> parts[1]
     let ppid_str = std::str::from_utf8(parts.next()?).ok()?;
     let ppid: u32 = ppid_str.parse().ok()?;
@@ -98,6 +100,7 @@ pub fn read_stat(pid: u32, buf: &mut [u8; 1024]) -> Option<FastStat> {
 
     Some(FastStat {
         comm,
+        state,
         ppid,
         utime,
         stime,
@@ -146,6 +149,33 @@ fn parse_cmdline(buf: &[u8]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The state letter lets the table show a stopped process as paused,
+    /// whoever stopped it.
+    #[test]
+    fn state_reports_a_stopped_process() {
+        use super::read_stat;
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        kill(Pid::from_raw(pid as i32), Signal::SIGSTOP).unwrap();
+        let mut state = 0;
+        for _ in 0..100 {
+            state = read_stat(pid, &mut [0; 1024]).unwrap().state;
+            if state == b'T' {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(state, b'T');
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
     use super::proc_stat_path;
 
     #[test]

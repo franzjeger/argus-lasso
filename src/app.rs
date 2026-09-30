@@ -165,6 +165,8 @@ pub struct ArgusLassoApp {
     cpu_temp: Option<f32>,
     // Pending kill awaiting undo
     pending_kill: Option<crate::gui::process_tab::PendingKill>,
+    /// Pause/resume requests the next snapshot has not caught up with.
+    pending_stops: crate::gui::process_tab::PendingStops,
     // Pending "create a rule from this manual change?" offer
     detail_window: crate::gui::detail_window::DetailWindow,
     // How many notable events the user has seen (bell badge = len - seen)
@@ -279,6 +281,7 @@ impl ArgusLassoApp {
             last_saved_theme,
             cpu_temp,
             pending_kill: None,
+            pending_stops: Default::default(),
             detail_window: Default::default(),
             tour: tour_dir.map(|d| match crate::ui_tour::Tour::new(d) {
                 Ok(t) => t,
@@ -458,10 +461,11 @@ impl eframe::App for ArgusLassoApp {
         }
         self.log_repaint_rate();
 
-        let Some(frame) = self.read_frame() else {
+        let Some(mut frame) = self.read_frame() else {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
             return;
         };
+        frame.suspended_pids = self.pending_stops.stopped_pids(&frame.snapshot);
         let FrameData {
             ref snapshot,
             ref cpu_pcts,
@@ -681,7 +685,7 @@ impl ArgusLassoApp {
             cpu_pcts: s.cpu_percents.clone(),
             cpu_gen: s.cpu_generation,
             throttled_pids: s.throttled_pids.clone(),
-            suspended_pids: s.suspended_pids.clone(),
+            suspended_pids: Default::default(),
             throttle_infos: if on_pb_tab {
                 s.throttle_infos.clone()
             } else {
@@ -1264,6 +1268,7 @@ impl ArgusLassoApp {
             snapshot,
             &self.state,
             &mut self.pending_kill,
+            &mut self.pending_stops,
             &mut self.dialog_manager,
             &mut self.detail_window,
             &notify_error,

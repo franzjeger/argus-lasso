@@ -110,6 +110,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - A rule's nice value is no longer skipped for good on a process that reused the
   PID of an earlier one whose change failed, and a new process's rule is applied
   and logged once instead of twice.
+- The process table's "Suspended" badge and Pause/Resume menu follow the kernel's
+  process state. A process paused or resumed elsewhere shows correctly, and a new
+  process that reuses a paused one's PID is no longer shown as suspended.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

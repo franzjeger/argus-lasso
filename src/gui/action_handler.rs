@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use crate::gui::detail_window::DetailWindow;
 use crate::gui::dialog_manager::{DialogManager, DialogTarget};
 use crate::gui::dialogs::{AffinityDialog, IoNiceDialog, NiceDialog};
-use crate::gui::process_tab::PendingKill;
 use crate::gui::process_tab::TableAction;
+use crate::gui::process_tab::{PendingKill, PendingStops};
 use crate::monitor::{AppState, ProcInfo};
 
 pub struct ActionHandler;
@@ -17,6 +17,7 @@ impl ActionHandler {
         snapshot: &[ProcInfo],
         state: &Arc<Mutex<AppState>>,
         pending_kill: &mut Option<PendingKill>,
+        pending_stops: &mut PendingStops,
         dialog_manager: &mut DialogManager,
         detail_window: &mut DetailWindow,
         notify_error: &impl Fn(&str),
@@ -76,22 +77,20 @@ impl ActionHandler {
                     .iter()
                     .find(|p| p.pid == pid)
                     .ok_or(nix::Error::ESRCH)
-                    .and_then(|p| crate::process_control::ProcessHandle::open(pid, p.start_ticks))
-                    .and_then(|t| {
-                        t.signal(if suspend {
+                    .and_then(|p| {
+                        let target =
+                            crate::process_control::ProcessHandle::open(pid, p.start_ticks)?;
+                        target.signal(if suspend {
                             nix::sys::signal::Signal::SIGSTOP
                         } else {
                             nix::sys::signal::Signal::SIGCONT
-                        })
+                        })?;
+                        Ok(p.start_ticks)
                     });
                 match result {
-                    Ok(()) => {
+                    Ok(start_ticks) => {
+                        pending_stops.record(pid, start_ticks, suspend);
                         if let Ok(mut s) = state.lock() {
-                            if suspend {
-                                s.suspended_pids.insert(pid);
-                            } else {
-                                s.suspended_pids.remove(&pid);
-                            }
                             s.append_log(format!(
                                 "{} {name} ({pid})",
                                 if suspend { "Suspended" } else { "Resumed" }

@@ -90,6 +90,9 @@ pub struct ProcInfo {
     /// start time. Callers that track a pid across scans (e.g. Gaming Mode's
     /// nice-restore list) should key on (pid, start_ticks), not pid alone.
     pub start_ticks: u64,
+    /// Stopped by a signal (state T), as "Pause process" does. From the
+    /// kernel, so a pause or resume made elsewhere shows too.
+    pub stopped: bool,
 }
 
 impl Default for ProcInfo {
@@ -108,6 +111,7 @@ impl Default for ProcInfo {
             disk_write_bps: 0,
             cmdline: std::sync::Arc::new(String::new()),
             start_ticks: 0,
+            stopped: false,
         }
     }
 }
@@ -155,8 +159,6 @@ pub struct AppState {
     pub proc_cpu_history: HashMap<u32, std::collections::VecDeque<f32>>,
     /// CPU model string from /proc/cpuinfo
     pub cpu_model: String,
-    /// PIDs manually suspended via SIGSTOP from the GUI
-    pub suspended_pids: std::collections::HashSet<u32>,
     /// Set by the daemon once a Shutdown command has finished restoring state
     pub shutdown_complete: bool,
     /// Notable events (throttles, alerts, gaming mode, kills) for the
@@ -1537,6 +1539,7 @@ fn collect_snapshot(
             disk_write_bps,
             cmdline,
             start_ticks: stat.starttime,
+            stopped: stat.state == b'T',
         });
     }
 
