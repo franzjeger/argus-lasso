@@ -788,6 +788,16 @@ mod tests {
         sha256_hex, strip_deleted_suffix, verify_signature, Update, UpdateState,
     };
 
+    /// The compiled-in key is what every installed copy checks updates
+    /// against; a malformed or placeholder dist/argus-lasso.pub would make
+    /// every update fail in the field.
+    #[test]
+    fn the_built_in_signing_key_is_usable() {
+        assert!(!super::PUBLIC_KEY.contains(super::PUBLIC_KEY_PLACEHOLDER));
+        minisign_verify::PublicKey::decode(super::PUBLIC_KEY.trim())
+            .expect("dist/argus-lasso.pub is a minisign public key");
+    }
+
     /// "Check now" after an install used to clear `installed`, compare the
     /// release with the still-running old version, offer it again, and let
     /// a second install back up the new binary as the "previous" one.

@@ -81,6 +81,14 @@ must not also be repository secrets: any workflow in the repository, including
 one pushed to a new branch, can read those, and pushing a tag alone would then
 be enough to get a release signed. This protects against leaked tokens and
 collaborator access; it does not protect against someone who has taken over the
-maintainer's own account, which only offline signing would. Release notes come from
+maintainer's own account, which only offline signing would.
+
+The key was replaced on 2026-09-30 (key ID `D53DAD0590FF1744`, previously
+`4CF0D660D5D39564`), when the signing values moved to the environment: the old
+secret key existed only as a repository secret, which GitHub never hands back,
+and every workflow in the repository had been able to read it. Installed builds
+check updates against the key compiled into them, so 1.3.1 and older refuse
+releases signed with the new key and have to be updated by hand once. The
+maintainer keeps the secret key and its password offline. Release notes come from
 the matching version section in `CHANGELOG.md`. Pushing source does not publish a
 release, and implementing this updater does not retrofit older published archives.

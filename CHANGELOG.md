@@ -350,6 +350,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Changed
 
+- **Releases are signed with a new key** (ID `D53DAD0590FF1744`), held only in the
+  approval-gated `release` environment. The in-app updater of 1.3.1 and older
+  checks against the old key and refuses these releases: install the next release
+  by hand once, and later updates work in the app again.
 - Settings take effect as they change, like theme and opacity already did, instead
   of waiting for **Apply changes** on the same page. Number fields are stored when
   the drag is released or the value entered, a typed CPU list on Enter once it is
