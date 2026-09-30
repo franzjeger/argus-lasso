@@ -22,7 +22,21 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX
+# It reads sysfs and writes one file: no sockets, network, /proc or
+# privileged system calls. As uid 0 it could otherwise reach the system
+# bus or systemd's private socket if it were ever compromised.
+RestrictAddressFamilies=none
+PrivateNetwork=yes
+IPAddressDeny=any
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes

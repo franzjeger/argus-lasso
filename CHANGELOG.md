@@ -315,6 +315,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   is reported and set aside rather than taken as absent and replaced with
   defaults. The old `process-lasso-rs` configuration is migrated once, atomically,
   and never again over a newer one; `--ui-tour` no longer migrates it.
+- The optional sensor service runs in a tighter sandbox: no sockets or network,
+  no privileged or resource system calls, and no view of other processes. It needs
+  none of them, and as root they could reach the system bus if it were ever
+  compromised. `systemd-analyze security` rates it 0.7 instead of 3.5.
 
 ### Changed
 
