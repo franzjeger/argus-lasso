@@ -446,8 +446,8 @@ impl eframe::App for ArgusLassoApp {
         let ctx = &root_ui.ctx().clone();
         // Without the compositor's alpha modifier, opacity is the alpha of
         // the root UI's fills, which is rebuilt from the theme every frame,
-        // so it is set every frame too: at startup, and after a theme change
-        // or Apply, as well as while the slider moves.
+        // so it is set every frame too: at startup and after a theme change
+        // as well as while the slider moves.
         if self.wayland_opacity.is_none() {
             crate::gui::theme::apply_viewport_opacity(root_ui, self.opacity);
         }

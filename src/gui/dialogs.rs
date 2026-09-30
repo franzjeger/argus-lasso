@@ -1,5 +1,6 @@
-//! Modal dialogs: affinity picker, nice dialog, ionice dialog, rule edit,
+//! Dialog windows: affinity picker, nice dialog, ionice dialog, rule edit,
 //! process picker, Steam game picker, Lutris game picker, rule presets.
+//! None is modal; each is a window of its own next to the main one.
 
 use egui::{Context, Ui, ViewportBuilder, ViewportId};
 use std::collections::HashSet;
