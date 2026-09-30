@@ -84,9 +84,16 @@ impl ProBalanceConfig {
         };
         self.system_cpu_threshold_percent =
             bounded(self.system_cpu_threshold_percent, 85.0, 1.0, 100.0);
-        self.system_restore_threshold_percent =
-            bounded(self.system_restore_threshold_percent, 75.0, 0.0, 99.0)
-                .min(self.system_cpu_threshold_percent - 1.0);
+        // Restore stays below activation, or one reading would both activate
+        // and recover. A value already below it is kept as entered: forcing a
+        // whole point of gap turned 84.5 under 85 into 84 on Apply, although
+        // the form had accepted it.
+        let restore = bounded(self.system_restore_threshold_percent, 75.0, 0.0, 99.0);
+        self.system_restore_threshold_percent = if restore < self.system_cpu_threshold_percent {
+            restore
+        } else {
+            (self.system_cpu_threshold_percent - 1.0).max(0.0)
+        };
         self.process_min_cpu_percent = bounded(self.process_min_cpu_percent, 1.0, 0.1, 100.0);
         self.consecutive_seconds = bounded(self.consecutive_seconds, 3.0, 1.0, 60.0);
         self.restore_hysteresis_seconds = bounded(self.restore_hysteresis_seconds, 5.0, 1.0, 120.0);
@@ -715,6 +722,23 @@ mod cpu_policy_config_tests {
         cfg.normalize();
         assert_eq!(cfg.system_restore_threshold_percent, 19.0);
         assert_eq!(cfg.process_min_cpu_percent, 1.0);
+    }
+
+    #[test]
+    fn a_restore_threshold_below_activation_is_kept_as_entered() {
+        let mut cfg = ProBalanceConfig {
+            system_cpu_threshold_percent: 85.0,
+            system_restore_threshold_percent: 84.5,
+            ..Default::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.system_restore_threshold_percent, 84.5);
+
+        // The lowest activation leaves room only for 0.
+        cfg.system_cpu_threshold_percent = 1.0;
+        cfg.system_restore_threshold_percent = 1.0;
+        cfg.normalize();
+        assert_eq!(cfg.system_restore_threshold_percent, 0.0);
     }
 
     fn scratch() -> PathBuf {

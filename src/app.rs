@@ -190,7 +190,9 @@ impl ArgusLassoApp {
         crate::gui::theme::apply_theme(&cc.egui_ctx, &startup_theme);
         // Child dialogs are native windows so they can be moved to another
         // monitor. Ordinary tooltips/popups retain egui's normal popup behavior.
-        cc.egui_ctx.set_embed_viewports(false);
+        // The tour embeds them instead: its capture is the root framebuffer,
+        // and a native child window never appears in it.
+        cc.egui_ctx.set_embed_viewports(tour_dir.is_some());
 
         let mut updates = crate::updater::UpdateState::default();
         if config.ui.check_updates_on_start && tour_dir.is_none() {

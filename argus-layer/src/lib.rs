@@ -1133,6 +1133,28 @@ unsafe fn present_impl(queue: vk::Queue, p_present_info: *const vk::PresentInfoK
     }
 }
 
+/// Why a present on `queue` gets the game's frame unchanged, or None when the
+/// HUD can be drawn on it. The HUD's commands are recorded for one graphics
+/// queue family and submitted on one queue; a present elsewhere passed the HUD
+/// by without a word, which looked like a HUD that never started.
+fn present_skip_reason(
+    queue_family: Option<u32>,
+    hud_family: u32,
+    graphics: bool,
+    draw_queue: Option<vk::Queue>,
+    queue: vk::Queue,
+) -> Option<&'static str> {
+    if queue_family != Some(hud_family) {
+        Some("the game presents from another queue family than the HUD's graphics queue")
+    } else if !graphics {
+        Some("the game presents from a queue without graphics")
+    } else if draw_queue.is_some_and(|previous| previous != queue) {
+        Some("the game presents from more than one queue")
+    } else {
+        None
+    }
+}
+
 /// Record and submit the HUD for this present. Returns the semaphore the
 /// present must wait on, or None to present the game's frame unchanged.
 unsafe fn submit_overlay(queue: vk::Queue, pi: &vk::PresentInfoKHR) -> Option<vk::Semaphore> {
@@ -1153,18 +1175,22 @@ unsafe fn submit_overlay(queue: vk::Queue, pi: &vk::PresentInfoKHR) -> Option<vk
     let mut states = OVERLAY_STATES.lock_or_recover();
     let state = states.get_mut(&*pi.p_swapchains)?;
     state.stats.record(Instant::now());
-    if QUEUE_FAMILIES.read_or_recover().get(&queue).copied() != Some(state.queue_family) {
-        return None;
-    }
-    if !GRAPHICS_QUEUES
-        .read_or_recover()
-        .get(&queue)
-        .copied()
-        .unwrap_or(false)
-    {
-        return None;
-    }
-    if state.draw_queue.is_some_and(|previous| previous != queue) {
+    let skip = present_skip_reason(
+        QUEUE_FAMILIES.read_or_recover().get(&queue).copied(),
+        state.queue_family,
+        GRAPHICS_QUEUES
+            .read_or_recover()
+            .get(&queue)
+            .copied()
+            .unwrap_or(false),
+        state.draw_queue,
+        queue,
+    );
+    if let Some(reason) = skip {
+        if !state.present_skip_logged {
+            state.present_skip_logged = true;
+            eprintln!("[Argus-Layer] HUD skipped on this swapchain: {reason}");
+        }
         return None;
     }
     state.draw_queue = Some(queue);
@@ -1407,6 +1433,21 @@ pub unsafe extern "system" fn vkNegotiateLoaderLayerInterfaceVersion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_present_the_hud_cannot_use_says_why() {
+        use ash::vk::Handle;
+        let (a, b) = (vk::Queue::from_raw(1), vk::Queue::from_raw(2));
+        assert_eq!(present_skip_reason(Some(0), 0, true, None, a), None);
+        assert_eq!(present_skip_reason(Some(0), 0, true, Some(a), a), None);
+        assert!(present_skip_reason(Some(1), 0, true, None, a)
+            .is_some_and(|why| why.contains("queue family")));
+        assert!(present_skip_reason(None, 0, true, None, a).is_some());
+        assert!(present_skip_reason(Some(0), 0, false, None, a)
+            .is_some_and(|why| why.contains("without graphics")));
+        assert!(present_skip_reason(Some(0), 0, true, Some(a), b)
+            .is_some_and(|why| why.contains("more than one queue")));
+    }
 
     #[test]
     fn guard_returns_the_real_result_when_f_does_not_panic() {

@@ -20,8 +20,9 @@ For screenshots, run `argus-lasso --ui-tour <output-directory>`; add
 capture a theme other than your own. Captures are opaque and ignore the pointer,
 whatever your window opacity. This isolated
 preview uses read-only collection: it must never enforce policies, bind the
-production overlay socket or save configuration. Root captures do not include
-native child windows; photograph those separately. Review images for private
+production overlay socket or save configuration. Dialogs that are native child
+windows in normal use are embedded in the main window during the tour, so its
+captures include them. Review images for private
 information before publishing. `examples/overlay-settings-preview.rs` renders the
 actual customization controls without a daemon or configuration writes.
 The tour warms up by frame count: a fast headless renderer can time out before
