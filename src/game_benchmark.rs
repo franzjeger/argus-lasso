@@ -49,14 +49,13 @@ impl Default for GameBenchmark {
     }
 }
 impl GameBenchmark {
+    /// Compare the two latest recordings: A the earlier, B the later, so
+    /// "Change B vs A" reads as what changed since.
     pub fn compare_recent(&mut self) -> bool {
-        if self.results.len() < 2 {
+        let Some([earlier, later]) = latest_two_runs(&self.results) else {
             return false;
-        }
-        let next = [
-            Some(self.results[0].0.clone()),
-            Some(self.results[1].0.clone()),
-        ];
+        };
+        let next = [Some(earlier.clone()), Some(later.clone())];
         if self.compare != next {
             self.compare = next;
             self.comparison_dirty = true;
@@ -139,7 +138,7 @@ impl GameBenchmark {
                 })
                 .clicked()
             {
-                match capture::toggle(self.duration.load(Ordering::Relaxed)) {
+                match capture::set_active(!self.active, self.duration.load(Ordering::Relaxed)) {
                     Ok(c) => {
                         self.active = c.active;
                         self.checked = None;
@@ -207,7 +206,7 @@ impl GameBenchmark {
         }
         if ui
             .add_enabled(
-                self.results.len() >= 2,
+                latest_two_runs(&self.results).is_some(),
                 egui::Button::new("Compare latest two"),
             )
             .clicked()
@@ -470,11 +469,34 @@ fn delta(a: Option<f64>, b: Option<f64>) -> String {
         _ => "—".into(),
     }
 }
+/// The main result of each of the two latest recording sessions, earlier
+/// first. One session writes a result per swapchain, so a game that
+/// recreates its swapchain (resize, fullscreen, settings) leaves several,
+/// and one that presented once leaves an empty one; the run is the one with
+/// the most frames. `results` is newest first.
+fn latest_two_runs(results: &[(PathBuf, Summary)]) -> Option<[&PathBuf; 2]> {
+    let mut runs: Vec<(&PathBuf, &Summary)> = Vec::new();
+    for (path, summary) in results.iter().filter(|(_, s)| s.frames > 0) {
+        match runs
+            .iter_mut()
+            .find(|(_, run)| run.session == summary.session)
+        {
+            Some(run) if summary.frames > run.1.frames => *run = (path, summary),
+            Some(_) => {}
+            None => runs.push((path, summary)),
+        }
+    }
+    match runs.as_slice() {
+        [later, earlier, ..] => Some([earlier.0, later.0]),
+        _ => None,
+    }
+}
+
 fn recording_label(s: &Summary) -> String {
-    let name = std::path::Path::new(&s.executable)
-        .file_name()
-        .map(|p| p.to_string_lossy())
-        .unwrap_or("Unknown application".into());
+    let name = match capture::program_file_name(&s.executable) {
+        "" => "Unknown application",
+        name => name,
+    };
     let date = s
         .session
         .split('-')
@@ -613,6 +635,34 @@ fn draw_comparison(ui: &mut egui::Ui, graphs: &Graphs) {
 #[cfg(test)]
 mod comparison_tests {
     use super::*;
+
+    fn run(name: &str, session: &str, frames: usize) -> (PathBuf, Summary) {
+        let summary = Summary {
+            session: session.into(),
+            frames,
+            ..Summary::default()
+        };
+        (PathBuf::from(name), summary)
+    }
+
+    /// A swapchain recreated during the latest recording used to be
+    /// compared with the rest of that same recording, newest as A.
+    #[test]
+    fn the_latest_two_runs_are_two_sessions_earlier_first() {
+        // Newest first, as load_summaries lists them.
+        let results = [
+            run("s2-swapchain-b", "s2", 900),
+            run("s2-swapchain-a", "s2", 3000),
+            run("s2-one-present", "s2", 0),
+            run("s1-swapchain", "s1", 2800),
+            run("s0-swapchain", "s0", 2500),
+        ];
+        let [a, b] = latest_two_runs(&results).unwrap();
+        assert_eq!(a, &PathBuf::from("s1-swapchain"));
+        assert_eq!(b, &PathBuf::from("s2-swapchain-a"));
+
+        assert!(latest_two_runs(&results[..3]).is_none(), "one session only");
+    }
     #[test]
     fn differences_handle_missing_zero_and_nonfinite_metrics() {
         assert_eq!(delta(Some(100.0), Some(110.0)), "+10.0%");

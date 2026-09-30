@@ -148,6 +148,33 @@ struct Stream {
     intervals: Vec<u64>,
     io_failed: bool,
 }
+/// The program a recording is of. Under Wine and Proton /proc/self/exe is
+/// Wine's loader (wine64-preloader), the same for every game; the Windows
+/// program is argv[0], which `activation` relies on too, or failing that
+/// the process name Wine gives it.
+fn recorded_program() -> String {
+    let exe = fs::read_link("/proc/self/exe")
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let argv0 = std::env::args_os()
+        .next()
+        .map(|a| a.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let comm = fs::read_to_string("/proc/self/comm").unwrap_or_default();
+    program_name(&exe, &argv0, comm.trim()).to_string()
+}
+
+fn program_name<'a>(exe: &'a str, argv0: &'a str, comm: &'a str) -> &'a str {
+    let wine = |path: &str| capture::program_file_name(path).starts_with("wine");
+    if !wine(exe) {
+        return exe;
+    }
+    [argv0, comm]
+        .into_iter()
+        .find(|name| !name.is_empty() && !wine(name))
+        .unwrap_or(exe)
+}
+
 impl Stream {
     fn new(sample: &Sample, control: &Control, sequence: u32) -> io::Result<Self> {
         let dir = capture::directory();
@@ -168,9 +195,7 @@ impl Stream {
                 .open(csv)?,
         );
         writeln!(writer, "present_begin_ns,interval_ns,vulkan_result")?;
-        let executable = fs::read_link("/proc/self/exe")
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
+        let executable = recorded_program();
         let telemetry = crate::TELEMETRY.read().ok().and_then(|t| t.frame.clone());
         let config = crate::OVERLAY_CONFIG.read().ok().map(|c| c.clone());
         use ash::vk::Handle;
@@ -304,6 +329,25 @@ fn finish(mut stream: Stream, dropped: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every Proton recording used to be labelled wine64-preloader.
+    #[test]
+    fn wine_games_are_recorded_by_their_windows_program() {
+        let game = "Z:\\games\\steamapps\\common\\Game\\game.exe";
+        assert_eq!(
+            program_name("/usr/bin/vkcube", "vkcube", "vkcube"),
+            "/usr/bin/vkcube"
+        );
+        assert_eq!(
+            program_name("/proton/bin/wine64-preloader", game, "game.exe"),
+            game
+        );
+        assert_eq!(
+            program_name("/proton/bin/wine64", "/proton/bin/wine64", "game.exe"),
+            "game.exe"
+        );
+        assert_eq!(program_name("/proton/bin/wine", "", ""), "/proton/bin/wine");
+    }
     #[test]
     fn stopped_or_old_generation_cannot_reopen_a_capture() {
         let mut streams = HashMap::new();

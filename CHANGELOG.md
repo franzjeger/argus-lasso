@@ -164,6 +164,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Showing or hiding the HUD with `argus-lasso toggle-overlay` or the shortcut is
   reflected in Gaming → Overlay, and changing another overlay setting afterwards
   no longer turns the HUD back to what the Gaming page last knew.
+- "Compare latest two" compares the two latest recordings, earlier as A and later
+  as B, so an improvement shows as a gain. It used to pick the two newest files,
+  which could be parts of one recording when the game recreated its swapchain,
+  with the newest as A. Proton and Wine recordings are named after the game's
+  Windows program instead of `wine64-preloader`. "Stop recording" no longer
+  starts a new recording when the last one has just run out.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
