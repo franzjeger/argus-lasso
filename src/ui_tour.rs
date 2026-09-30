@@ -107,6 +107,24 @@ pub fn prepare_config(config: &mut crate::config::Config) {
     config.ui.opacity = 1.0;
 }
 
+/// Drop pointer input for the tour.
+///
+/// The screens are what the app shows, not where the display's pointer happens
+/// to rest: under Xvfb it sits mid-screen, and whichever capture had a widget
+/// there got that widget's hover tooltip.
+pub fn without_pointer(input: &mut egui::RawInput) {
+    input.events.retain(|event| {
+        !matches!(
+            event,
+            egui::Event::PointerMoved(_)
+                | egui::Event::MouseMoved(_)
+                | egui::Event::PointerButton { .. }
+                | egui::Event::MouseWheel { .. }
+                | egui::Event::Touch { .. }
+        )
+    });
+}
+
 /// Frames to render before capturing a step.
 ///
 /// One frame is not enough: egui is immediate-mode, so a screen that sizes
@@ -335,6 +353,33 @@ mod tests {
         config.ui.opacity = 0.8;
         prepare_config(&mut config);
         assert_eq!(config.ui.opacity, 1.0);
+    }
+
+    #[test]
+    fn the_pointer_never_reaches_the_tour() {
+        let mut input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(egui::pos2(800.0, 500.0)),
+                egui::Event::MouseMoved(egui::vec2(1.0, 1.0)),
+                egui::Event::PointerButton {
+                    pos: egui::pos2(800.0, 500.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Screenshot {
+                    viewport_id: egui::ViewportId::ROOT,
+                    user_data: egui::UserData::default(),
+                    image: std::sync::Arc::new(egui::ColorImage::example()),
+                },
+            ],
+            ..Default::default()
+        };
+        without_pointer(&mut input);
+        assert!(
+            matches!(input.events.as_slice(), [egui::Event::Screenshot { .. }]),
+            "only the pointer is dropped, not the tour's own capture replies"
+        );
     }
 
     #[test]

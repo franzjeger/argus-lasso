@@ -15,6 +15,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - `--ui-tour` captures the window opaque. It used the window opacity of whoever
   ran it, and at 80 % every screenshot was drawn over black: dark themes came out
   a muddy brown-grey and light themes grey.
+- `--ui-tour` ignores the pointer. Under Xvfb it rests mid-screen, and the capture
+  of whichever screen had a widget there showed that widget's tooltip.
 
 ## [1.4.0] — 2026-09-30
 
