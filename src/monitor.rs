@@ -593,6 +593,9 @@ struct GamingState {
     auto: bool,
     /// Consecutive snapshots without a detected game before auto-disabling
     absent_snapshots: u32,
+    /// The user turned Gaming Mode off while a game ran: detection must not
+    /// turn it straight back on. Cleared once no game is detected.
+    manual_off: bool,
     launch_profiles: Vec<argus_ipc::LaunchProfile>,
 }
 
@@ -847,9 +850,11 @@ impl Daemon {
                 gaming.active = active;
                 gaming.elevate_nice = elevate_nice;
                 // A manual toggle takes ownership: the auto-detector must
-                // not later auto-disable a manually (re-)enabled mode.
+                // not later auto-disable a manually (re-)enabled mode, nor
+                // turn a manually disabled one straight back on.
                 gaming.auto = false;
                 gaming.absent_snapshots = 0;
+                gaming.manual_off = !active;
                 if active {
                     self.boost_running();
                 } else {
@@ -989,7 +994,7 @@ impl Daemon {
         let gaming = &mut self.gaming;
         if let Some(game) = game {
             gaming.absent_snapshots = 0;
-            if !gaming.active {
+            if !gaming.active && !gaming.manual_off {
                 gaming.active = true;
                 gaming.elevate_nice = true;
                 gaming.auto = true;
@@ -1006,6 +1011,8 @@ impl Daemon {
                 // The game that turned it on is running already.
                 self.boost_running();
             }
+        } else if std::mem::take(&mut gaming.manual_off) {
+            // The game ended: detection may turn Gaming Mode on again.
         } else if gaming.auto && gaming.active {
             // Require a couple of game-free snapshots before restoring,
             // so a brief exec/restart doesn't bounce the CPUs.

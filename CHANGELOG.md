@@ -292,6 +292,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - "Restore all CPU assignments" restores the processes Argus changed, to what
   they had before. It reset every process ever seen, pinning those first seen
   while CPUs were parked to the CPUs online then.
+- Turning Gaming Mode off while a detected game runs keeps it off until the game
+  exits, instead of auto-detection turning it (and CPU parking) back on within a
+  second.
 
 ### Changed
 
