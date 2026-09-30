@@ -255,6 +255,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   one that arrives before the window exists is kept until it does. The autostart
   entry points at the binary on disk, not at the " (deleted)" image after an
   update, and systemctl runs in the background.
+- "Delete rule?" deletes the rule it names; selecting another row while it was
+  open switched it to that row. "Show all rules" under Live rule effects clears
+  the rule filter again.
 
 ### Changed
 

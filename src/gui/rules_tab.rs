@@ -29,7 +29,9 @@ pub struct RulesTab {
     file_rx: std::sync::mpsc::Receiver<FileDialogResult>,
     file_tx: std::sync::mpsc::Sender<FileDialogResult>,
     // Confirm dialog state
-    confirm_delete_rule: bool,
+    /// The rule a "Delete rule?" confirmation is for. Held here, not taken
+    /// from the table's selection, which can change while it is open.
+    pending_delete: Option<String>,
     /// Picked in the profile menu, waiting for the user to confirm loading.
     pending_profile: Option<String>,
     confirm_delete_profile: bool,
@@ -50,7 +52,7 @@ impl RulesTab {
             test_input: String::new(),
             file_rx,
             file_tx,
-            confirm_delete_rule: false,
+            pending_delete: None,
             pending_profile: None,
             confirm_delete_profile: false,
             focus_editor: false,
@@ -85,7 +87,8 @@ impl RulesTab {
         stale
     }
 
-    /// Returns `true` if rule_profiles in config changed (needs save).
+    /// Sets `on_rules_changed` or `on_profiles_changed` when the rules or the
+    /// saved profiles changed and need saving.
     #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
@@ -162,7 +165,7 @@ impl RulesTab {
                     if count == 0 { ui.label("No running processes match the selected rules."); ui.end_row(); }
                 });
             });
-            if self.selected_rule_id.is_some() && ui.small_button("Show all rules").clicked() { self.selected_rule_id = None; }
+            if self.selected_rule_id.is_some() && ui.small_button("Show all rules").clicked() { new_sel = None; }
         });
         if !self.status.is_empty() {
             ui.label(
@@ -442,8 +445,8 @@ impl RulesTab {
             ctx.send_viewport_cmd_to(RuleEditDialog::viewport_id(), egui::ViewportCommand::Focus);
         }
         if let Some(id) = delete_rule_id {
-            self.selected_rule_id = Some(id);
-            self.confirm_delete_rule = true;
+            self.selected_rule_id = Some(id.clone());
+            self.pending_delete = Some(id);
         }
         if let Some(id) = toggle_rule_id {
             if let Ok(mut re) = rule_engine.lock() {
@@ -459,11 +462,10 @@ impl RulesTab {
         }
 
         // ── Confirm dialogs ────────────────────────────────────────────────
-        if self.confirm_delete_rule {
-            let rule_name = self
-                .selected_rule_id
-                .as_ref()
-                .and_then(|id| rules.iter().find(|r| &r.rule_id == id))
+        if let Some(id) = self.pending_delete.clone() {
+            let rule_name = rules
+                .iter()
+                .find(|r| r.rule_id == id)
                 .map(|r| r.name.as_str())
                 .unwrap_or("this rule");
             let mut confirmed = false;
@@ -485,16 +487,17 @@ impl RulesTab {
                     });
                 });
             if confirmed {
-                if let (Some(id), Ok(mut re)) = (self.selected_rule_id.clone(), rule_engine.lock())
-                {
+                if let Ok(mut re) = rule_engine.lock() {
                     re.remove_rule(&id);
                     *on_rules_changed = true;
-                    self.selected_rule_id = None;
+                    if self.selected_rule_id.as_ref() == Some(&id) {
+                        self.selected_rule_id = None;
+                    }
                     self.close_editor_if(|edited| edited == id);
                 }
-                self.confirm_delete_rule = false;
+                self.pending_delete = None;
             } else if cancelled {
-                self.confirm_delete_rule = false;
+                self.pending_delete = None;
             }
         }
 
@@ -886,6 +889,12 @@ mod tests {
         }
 
         fn click(&mut self, label: &str) {
+            self.click_nearest(label, egui::Pos2::ZERO);
+        }
+
+        /// Click the control labelled `label` closest to `near`, for a label
+        /// that appears more than once.
+        fn click_nearest(&mut self, label: &str, near: egui::Pos2) {
             // Windows are laid out, invisibly, in their first frame.
             self.frame(vec![]);
             let output = self.frame(vec![]);
@@ -893,16 +902,14 @@ mod tests {
                 .platform_output
                 .accesskit_update
                 .expect("accesskit update");
-            let bounds = update
+            let pos = update
                 .nodes
                 .iter()
-                .find(|(_, node)| node.label() == Some(label))
-                .and_then(|(_, node)| node.bounds())
+                .filter(|(_, node)| node.label() == Some(label))
+                .filter_map(|(_, node)| node.bounds())
+                .map(|b| egui::pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32))
+                .min_by(|a, b| a.distance(near).total_cmp(&b.distance(near)))
                 .unwrap_or_else(|| panic!("nothing labelled {label}"));
-            let pos = egui::pos2(
-                ((bounds.x0 + bounds.x1) / 2.0) as f32,
-                ((bounds.y0 + bounds.y1) / 2.0) as f32,
-            );
             let button = |pressed| egui::Event::PointerButton {
                 pos,
                 button: egui::PointerButton::Primary,
@@ -1005,5 +1012,35 @@ mod tests {
             import_summary(0, &two),
             "Imported 0 rules; skipped 2 — \"x\": nice 50 is outside -20 to 19, and 1 more."
         );
+    }
+
+    /// Selecting another row while "Delete rule 'A'?" was open (it is not
+    /// modal) switched the confirmation, and Delete removed that row.
+    #[test]
+    fn delete_removes_the_rule_it_asked_about() {
+        let (a, b) = (rule("a"), rule("b"));
+        let mut h = Harness::new(&[a.clone(), b.clone()]);
+        h.tab.pending_delete = Some(a.rule_id.clone());
+        h.tab.selected_rule_id = Some(b.rule_id.clone());
+        h.click_nearest("Delete", egui::pos2(600.0, 400.0));
+        let left: Vec<String> = h
+            .engine
+            .lock()
+            .unwrap()
+            .get_rules()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        assert_eq!(left, ["b"]);
+    }
+
+    #[test]
+    fn show_all_rules_clears_the_filter() {
+        let a = rule("a");
+        let mut h = Harness::new(std::slice::from_ref(&a));
+        h.tab.selected_rule_id = Some(a.rule_id.clone());
+        h.click("Live rule effects");
+        h.click("Show all rules");
+        assert_eq!(h.tab.selected_rule_id, None);
     }
 }
