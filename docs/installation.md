@@ -7,7 +7,7 @@ Do not mix daemon and layer files from arbitrary revisions.
 
 ## Dependencies
 
-Build with Rust 1.92 or newer, Cargo, pkg-config, Wayland/X11 development libraries,
+Build with Rust 1.95 or newer, Cargo, pkg-config, Wayland/X11 development libraries,
 an OpenGL driver for the GUI, and `glslangValidator` for the Vulkan shaders.
 The source installer also uses Python 3 and systemd user services. A Vulkan loader
 and working Vulkan driver are needed by games using the overlay.

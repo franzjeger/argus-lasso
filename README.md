@@ -88,7 +88,7 @@ verified displayed/generated-frame timing. See [metric definitions](docs/overlay
 
 ## Quick start from source
 
-Requires Rust **1.92 or newer**, a Linux graphics stack, Wayland/X11 development
+Requires Rust **1.95 or newer**, a Linux graphics stack, Wayland/X11 development
 libraries, `pkg-config`, `glslangValidator`, Python 3, and systemd user services
 for the supplied installer. Full distro dependencies and manual instructions are
 in [installation](docs/installation.md).

@@ -358,6 +358,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Changed
 
+- Building from source needs Rust **1.95** or newer, the floor of egui 0.36.
+  Dependencies are updated: egui, eframe and egui_extras 0.36, nix 0.31, png 0.18
+  and nvml-wrapper 0.13.
 - **Releases are signed with a new key** (ID `D53DAD0590FF1744`), held only in the
   approval-gated `release` environment. The in-app updater of 1.3.1 and older
   checks against the old key and refuses these releases: install the next release

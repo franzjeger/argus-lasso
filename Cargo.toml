@@ -2,10 +2,10 @@
 name = "argus-lasso"
 version = "1.3.1"
 edition = "2021"
-# The floor the dependency tree actually imposes — the egui 0.34 stack
-# declares 1.92. Enforced by cargo, and checked in CI so it cannot drift
+# The floor the dependency tree actually imposes — the egui 0.36 stack
+# declares 1.95. Enforced by cargo, and checked in CI so it cannot drift
 # back into being a guess.
-rust-version = "1.92"
+rust-version = "1.95"
 description = "Argus-Lasso — Linux process manager with CPU affinity, ProBalance, Gaming Mode, and HW monitoring"
 authors = ["franzjeger"]
 
