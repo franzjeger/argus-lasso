@@ -86,7 +86,7 @@ raw-window-handle = "0.6"
 png = "0.18"
 ureq = { version = "3.3.0", features = ["rustls"] }
 sha2 = "0.11.0"
-minisign-verify = "0.2.5"
+minisign-verify = "0.3.0"
 bincode = "1.3"
 ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "global_shortcuts"] }
 async-io = "2"
