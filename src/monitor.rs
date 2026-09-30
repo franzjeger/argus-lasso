@@ -410,9 +410,10 @@ pub fn spawn(
     cmd_rx: Receiver<DaemonCmd>,
     initial_config: Config,
     rule_engine: Arc<Mutex<RuleEngine>>,
+    gui_context: crate::gui::SharedContext,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        run_loop(state, cmd_rx, initial_config, rule_engine);
+        Daemon::start(state, initial_config, rule_engine, gui_context).run(&cmd_rx);
     })
 }
 
@@ -568,15 +569,6 @@ fn get_ram_info() -> (f32, f32) {
     })
 }
 
-fn run_loop(
-    state: Arc<Mutex<AppState>>,
-    cmd_rx: Receiver<DaemonCmd>,
-    initial_config: Config,
-    rule_engine: Arc<Mutex<RuleEngine>>,
-) {
-    Daemon::start(state, initial_config, rule_engine).run(&cmd_rx);
-}
-
 /// A log sink that appends to the shared state's log.
 fn logger(state: &Arc<Mutex<AppState>>) -> impl Fn(String) + Send + Clone + 'static {
     let state = state.clone();
@@ -608,6 +600,8 @@ struct GamingState {
 struct Daemon {
     state: Arc<Mutex<AppState>>,
     rule_engine: Arc<Mutex<RuleEngine>>,
+    /// For showing the window when a second launch asks.
+    gui_context: crate::gui::SharedContext,
     config: Config,
     ipc: ipc_server::Broadcaster,
     log: Box<dyn Fn(String) + Send>,
@@ -659,6 +653,7 @@ impl Daemon {
         state: Arc<Mutex<AppState>>,
         config: Config,
         rule_engine: Arc<Mutex<RuleEngine>>,
+        gui_context: crate::gui::SharedContext,
     ) -> Self {
         let ipc = ipc_server::Broadcaster::start();
         ipc.broadcast(&argus_ipc::IpcMessage::Config(
@@ -685,6 +680,7 @@ impl Daemon {
         Self {
             state,
             rule_engine,
+            gui_context,
             config,
             ipc,
             log,
@@ -718,7 +714,7 @@ impl Daemon {
 
     fn run(mut self, cmd_rx: &Receiver<DaemonCmd>) {
         loop {
-            self.poll_overlay_toggle();
+            self.poll_requests();
             while let Ok(cmd) = cmd_rx.try_recv() {
                 if self.handle(cmd).is_break() {
                     return;
@@ -770,6 +766,14 @@ impl Daemon {
                 .lock()
                 .map(|re| re.get_rules().iter().any(|r| r.enabled))
                 .unwrap_or(false)
+    }
+
+    /// Requests left by the CLI and by a second launch.
+    fn poll_requests(&mut self) {
+        if crate::overlay_toggle::drain_show_window(&self.toggle_dir) > 0 {
+            crate::gui::show_main_window(&self.gui_context);
+        }
+        self.poll_overlay_toggle();
     }
 
     fn poll_overlay_toggle(&mut self) {

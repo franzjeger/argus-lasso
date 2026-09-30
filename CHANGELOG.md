@@ -175,6 +175,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Changed
 
+- The tray menu has "Open Argus-Lasso", and a left click on the tray icon does
+  the same. Launching Argus from the app menu while it already runs brings the
+  running window to the front instead of only printing "already running".
+
 - Screen readers can use the hand-drawn controls: the page tabs, filter chips,
   on/off switches, segmented choices and CPU thread tiles now report their name
   and state. The process filter chips explain themselves on hover.
