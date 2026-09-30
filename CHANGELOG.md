@@ -55,9 +55,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
   open is no longer dropped with a note to pick it again. The open editor comes
   to the front, and the new rule opens as soon as it is saved or cancelled. A
   rule from a template is titled "New rule", not "Edit Rule".
-- Helper installation no longer trusts the user-writable staging directory: root
-  installs only copies matching SHA-256 digests in its own command, so a file
-  swapped while the polkit prompt is open is refused instead of installed.
+- Installing the CPU control helpers no longer trusts files in the user's own
+  directories: the helper files travel inside the root command, and root checks
+  each against its SHA-256 before installing it. A file swapped while the polkit
+  prompt was open used to be installed, a FIFO or device node in its place could
+  hang root, and home directories with spaces or non-ASCII characters could not
+  install at all.
 - Nice and I/O priority now reach every thread of a process, as affinity already
   did. Rules, ProBalance and the Gaming Mode boost previously changed only the
   main thread. The renice helper is updated (v5) and asks to be reinstalled.
@@ -272,9 +275,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   open switched it to that row. "Show all rules" under Live rule effects clears
   the rule filter again.
 - Dragging a slider or colour in the HUD customization window updates the HUD
-  live but saves the configuration once it settles, and the Activity log records
-  only what changed: it got a "Config updated" line, and the file a save, for
-  every frame of the drag.
+  live but saves the configuration at most every 300 ms while dragging, and the
+  Activity log records only what changed: it got a "Config updated" line, and the
+  file a save, for every frame of the drag.
 - Start or Stop recording is no longer undone by a recordings scan that read the
   state just before the click, which put the button back so a second click
   restarted the recording.
@@ -335,11 +338,6 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - `make uninstall` also removes the update backups, the rollback record and the
   autostart entry, and prints the commands to remove the system-wide CPU control
   helpers when they are installed; they still granted their actions afterwards.
-- Installing the CPU control helpers no longer has root read a staging directory
-  in the user's configuration: the files travel in the root command itself. A
-  process of the user could replace a staged file with a FIFO that hung root or a
-  device node; home directories with spaces or non-ASCII characters no longer stop
-  the install.
 - A recording is no longer lost when the game exits or crashes before finishing
   it. The layer writes rows out every 100 ms and finishes recordings when the game
   tears down its device; a recording left unfinished is listed as incomplete, with

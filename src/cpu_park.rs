@@ -207,12 +207,6 @@ for task in "/proc/$pid/task/"*; do
 done
 "#;
 
-/// Three separate actions so an administrator can tighten one without losing
-/// the others. Each asks for an administrator's password by default;
-/// `polkit_rules` lets the user who installed the helpers run them without
-/// one, from an active local session. (`allow_active=yes` let every local
-/// user do that.) Renice is confined to the caller's own processes by the
-/// helper itself.
 /// The polkit rule, with `@USER@` for the user who installs the helpers: that
 /// user, in an active local session, runs them without a password.
 fn polkit_rules() -> String {
@@ -242,6 +236,12 @@ fn rules_script() -> String {
     )
 }
 
+/// Three separate actions so an administrator can tighten one without losing
+/// the others. Each asks for an administrator's password by default;
+/// `polkit_rules` lets the user who installed the helpers run them without
+/// one, from an active local session. (`allow_active=yes` let every local
+/// user do that.) Renice is confined to the caller's own processes by the
+/// helper itself.
 fn policy_xml() -> String {
     let action = |id: &str, desc: &str, msg: &str, path: String| {
         format!(
