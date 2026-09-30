@@ -275,6 +275,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
   when that was refused. A nice throttle is put back only while the process still
   has the value ProBalance set, so a manual change made meanwhile (which also
   exempts the process) or a rule's is no longer undone.
+- Stopping Argus with `systemctl --user stop`, logging out or Ctrl+C now restores
+  parked CPUs, ProBalance throttles and Gaming Mode nices, as quitting from the
+  window or tray does. The process died at once on those signals, leaving CPUs
+  offline system-wide. Unparking now comes first and the restore gets up to 10 s.
 
 ### Changed
 

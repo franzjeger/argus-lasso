@@ -62,8 +62,10 @@ pub enum DaemonCmd {
     },
     ResetAffinities,
     ReapplyDefaults,
-    /// Restore everything we changed (nices, throttles, parked CPUs) before
-    /// the process exits; sets AppState::shutdown_complete when done.
+    /// Put back what only this process remembers (parked CPUs, ProBalance
+    /// throttles, Gaming Mode nices) before it exits; sets
+    /// AppState::shutdown_complete when done. Values set by rules stay: they
+    /// are the user's settings, not temporary measures.
     Shutdown,
 }
 
@@ -260,16 +262,19 @@ fn chrono_ts() -> String {
 
 // ── Daemon thread ─────────────────────────────────────────────────────────────
 
-/// Ask the daemon to restore everything it changed (nices, throttles, parked
-/// CPUs) and wait briefly for it to report back.
+/// Ask the daemon to put back its temporary changes (parked CPUs, throttles,
+/// Gaming Mode nices) and wait for it to report back.
 ///
 /// Every path that ends this process image must go through here — window
-/// close, tray Quit, and the updater's `exec` restart. Skipping it leaves
+/// close, tray Quit, a termination signal (see main's stop-signal thread)
+/// and the updater's `exec` restart. Skipping it leaves
 /// parked CPUs offline and throttled processes at a raised nice, with the
 /// original values lost: they live only in this process's memory.
 pub fn shutdown_and_wait(state: &Arc<Mutex<AppState>>, cmd_tx: &Sender<DaemonCmd>) {
     let _ = cmd_tx.send(DaemonCmd::Shutdown);
-    for _ in 0..30 {
+    // Unparking and restoring throttled units run a pkexec or a systemctl
+    // (with a 5 s timeout) each; systemd allows a stopping service 90 s.
+    for _ in 0..100 {
         // A poisoned lock means the daemon is already gone; don't hang on it.
         let done = state.lock().map(|s| s.shutdown_complete).unwrap_or(true);
         if done {
@@ -277,7 +282,7 @@ pub fn shutdown_and_wait(state: &Arc<Mutex<AppState>>, cmd_tx: &Sender<DaemonCmd
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    log::warn!("daemon did not confirm shutdown within 3s; continuing anyway");
+    log::warn!("daemon did not confirm shutdown within 10s; continuing anyway");
 }
 
 // ── Overlay IPC Server ────────────────────────────────────────────────────────
@@ -880,12 +885,15 @@ impl Daemon {
 
     fn shutdown(&mut self) {
         (self.log)("[Shutdown] Restoring system state…".into());
-        if !self.gaming.niced.is_empty() {
-            restore_gaming_nices(&mut self.gaming.niced, &self.log);
-        }
-        self.probalance.shutdown();
+        // Parked CPUs first: they matter to the whole system, and the rest
+        // (a pkexec per gaming nice, systemctl per throttled unit) can take
+        // long enough for the exit to cut it off.
         if !utils::get_offline_cpus().is_empty() {
             cpu_park::unpark_all(&self.log);
+        }
+        self.probalance.shutdown();
+        if !self.gaming.niced.is_empty() {
+            restore_gaming_nices(&mut self.gaming.niced, &self.log);
         }
         if let Ok(mut s) = self.state.lock() {
             s.shutdown_complete = true;
