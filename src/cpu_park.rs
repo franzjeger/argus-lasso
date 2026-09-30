@@ -40,7 +40,7 @@ pub const LEGACY_SUDOERS: &str = "/etc/sudoers.d/argus-lasso";
 
 /// Bumped whenever a helper script changes, so the app can tell an outdated
 /// install from a missing one. Substring-matched in the installed files.
-const HELPER_VERSION: &str = "argus-lasso-helper v5";
+const HELPER_VERSION: &str = "argus-lasso-helper v6";
 
 /// The three privileged operations, and the file each one lives in.
 const OP_PARK: &str = "cpu-park";
@@ -52,7 +52,7 @@ fn helper_path(op: &str) -> String {
 }
 
 const PARK_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v5 — CPU parking. Managed by argus-lasso; do not edit.
+# argus-lasso-helper v6 — CPU parking. Managed by argus-lasso; do not edit.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 case "${1-}" in
@@ -100,21 +100,46 @@ esac
 "#;
 
 const POWER_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v5 — CPU governor and energy preference.
+# argus-lasso-helper v6 — CPU governor and energy preference.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+# Write $2 to cpufreq/$1 on every online CPU. Fails, naming the CPUs and the
+# kernel's reason, if it refuses any of them (a governor it lacks, an EPP the
+# governor does not allow) or if no CPU has the file. Parked CPUs have no
+# policy to set.
+set_all() {
+    local name=$1 value=$2 dir f err refused="" reason="" ok=0
+    for dir in $(printf '%s\n' /sys/devices/system/cpu/cpu[0-9]* | sort -V); do
+        f=$dir/cpufreq/$name
+        [ -e "$f" ] || continue
+        if [ "$(cat "$dir/online" 2>/dev/null || echo 1)" = 0 ]; then
+            continue
+        fi
+        if err=$( { echo "$value" > "$f"; } 2>&1 ); then
+            ok=$((ok + 1))
+        else
+            refused+=" ${dir##*/}"
+            reason=${err##*: }
+        fi
+    done
+    if [ -n "$refused" ]; then
+        [ "$ok" = 0 ] && refused=" every CPU"
+        echo "the kernel refused $name=$value on$refused ($reason)" >&2
+        exit 1
+    fi
+    if [ "$ok" = 0 ]; then
+        echo "no CPU has $name" >&2
+        exit 1
+    fi
+}
 case "${1-}" in
     governor)
         [[ "${2-}" =~ ^[a-z_-]+$ ]] || exit 2
-        for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-            echo "$2" > "$f" 2>/dev/null || true
-        done
+        set_all scaling_governor "$2"
         ;;
     epp)
         [[ "${2-}" =~ ^[a-z_-]+$ ]] || exit 2
-        for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
-            echo "$2" > "$f" 2>/dev/null || true
-        done
+        set_all energy_performance_preference "$2"
         ;;
     *)
         echo "usage: power-profile governor <name> | epp <name>" >&2; exit 2 ;;
@@ -136,7 +161,7 @@ esac
 /// re-check and the renice call; Linux has no pidfd-based setpriority to
 /// close it entirely.
 const RENICE_SCRIPT: &str = r#"#!/bin/bash
-# argus-lasso-helper v5 — renice, restricted to the caller's own processes.
+# argus-lasso-helper v6 — renice, restricted to the caller's own processes.
 set -euo pipefail
 export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 [[ "${1-}" =~ ^-?[0-9]+$ ]] || exit 2
@@ -963,8 +988,7 @@ fn available_governors() -> Vec<String> {
 
 /// Apply a power profile via the privileged helper. Returns (ok, message).
 pub fn apply_power_profile(profile: PowerProfile) -> (bool, String) {
-    // The helper's cpu-epp glob writes are best-effort and always exit 0, so
-    // detect EPP support from sysfs instead of trusting the helper.
+    // Whether to set EPP at all: platforms without it have no such file.
     let epp_supported = current_epp().is_some();
     let available = available_governors();
     let Some(governor) = profile.pick_governor(epp_supported, &available) else {
@@ -1082,6 +1106,31 @@ mod tests {
         fs::remove_file(&script).ok();
     }
 
+    /// The v5 helper ignored every refused write and exited 0, so Settings
+    /// reported a governor or EPP change the kernel never made.
+    #[test]
+    fn power_helper_reports_writes_the_kernel_refuses() {
+        // As root the write might succeed; this is about refusal.
+        // SAFETY: getuid(2) cannot fail and takes no arguments.
+        if unsafe { nix::libc::getuid() } == 0 {
+            return;
+        }
+        let script = stage_script("power-refused", POWER_SCRIPT);
+        let out = Command::new("bash")
+            .arg(&script)
+            .args(["governor", "performance"])
+            .output()
+            .unwrap();
+        fs::remove_file(&script).ok();
+        assert_eq!(out.status.code(), Some(1));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.trim() == "the kernel refused scaling_governor=performance on every CPU (Permission denied)"
+                || stderr.trim() == "no CPU has scaling_governor",
+            "{stderr}"
+        );
+    }
+
     #[test]
     fn renice_rejects_malformed_arguments() {
         let script = stage_script("renice-args", RENICE_SCRIPT);
@@ -1134,7 +1183,7 @@ mod tests {
         // its sibling above, which is refused before reaching renice) — see
         // PROCESS_NICE_TEST_LOCK's doc comment for why that needs
         // serializing against other tests doing the same (rules.rs's
-        // apply_rules_lets_a_later_rule_override_..).
+        // rules_sharing_a_nice_target_change_it_once).
         let _guard = crate::utils::PROCESS_NICE_TEST_LOCK.lock().unwrap();
         use std::os::unix::fs::MetadataExt;
         let script = stage_script("renice-start-match", RENICE_SCRIPT);

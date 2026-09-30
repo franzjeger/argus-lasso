@@ -30,8 +30,11 @@ pub struct RulesTab {
     file_tx: std::sync::mpsc::Sender<FileDialogResult>,
     // Confirm dialog state
     confirm_delete_rule: bool,
-    confirm_load_profile: bool,
+    /// Picked in the profile menu, waiting for the user to confirm loading.
+    pending_profile: Option<String>,
     confirm_delete_profile: bool,
+    /// Bring the open rule editor to the front on the next frame.
+    focus_editor: bool,
 }
 
 impl RulesTab {
@@ -48,15 +51,38 @@ impl RulesTab {
             file_rx,
             file_tx,
             confirm_delete_rule: false,
-            confirm_load_profile: false,
+            pending_profile: None,
             confirm_delete_profile: false,
+            focus_editor: false,
         }
     }
 
     pub fn open_add_dialog(&mut self, template: Option<Rule>) {
-        self.edit_dialog = Some(RuleEditDialog::new(
-            template.unwrap_or_else(Rule::new_empty),
-        ));
+        self.open_editor(template.unwrap_or_else(Rule::new_empty), false);
+    }
+
+    /// Open the rule editor, unless it is open already: replacing it would
+    /// throw away unsaved edits, so bring that one to the front instead.
+    fn open_editor(&mut self, rule: Rule, existing: bool) {
+        if self.edit_dialog.is_some() {
+            self.focus_editor = true;
+            self.status = "Save or cancel the rule you are editing first.".into();
+            return;
+        }
+        self.edit_dialog = Some(RuleEditDialog::new(rule, existing));
+    }
+
+    /// Close the editor if it is editing a saved rule that `gone` says no
+    /// longer exists as it was: saving it would bring the old rule back.
+    fn close_editor_if(&mut self, gone: impl Fn(&str) -> bool) -> bool {
+        let stale = self
+            .edit_dialog
+            .as_ref()
+            .is_some_and(|dlg| dlg.existing && gone(&dlg.rule.rule_id));
+        if stale {
+            self.edit_dialog = None;
+        }
+        stale
     }
 
     /// Returns `true` if rule_profiles in config changed (needs save).
@@ -80,14 +106,15 @@ impl RulesTab {
                     self.status = msg;
                 }
                 FileDialogResult::ImportDone(Ok(configs)) => {
-                    let count = configs.len();
                     if let Ok(mut re) = rule_engine.lock() {
-                        for cfg in configs {
-                            re.add_rule(Rule::from_config(&cfg));
+                        let (rules, skipped) =
+                            crate::rules::prepare_import(configs, re.get_rules());
+                        self.status = import_summary(rules.len(), &skipped);
+                        *on_rules_changed |= !rules.is_empty();
+                        for rule in rules {
+                            re.add_rule(rule);
                         }
                     }
-                    *on_rules_changed = true;
-                    self.status = format!("Imported {count} rules.");
                 }
                 FileDialogResult::ImportDone(Err(e)) => {
                     self.status = e;
@@ -126,7 +153,7 @@ impl RulesTab {
                         ui.vertical(|ui| {
                             ui.label(format!("CPU {} · nice {} · I/O {}", effect.affinity.unwrap_or("unchanged"),
                                 effect.nice.map_or("unchanged".into(), |v| v.to_string()),
-                                effect.ionice.map_or("unchanged".into(), |(c,l)| format!("{c}:{l}"))));
+                                effect.ionice.map_or("unchanged".into(), |(c,l)| format!("{c}/{l}"))));
                             if effect.conflict { ui.colored_label(theme::sem(ui).warning, "Overlapping rules set different values"); }
                         });
                         ui.label(format!("CPU {} · nice {} · I/O {}", process.affinity, process.nice, process.ionice));
@@ -294,7 +321,7 @@ impl RulesTab {
                                             })
                                             .unwrap_or(false);
                                         let mut on = rule.enabled;
-                                        if theme::toggle(ui, &mut on) {
+                                        if theme::toggle(ui, &mut on, "Rule enabled") {
                                             toggle_rule_id = Some(rule_id.clone());
                                         }
                                     });
@@ -302,7 +329,18 @@ impl RulesTab {
                                         ui.label(RichText::new(&rule.name).color(row_color));
                                     });
                                     let (_, r2) = row.col(|ui| {
-                                        ui.label(RichText::new(&rule.pattern).color(row_color));
+                                        match rule.pattern_error() {
+                                            None => {
+                                                ui.label(RichText::new(&rule.pattern).color(row_color));
+                                            }
+                                            Some(e) => {
+                                                let warn = theme::sem(ui).warning;
+                                                ui.label(RichText::new(format!("⚠ {}", rule.pattern)).color(warn))
+                                                    .on_hover_text(format!(
+                                                        "Not a valid regular expression, so this rule matches nothing: {e}"
+                                                    ));
+                                            }
+                                        }
                                     });
                                     let (_, r3) = row.col(|ui| {
                                         theme::badge_outline(ui, rule.match_type.as_str());
@@ -331,11 +369,13 @@ impl RulesTab {
                                         );
                                     });
                                     let (_, r6) = row.col(|ui| {
-                                        let txt = match (rule.ionice_class, rule.ionice_level) {
-                                            (Some(c), Some(l)) => format!("cls {c} · {l}"),
-                                            (Some(c), None) => format!("cls {c}"),
-                                            (None, Some(l)) => format!("lvl {l}"),
-                                            (None, None) => "—".into(),
+                                        // What is enforced: a level without a class is not.
+                                        let txt = match rule.ionice_class.map(|c| {
+                                            crate::rules::ionice_target(c, rule.ionice_level)
+                                        }) {
+                                            Some((c @ (1 | 2), l)) => format!("cls {c} · {l}"),
+                                            Some((c, _)) => format!("cls {c}"),
+                                            None => "—".into(),
                                         };
                                         ui.label(
                                             RichText::new(txt)
@@ -396,7 +436,10 @@ impl RulesTab {
 
         self.selected_rule_id = new_sel;
         if let Some(rule) = open_edit {
-            self.edit_dialog = Some(RuleEditDialog::new(rule));
+            self.open_editor(rule, true);
+        }
+        if std::mem::take(&mut self.focus_editor) {
+            ctx.send_viewport_cmd_to(RuleEditDialog::viewport_id(), egui::ViewportCommand::Focus);
         }
         if let Some(id) = delete_rule_id {
             self.selected_rule_id = Some(id);
@@ -407,6 +450,10 @@ impl RulesTab {
                 if let Some(r) = re.get_rules_mut().iter_mut().find(|r| r.rule_id == id) {
                     r.enabled = !r.enabled;
                     *on_rules_changed = true;
+                    // Saving the open editor must not undo the switch.
+                    if let Some(dlg) = self.edit_dialog.as_mut().filter(|d| d.rule.rule_id == id) {
+                        dlg.rule.enabled = r.enabled;
+                    }
                 }
             }
         }
@@ -443,6 +490,7 @@ impl RulesTab {
                     re.remove_rule(&id);
                     *on_rules_changed = true;
                     self.selected_rule_id = None;
+                    self.close_editor_if(|edited| edited == id);
                 }
                 self.confirm_delete_rule = false;
             } else if cancelled {
@@ -450,8 +498,7 @@ impl RulesTab {
             }
         }
 
-        if self.confirm_load_profile {
-            let profile = self.selected_profile.clone();
+        if let Some(profile) = self.pending_profile.clone() {
             let mut confirmed = false;
             let mut cancelled = false;
             egui::Window::new("Load rule profile")
@@ -473,7 +520,7 @@ impl RulesTab {
                     });
                 });
             if confirmed {
-                if let Some(rules) = rule_profiles.get(&self.selected_profile) {
+                if let Some(rules) = rule_profiles.get(&profile) {
                     if let Ok(mut re) = rule_engine.lock() {
                         re.clear_rules();
                         for cfg in rules {
@@ -481,11 +528,16 @@ impl RulesTab {
                         }
                     }
                     *on_rules_changed = true;
-                    self.status = format!("Loaded profile '{}'.", self.selected_profile);
+                    self.status = if self.close_editor_if(|_| true) {
+                        format!("Loaded profile '{profile}' and closed the rule editor: the rule it was editing was replaced.")
+                    } else {
+                        format!("Loaded profile '{profile}'.")
+                    };
+                    self.selected_profile = profile;
                 }
-                self.confirm_load_profile = false;
+                self.pending_profile = None;
             } else if cancelled {
-                self.confirm_load_profile = false;
+                self.pending_profile = None;
             }
         }
 
@@ -523,14 +575,20 @@ impl RulesTab {
         // ── Dialogs ────────────────────────────────────────────────────────
         if let Some(ref mut dlg) = self.edit_dialog {
             if let Some(result) = dlg.show(ctx, opacity, &proc_names) {
+                let existing = dlg.existing;
                 self.edit_dialog = None;
                 if let Some(rule) = result {
                     if let Ok(mut re) = rule_engine.lock() {
                         let exists = re.get_rules().iter().any(|r| r.rule_id == rule.rule_id);
                         if exists {
                             re.update_rule(rule);
-                        } else {
+                        } else if !existing {
                             re.add_rule(rule);
+                        } else {
+                            self.status = format!(
+                                "Not saved: '{}' was removed while you edited it.",
+                                rule.name
+                            );
                         }
                         *on_rules_changed = true;
                     }
@@ -542,7 +600,7 @@ impl RulesTab {
             if let Some(result) = dlg.show(ctx, opacity) {
                 self.presets_dialog = None;
                 if let Some(rule) = result {
-                    self.edit_dialog = Some(RuleEditDialog::new(rule));
+                    self.open_editor(rule, false);
                 }
             }
         }
@@ -637,11 +695,13 @@ impl RulesTab {
                             .color(ui.visuals().weak_text_color()),
                     );
                 }
+                // Picking the current profile again loads it again,
+                // discarding edits made since. Nothing changes until the
+                // load is confirmed.
                 for name in &profile_names {
                     let picked = self.selected_profile == *name;
-                    if ui.selectable_label(picked, name.as_str()).clicked() && !picked {
-                        self.selected_profile = name.clone();
-                        self.confirm_load_profile = true;
+                    if ui.selectable_label(picked, name.as_str()).clicked() {
+                        self.pending_profile = Some(name.clone());
                     }
                 }
             });
@@ -750,5 +810,200 @@ impl RulesTab {
             };
             tx.send(FileDialogResult::ExportDone(msg)).ok();
         });
+    }
+}
+
+/// The status line after an import.
+fn import_summary(imported: usize, skipped: &[String]) -> String {
+    let rules = |n: usize| if n == 1 { "rule" } else { "rules" };
+    match skipped {
+        [] => format!("Imported {imported} {}.", rules(imported)),
+        [only] => format!("Imported {imported} {}; skipped {only}.", rules(imported)),
+        [first, rest @ ..] => format!(
+            "Imported {imported} {}; skipped {} — {first}, and {} more.",
+            rules(imported),
+            skipped.len(),
+            rest.len()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RuleConfig;
+    use std::collections::HashMap;
+
+    /// The rules tab rendered headless, clicked by accessible label.
+    struct Harness {
+        ctx: egui::Context,
+        engine: Arc<Mutex<RuleEngine>>,
+        profiles: HashMap<String, Vec<RuleConfig>>,
+        tab: RulesTab,
+    }
+
+    impl Harness {
+        fn new(rules: &[RuleConfig]) -> Self {
+            let ctx = egui::Context::default();
+            theme::apply_theme(&ctx, 1.0, &theme::AppTheme::BreezeDark);
+            ctx.enable_accesskit();
+            let mut engine = RuleEngine::new();
+            engine.load_rules(rules);
+            Self {
+                ctx,
+                engine: Arc::new(Mutex::new(engine)),
+                profiles: HashMap::new(),
+                tab: RulesTab::new(),
+            }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
+            let input = egui::RawInput {
+                events,
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 800.0),
+                )),
+                ..Default::default()
+            };
+            let (mut changed, mut profiles_changed) = (false, false);
+            let (tab, engine, profiles) = (&mut self.tab, &self.engine, &mut self.profiles);
+            self.ctx.run_ui(input, |root| {
+                egui::CentralPanel::default().show_inside(root, |ui| {
+                    let ctx = ui.ctx().clone();
+                    tab.show(
+                        ui,
+                        &ctx,
+                        engine,
+                        &mut changed,
+                        1.0,
+                        &[],
+                        profiles,
+                        &mut profiles_changed,
+                    );
+                });
+            })
+        }
+
+        fn click(&mut self, label: &str) {
+            // Windows are laid out, invisibly, in their first frame.
+            self.frame(vec![]);
+            let output = self.frame(vec![]);
+            let update = output
+                .platform_output
+                .accesskit_update
+                .expect("accesskit update");
+            let bounds = update
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .and_then(|(_, node)| node.bounds())
+                .unwrap_or_else(|| panic!("nothing labelled {label}"));
+            let pos = egui::pos2(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            );
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            self.frame(vec![egui::Event::PointerMoved(pos), button(true)]);
+            self.frame(vec![button(false)]);
+            self.frame(vec![]);
+        }
+    }
+
+    /// Open the editor on a saved rule. In the app it is a window of its
+    /// own; headless, egui would draw it over the tab and catch the clicks,
+    /// so it is kept from drawing.
+    fn edit_behind(tab: &mut RulesTab, rule: &RuleConfig) {
+        tab.open_editor(Rule::from_config(rule), true);
+        tab.edit_dialog.as_mut().unwrap().open = false;
+    }
+
+    fn rule(name: &str) -> RuleConfig {
+        RuleConfig {
+            name: name.into(),
+            pattern: name.into(),
+            ..RuleConfig::default()
+        }
+    }
+
+    /// Cancelling used to leave the profile selected although nothing was
+    /// loaded, so "Delete profile" then targeted it.
+    #[test]
+    fn cancelling_a_profile_load_changes_nothing() {
+        let mut h = Harness::new(&[rule("current")]);
+        h.profiles.insert("other".into(), vec![rule("from-other")]);
+        h.tab.pending_profile = Some("other".into());
+        h.click("Cancel");
+        assert_eq!(h.tab.pending_profile, None);
+        assert_eq!(h.tab.selected_profile, "");
+        assert_eq!(h.engine.lock().unwrap().get_rules()[0].name, "current");
+
+        h.tab.pending_profile = Some("other".into());
+        h.click("Load");
+        assert_eq!(h.tab.selected_profile, "other");
+        assert_eq!(h.engine.lock().unwrap().get_rules()[0].name, "from-other");
+    }
+
+    /// Saving an editor opened before a profile load used to put the old
+    /// profile's rule back among the new profile's rules.
+    #[test]
+    fn loading_a_profile_closes_the_editor_of_a_replaced_rule() {
+        let current = rule("current");
+        let mut h = Harness::new(std::slice::from_ref(&current));
+        h.profiles.insert("other".into(), vec![rule("from-other")]);
+        edit_behind(&mut h.tab, &current);
+        h.tab.pending_profile = Some("other".into());
+        h.click("Load");
+        assert!(h.tab.edit_dialog.is_none());
+        assert!(
+            h.tab.status.contains("closed the rule editor"),
+            "{}",
+            h.tab.status
+        );
+    }
+
+    /// Opening another editor used to replace the open one, unsaved edits
+    /// and all.
+    #[test]
+    fn a_second_editor_does_not_replace_unsaved_edits() {
+        let mut tab = RulesTab::new();
+        tab.open_add_dialog(None);
+        tab.edit_dialog.as_mut().unwrap().rule.name = "draft".into();
+        tab.open_add_dialog(Some(Rule::from_config(&rule("other"))));
+        assert_eq!(tab.edit_dialog.as_ref().unwrap().rule.name, "draft");
+        assert!(tab.focus_editor);
+        assert!(!tab.status.is_empty());
+    }
+
+    /// Switching a rule off in the table while its editor is open, then
+    /// saving the editor, used to switch it back on.
+    #[test]
+    fn the_table_switch_reaches_an_open_editor() {
+        let current = rule("current");
+        let mut h = Harness::new(std::slice::from_ref(&current));
+        edit_behind(&mut h.tab, &current);
+        h.click("Rule enabled");
+        assert!(!h.engine.lock().unwrap().get_rules()[0].enabled);
+        assert!(!h.tab.edit_dialog.as_ref().unwrap().rule.enabled);
+    }
+
+    #[test]
+    fn import_summary_names_what_was_skipped() {
+        assert_eq!(import_summary(3, &[]), "Imported 3 rules.");
+        let one = vec!["\"x\": nice 50 is outside -20 to 19".to_string()];
+        assert_eq!(
+            import_summary(1, &one),
+            "Imported 1 rule; skipped \"x\": nice 50 is outside -20 to 19."
+        );
+        let two = vec![one[0].clone(), "\"y\": it has no pattern".into()];
+        assert_eq!(
+            import_summary(0, &two),
+            "Imported 0 rules; skipped 2 — \"x\": nice 50 is outside -20 to 19, and 1 more."
+        );
     }
 }

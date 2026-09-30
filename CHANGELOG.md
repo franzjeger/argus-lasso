@@ -107,6 +107,81 @@ current source, release and verification status, see [docs/status.md](docs/statu
   graphics temperature, clocks, load and video memory, which it looked up under
   labels those drivers never use. With an integrated and a discrete GPU, every
   GPU value comes from the card with the most video memory instead of a mix.
+- A rule's nice value is no longer skipped for good on a process that reused the
+  PID of an earlier one whose change failed, and a new process's rule is applied
+  and logged once instead of twice.
+- The process table's "Suspended" badge and Pause/Resume menu follow the kernel's
+  process state. A process paused or resumed elsewhere shows correctly, and a new
+  process that reuses a paused one's PID is no longer shown as suspended.
+- Ending a process appears in the status bar's Recent events again. The messages
+  had been reworded and no longer matched what the event list looked for.
+- Picking a game from the Steam list now launches it. The app id kept its closing
+  quote (`steam -applaunch 620"`), so the launcher rejected the command; names
+  showed the stray quote too. Lutris names containing `|` are no longer split,
+  and the Lutris database is read read-only.
+- Rules that match the same process no longer undo each other: the last matching
+  rule to set a value wins, as the rules tab already showed, and the value is
+  changed once instead of on every pass. I/O priority failures are reported once
+  instead of retried silently forever, the "none" I/O class no longer sends a
+  level the kernel rejects, and I/O priority is read only for processes a rule
+  sets it on. An affinity naming parked CPUs is no longer re-applied every pass.
+- Disabling, deleting or editing a rule puts back the affinity, nice value and
+  I/O priority it set, and clearing the default affinity releases the processes
+  it pinned; before, they kept the values until they exited. A value changed
+  since by something else, such as a manual change, is left alone.
+- Importing rules gives each one its own ID, so importing an export of the current
+  rules no longer creates twins that toggle, edit and delete together. Rules the
+  kernel would refuse or clamp (nice 50, CPU list "abc", an invalid regular
+  expression, I/O level 8) are skipped and named in the status line.
+- The rule editor shows why a regular expression is invalid and does not save it,
+  names the I/O classes, and offers a level only for real-time and best-effort. A
+  rule with an I/O class but no level is enforced at level 4, as the editor showed,
+  instead of 0. A rule saved without a name takes its pattern as the name. Rules
+  with an invalid pattern are marked in the table.
+- Opening a second rule editor brings the open one to the front instead of
+  discarding its unsaved edits. Switching a rule on or off in the table while
+  it is being edited is kept when the editor is saved, and deleting the rule or
+  loading a profile closes its editor instead of letting Save bring the old
+  rule back.
+- Cancelling a profile load leaves the previous profile selected, so "Delete
+  profile" no longer targets the one that was not loaded. The current profile
+  can be picked again to reload it.
+- Governor and EPP changes the kernel refuses are reported as failures with its
+  reason, instead of as success: the power helper (v6, asks to be reinstalled)
+  no longer ignores refused writes, and Settings checks what the kernel reports
+  afterwards. Settings follows governor and EPP changed elsewhere (Gaming → Power
+  profile, or EPP following a governor change) instead of showing and comparing
+  against the values from startup, and keeps a choice not yet applied. Power
+  changes in Settings and Gaming run in the background, so the window keeps
+  responding while an authentication dialog is open.
+- After an update or rollback is installed, "Check now" waits for the restart.
+  Checking from the old process offered the just-installed release again and
+  hid "Restart now", and installing it a second time saved the new binary as
+  the previous one, so "Restore previous app and overlay" restored the update.
+- Window opacity without the compositor's alpha modifier (X11, or compositors
+  without `wp_alpha_modifier_v1`) is applied at startup and kept through theme
+  changes and Apply, instead of only while the slider moves.
+- Showing or hiding the HUD with `argus-lasso toggle-overlay` or the shortcut is
+  reflected in Gaming → Overlay, and changing another overlay setting afterwards
+  no longer turns the HUD back to what the Gaming page last knew.
+- "Compare latest two" compares the two latest recordings, earlier as A and later
+  as B, so an improvement shows as a gain. It used to pick the two newest files,
+  which could be parts of one recording when the game recreated its swapchain,
+  with the newest as A. Proton and Wine recordings are named after the game's
+  Windows program instead of `wine64-preloader`. "Stop recording" no longer
+  starts a new recording when the last one has just run out.
+- ProBalance's cgroup method works with a hard quota on desktops where the cpu
+  controller is not enabled for the app slice: the original quota is read from
+  systemd instead of a `cpu.max` file that does not exist there. A throttle
+  never gives a unit more CPU (an `idle` weight or a lower quota stays), a
+  closed app's unit is no longer retried every second forever, and throttles
+  left by a crash or kill are restored by the next run instead of being taken
+  for the units' own settings. Only application and background units are
+  throttled, never the desktop's own session services, and only the unit that
+  owns the process's cgroup. `systemctl` calls time out after 5 seconds.
+- A recording's frametime graph keeps its shape to the end when the recording had
+  failed presents, instead of collapsing everything after the summed duration
+  into a single point.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.
@@ -162,6 +237,14 @@ current source, release and verification status, see [docs/status.md](docs/statu
   without changing exemptions or priority settings.
 
 ### Changed
+
+- The tray menu has "Open Argus-Lasso", and a left click on the tray icon does
+  the same. Launching Argus from the app menu while it already runs brings the
+  running window to the front instead of only printing "already running".
+
+- Screen readers can use the hand-drawn controls: the page tabs, filter chips,
+  on/off switches, segmented choices and CPU thread tiles now report their name
+  and state. The process filter chips explain themselves on hover.
 
 - "Enable in-game overlay" is a checkbox like the setting below it; while off it
   used to look like plain text. The process filter's hint fits its field, with

@@ -74,6 +74,9 @@ pub struct GamingModeTab {
     pub section: GamingSection,
     overlay_install_status: String,
     pub config: Config,
+    /// The shared overlay visibility as this tab last took it (see
+    /// `follow_overlay_shown`).
+    overlay_shown_seen: bool,
     pub topo: Option<CpuTopology>,
     pub topo_description: String,
     /// Mirrors the daemon, which owns Gaming Mode (see `sync_gaming_state`).
@@ -129,6 +132,10 @@ pub struct GamingModeTab {
     /// auth dialog can stay open for minutes, so installing synchronously
     /// would freeze the whole UI.
     install_result_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// A power profile change in progress; pkexec runs off the UI thread.
+    power_profile_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// When the governor/EPP shown was read; Settings can change them too.
+    power_read_at: std::time::Instant,
     steam_picker: Option<crate::gui::dialogs::SteamGamePickerDialog>,
     lutris_picker: Option<crate::gui::dialogs::LutrisGamePickerDialog>,
 
@@ -162,6 +169,7 @@ impl GamingModeTab {
         let helper_ok = is_helper_current() && is_helper_authorized();
 
         let mut tab = Self {
+            overlay_shown_seen: config.gaming_mode.overlay.show_overlay,
             config,
             topo: Some(topo),
             topo_description,
@@ -191,6 +199,8 @@ impl GamingModeTab {
             power_status_text: String::new(),
             power_governor: String::new(),
             install_result_rx: None,
+            power_profile_rx: None,
+            power_read_at: std::time::Instant::now(),
             steam_picker: None,
             lutris_picker: None,
             section: GamingSection::default(),
@@ -227,6 +237,7 @@ impl GamingModeTab {
     }
 
     fn refresh_power_status(&mut self) {
+        self.power_read_at = std::time::Instant::now();
         let gov = cpu_park::current_governor().unwrap_or_else(|| "?".into());
         self.power_status_text = match cpu_park::current_epp() {
             Some(epp) => format!("current: {gov} / {epp}"),
@@ -425,6 +436,25 @@ impl GamingModeTab {
         }
     }
 
+    /// Overlay visibility also changes outside this tab, from the CLI and
+    /// the shortcut. Take the shared value every frame, so the checkbox
+    /// shows it and later edits do not carry a stale one.
+    pub fn follow_overlay_shown(&mut self, shared: bool) {
+        self.config.gaming_mode.overlay.show_overlay = shared;
+        self.overlay_shown_seen = shared;
+    }
+
+    /// The overlay visibility to store with a config this tab sent: its own
+    /// if it changed the value since it last took the shared one, otherwise
+    /// the shared value, which may have changed in between.
+    pub fn overlay_shown(&self, sent: bool, shared: bool) -> bool {
+        if sent != self.overlay_shown_seen {
+            sent
+        } else {
+            shared
+        }
+    }
+
     pub fn overlay_window(&mut self, ctx: &egui::Context, opacity: f32) -> bool {
         crate::gui::overlay_settings::window(
             ctx,
@@ -453,6 +483,27 @@ impl GamingModeTab {
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     // keep repainting while we wait for the auth dialog
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+
+        if self.power_profile_rx.is_none()
+            && self.power_read_at.elapsed() >= std::time::Duration::from_secs(2)
+        {
+            self.refresh_power_status();
+        }
+        if let Some(rx) = &self.power_profile_rx {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    self.append_log(msg);
+                    self.refresh_power_status();
+                    self.power_profile_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.power_profile_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
                     ctx.request_repaint_after(std::time::Duration::from_millis(250));
                 }
             }
@@ -667,13 +718,17 @@ impl GamingModeTab {
                             "powersave" => 2,
                             _ => 1,
                         };
-                        ui.add_enabled_ui(self.helper_ok, |ui| {
+                        let idle = self.power_profile_rx.is_none();
+                        ui.add_enabled_ui(self.helper_ok && idle, |ui| {
                             if let Some(i) =
                                 th::segmented(ui, &["Performance", "Balanced", "Power save"], sel)
                             {
-                                let (_ok, msg) = cpu_park::apply_power_profile(profiles[i]);
-                                self.append_log(msg);
-                                self.refresh_power_status();
+                                let (tx, rx) = std::sync::mpsc::channel();
+                                self.power_profile_rx = Some(rx);
+                                let profile = profiles[i];
+                                std::thread::spawn(move || {
+                                    let _ = tx.send(cpu_park::apply_power_profile(profile).1);
+                                });
                             }
                         });
                         ui.add_space(tokens::SPACE_S);
@@ -1119,6 +1174,16 @@ fn core_map(
                 egui::Sense::hover()
             },
         );
+        if clickable {
+            resp.widget_info(|| {
+                egui::WidgetInfo::selected(
+                    egui::WidgetType::Checkbox,
+                    true,
+                    kept,
+                    format!("Keep CPU {cpu} online"),
+                )
+            });
+        }
         if resp.clicked() {
             let v = checks.entry(cpu).or_insert(true);
             *v = !*v;
@@ -1279,5 +1344,29 @@ mod launcher_tests {
         );
         assert!(parse_launch_command("game 'unterminated").is_err());
         assert!(parse_launch_command("  ").is_err());
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::GamingModeTab;
+
+    /// `argus-lasso toggle-overlay` hid the HUD, then the next change to any
+    /// overlay setting sent this tab's stale copy and showed it again.
+    #[test]
+    fn a_toggle_made_elsewhere_survives_the_next_overlay_edit() {
+        let mut config = crate::config::Config::default();
+        config.gaming_mode.overlay.show_overlay = true;
+        let mut tab = GamingModeTab::new(config);
+
+        // The CLI hides it; the next frame takes that over.
+        tab.follow_overlay_shown(false);
+        assert!(!tab.config.gaming_mode.overlay.show_overlay);
+
+        // An edit of another setting sends `false` back unchanged, while
+        // the shortcut has meanwhile shown it again: the shared value wins.
+        assert!(tab.overlay_shown(false, true));
+        // The user switching it on in this tab wins over the shared value.
+        assert!(tab.overlay_shown(true, false));
     }
 }

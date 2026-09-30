@@ -39,10 +39,15 @@ pub struct SettingsTab {
     pub available_governors: Vec<String>,
     pub cpu_epp: String,
     pub available_epps: Vec<String>,
-    /// Governor/EPP as last applied to sysfs.
+    /// Governor/EPP as sysfs last reported them.
     saved_governor: String,
     saved_epp: String,
     pub power_status: String,
+    /// A governor/EPP change in progress: pkexec can wait on an
+    /// authentication dialog, so it runs off the UI thread.
+    power_job: Option<std::sync::mpsc::Receiver<Vec<String>>>,
+    /// When sysfs was last read for changes made outside this tab.
+    power_synced: Option<std::time::Instant>,
     /// Detected CPU topology — drives dynamic quick-buttons
     pub topo: CpuTopology,
 }
@@ -77,6 +82,8 @@ impl SettingsTab {
             cpu_epp: epp,
             available_epps: read_available_epps(),
             power_status: String::new(),
+            power_job: None,
+            power_synced: None,
             topo: detect_topology(),
         }
     }
@@ -149,24 +156,20 @@ impl SettingsTab {
         self.config.ui.theme = self.theme.to_str().into();
         theme::apply_theme(ctx, self.native_ppp, &self.theme);
 
-        // CPU power
-        if !self.available_governors.is_empty() && self.cpu_governor != self.saved_governor {
-            match set_governor(&self.cpu_governor) {
-                Ok(_) => {
-                    msgs.push(format!("Governor → {}", self.cpu_governor));
-                    self.saved_governor = self.cpu_governor.clone();
-                }
-                Err(e) => msgs.push(format!("Governor failed: {e}")),
-            }
-        }
-        if !self.available_epps.is_empty() && self.cpu_epp != self.saved_epp {
-            match set_epp(&self.cpu_epp) {
-                Ok(_) => {
-                    msgs.push(format!("EPP → {}", self.cpu_epp));
-                    self.saved_epp = self.cpu_epp.clone();
-                }
-                Err(e) => msgs.push(format!("EPP failed: {e}")),
-            }
+        // CPU power, reported when done (see poll_power).
+        let governor = (!self.available_governors.is_empty()
+            && self.cpu_governor != self.saved_governor)
+            .then(|| self.cpu_governor.clone());
+        let epp = (!self.available_epps.is_empty() && self.cpu_epp != self.saved_epp)
+            .then(|| self.cpu_epp.clone());
+        if (governor.is_some() || epp.is_some()) && self.power_job.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.power_job = Some(rx);
+            self.power_status = "Applying CPU power settings…".into();
+            msgs.push(self.power_status.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(apply_power(governor, epp));
+            });
         }
 
         // Autostart
@@ -195,6 +198,47 @@ impl SettingsTab {
         self.config.clone()
     }
 
+    /// Collect a finished governor/EPP change. Until it is done the choice
+    /// stays unsaved, and a refused one stays that way so it can be retried
+    /// or discarded.
+    fn poll_power(&mut self, ctx: &egui::Context) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(job) = &self.power_job else {
+            return;
+        };
+        let msgs = match job.try_recv() {
+            Ok(msgs) => msgs,
+            Err(TryRecvError::Disconnected) => vec!["CPU power change failed".into()],
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            }
+        };
+        self.power_job = None;
+        self.sync_power();
+        self.power_status = msgs.join("  ·  ");
+        self.status = self.power_status.clone();
+    }
+
+    /// Follow governor and EPP as the kernel reports them. Gaming → Power
+    /// profile changes both, and a governor change can change EPP; a choice
+    /// the user has not applied yet is kept.
+    fn sync_power(&mut self) {
+        self.follow_power(read_governor(), read_epp());
+    }
+
+    fn follow_power(&mut self, governor: String, epp: String) {
+        if self.cpu_governor == self.saved_governor {
+            self.cpu_governor = governor.clone();
+        }
+        if self.cpu_epp == self.saved_epp {
+            self.cpu_epp = epp.clone();
+        }
+        self.saved_governor = governor;
+        self.saved_epp = epp;
+        self.power_synced = Some(std::time::Instant::now());
+    }
+
     /// Returns Some(updated_config) when "Apply changes" is clicked.
     pub fn show(
         &mut self,
@@ -204,6 +248,13 @@ impl SettingsTab {
         updates: &mut crate::updater::UpdateState,
     ) -> Option<Config> {
         let mut applied: Option<Config> = None;
+        self.poll_power(ctx);
+        let stale = self
+            .power_synced
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
+        if self.section == SettingsSection::Power && self.power_job.is_none() && stale {
+            self.sync_power();
+        }
 
         crate::gui::theme::section_nav(
             ui,
@@ -401,6 +452,7 @@ impl SettingsTab {
                                         .color(ui.visuals().weak_text_color()),
                                 );
                             } else {
+                                ui.add_enabled_ui(self.power_job.is_none(), |ui| {
                                 egui::ComboBox::from_id_salt("gov_picker")
                                     .selected_text(&self.cpu_governor)
                                     .show_ui(ui, |ui| {
@@ -412,6 +464,7 @@ impl SettingsTab {
                                             );
                                         }
                                     });
+                                });
                             }
                         });
 
@@ -423,6 +476,7 @@ impl SettingsTab {
                                         .color(ui.visuals().weak_text_color()),
                                 );
                             } else {
+                                ui.add_enabled_ui(self.power_job.is_none(), |ui| {
                                 egui::ComboBox::from_id_salt("epp_picker")
                                     .selected_text(&self.cpu_epp)
                                     .show_ui(ui, |ui| {
@@ -434,6 +488,7 @@ impl SettingsTab {
                                             );
                                         }
                                     });
+                                });
                             }
                         });
 
@@ -531,7 +586,14 @@ impl SettingsTab {
                                 "Check now"
                             };
                             if ui
-                                .add_enabled(!updates.busy, egui::Button::new(label))
+                                .add_enabled(
+                                    !updates.busy && !updates.installed,
+                                    egui::Button::new(label),
+                                )
+                                .on_disabled_hover_text(
+                                    "Restart Argus first: it is still running the version \
+                                     it replaced.",
+                                )
                                 .clicked()
                             {
                                 updates.start_check();
@@ -659,6 +721,31 @@ fn write_sysfs_all_cpus_at(
     } else {
         Ok(())
     }
+}
+
+/// Set the governor, then EPP (a governor change can reset EPP), and say
+/// what the kernel ended up with. Runs off the UI thread.
+fn apply_power(governor: Option<String>, epp: Option<String>) -> Vec<String> {
+    let mut msgs = Vec::new();
+    let mut report = |what: &str, wanted: &str, set: Result<(), String>, now: String| {
+        msgs.push(match set {
+            Err(e) => format!("{what} {wanted} failed: {e}"),
+            Ok(()) if now != wanted => format!("{what} {wanted} did not take effect (still {now})"),
+            Ok(()) => format!("{what} → {wanted}"),
+        });
+    };
+    if let Some(governor) = governor {
+        report(
+            "Governor",
+            &governor,
+            set_governor(&governor),
+            read_governor(),
+        );
+    }
+    if let Some(epp) = epp {
+        report("EPP", &epp, set_epp(&epp), read_epp());
+    }
+    msgs
 }
 
 fn set_governor(governor: &str) -> Result<(), String> {
@@ -937,5 +1024,28 @@ mod tests {
         });
         assert_eq!(result, Err("helper unavailable".to_string()));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Gaming → Power profile changes governor and EPP behind this tab's
+    /// back; the tab used to keep showing, and comparing against, what it
+    /// read at startup.
+    #[test]
+    fn power_settings_follow_the_kernel_but_keep_an_unapplied_choice() {
+        let mut tab = super::SettingsTab::new(crate::config::Config::default());
+        tab.follow_power("powersave".into(), "balance_power".into());
+        tab.follow_power("performance".into(), "performance".into());
+        assert_eq!(tab.cpu_governor, "performance");
+        assert_eq!(tab.cpu_epp, "performance");
+        assert!(!tab.is_dirty());
+
+        tab.cpu_governor = "powersave".into();
+        tab.follow_power("performance".into(), "balance_performance".into());
+        assert_eq!(tab.cpu_governor, "powersave", "the user's choice stays");
+        assert_eq!(tab.cpu_epp, "balance_performance");
+        assert!(tab.is_dirty(), "and can still be applied");
+
+        // Applied, and the kernel took it.
+        tab.follow_power("powersave".into(), "balance_performance".into());
+        assert!(!tab.is_dirty());
     }
 }

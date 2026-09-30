@@ -62,7 +62,11 @@ pub fn open_regular(path: &Path) -> io::Result<File> {
 }
 
 pub fn read_control() -> Control {
-    read_regular_capped(&directory().join("control.json"), 4096)
+    read_control_in(&directory())
+}
+
+fn read_control_in(dir: &Path) -> Control {
+    read_regular_capped(&dir.join("control.json"), 4096)
         .ok()
         .flatten()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -81,12 +85,28 @@ impl Control {
                 < u64::from(self.duration_seconds.clamp(5, 600)) * 1000
     }
 }
+/// Start a recording if none is running, or stop the running one: what the
+/// CLI and the shortcut do, not knowing which it is.
 pub fn toggle(duration_seconds: u32) -> io::Result<Control> {
-    let dir = directory();
+    update(&directory(), duration_seconds, |old| !old.is_active())
+}
+
+/// Start or stop recording. A button labelled from a scan up to a second
+/// old must not toggle: "Stop" just after a recording ran out would start a
+/// new one. Already in that state, nothing is written.
+pub fn set_active(active: bool, duration_seconds: u32) -> io::Result<Control> {
+    update(&directory(), duration_seconds, |_| active)
+}
+
+fn update(
+    dir: &Path,
+    duration_seconds: u32,
+    active: impl FnOnce(&Control) -> bool,
+) -> io::Result<Control> {
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(&dir)?;
+        .create(dir)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -95,12 +115,16 @@ pub fn toggle(duration_seconds: u32) -> io::Result<Control> {
         .mode(0o600)
         .open(dir.join("control.lock"))?;
     lock.lock()?;
-    let old = read_control();
+    let old = read_control_in(dir);
+    let active = active(&old);
+    if active == old.is_active() {
+        return Ok(Control { active, ..old });
+    }
     let _ = fs::remove_file(dir.join("latest-error.txt"));
     let now = now_ms();
     let c = Control {
         session: format!("{now}-{}", std::process::id()),
-        active: !old.is_active(),
+        active,
         started_unix_ms: now,
         duration_seconds: duration_seconds.clamp(5, 600),
     };
@@ -134,6 +158,12 @@ pub struct Summary {
     pub failed_presents: u64,
     pub complete: bool,
 }
+/// The file name of a program path, Unix or Windows: Wine and Proton
+/// games are recorded by their Windows path (`Z:\\games\\Game.exe`).
+pub fn program_file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
 pub fn statistics(intervals_ns: &mut [u64]) -> (Option<f64>, Option<f64>, Option<f64>) {
     if intervals_ns.is_empty() {
         return (None, None, None);
@@ -273,6 +303,45 @@ mod tests {
         let path = temp_path("argus-ipc-summary-missing");
         let _ = std::fs::remove_file(&path);
         assert_eq!(read_summary_capped(&path), None);
+    }
+
+    /// The recordings page's "Stop" is labelled from a scan up to a second
+    /// old; toggling then started a new recording if the last one had just
+    /// run out.
+    #[test]
+    fn stopping_a_recording_that_ran_out_starts_nothing() {
+        let dir = temp_path("argus-ipc-control");
+        let _ = std::fs::remove_dir_all(&dir);
+        let started = update(&dir, 5, |_| true).unwrap();
+        assert!(started.is_active());
+        // It runs out.
+        let mut expired = started.clone();
+        expired.started_unix_ms -= 10_000;
+        std::fs::write(
+            dir.join("control.json"),
+            serde_json::to_vec(&expired).unwrap(),
+        )
+        .unwrap();
+
+        let stopped = update(&dir, 5, |_| false).unwrap();
+        assert!(!stopped.is_active());
+        assert!(!read_control_in(&dir).is_active());
+        assert_eq!(
+            read_control_in(&dir).session,
+            started.session,
+            "nothing written"
+        );
+
+        let toggled = update(&dir, 5, |old| !old.is_active()).unwrap();
+        assert!(toggled.is_active(), "the CLI toggle still starts one");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn program_file_names_of_both_kinds_of_path() {
+        assert_eq!(program_file_name("/usr/bin/vkcube"), "vkcube");
+        assert_eq!(program_file_name("Z:\\games\\Game\\game.exe"), "game.exe");
+        assert_eq!(program_file_name("game.exe"), "game.exe");
     }
 
     #[test]

@@ -99,7 +99,7 @@ impl HwMonitorTab {
                         .size(tokens::FONT_LABEL)
                         .color(ui.visuals().weak_text_color()),
                 );
-                theme::toggle(ui, &mut self.show_sparklines);
+                theme::toggle(ui, &mut self.show_sparklines, "Show sparklines");
             });
         });
     }

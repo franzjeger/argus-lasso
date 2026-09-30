@@ -733,6 +733,8 @@ impl IoNiceDialog {
 pub struct RuleEditDialog {
     pub open: bool,
     pub rule: Rule,
+    /// Editing a saved rule, as opposed to one that is saved as new.
+    pub existing: bool,
     pub affinity_enabled: bool,
     pub nice_enabled: bool,
     pub ionice_enabled: bool,
@@ -741,7 +743,11 @@ pub struct RuleEditDialog {
 }
 
 impl RuleEditDialog {
-    pub fn new(template: Rule) -> Self {
+    pub fn viewport_id() -> ViewportId {
+        ViewportId::from_hash_of("rule_edit_dialog")
+    }
+
+    pub fn new(template: Rule, existing: bool) -> Self {
         let affinity_enabled = template.affinity.is_some();
         let nice_enabled = template.nice.is_some();
         let ionice_enabled = template.ionice_class.is_some();
@@ -750,6 +756,7 @@ impl RuleEditDialog {
             open: true,
             affinity_picker: AffinityPicker::new(picker_init),
             rule: template,
+            existing,
             affinity_enabled,
             nice_enabled,
             ionice_enabled,
@@ -783,7 +790,7 @@ impl RuleEditDialog {
             let picker = &mut self.affinity_picker;
 
             ctx.show_viewport_immediate(
-                ViewportId::from_hash_of("rule_edit_dialog"),
+                Self::viewport_id(),
                 ViewportBuilder::default()
                     .with_title(title_str)
                     .with_app_id("argus-lasso")
@@ -837,10 +844,14 @@ impl RuleEditDialog {
                                     // affinity restriction at all) — visible
                                     // intent and saved result must not
                                     // diverge like that.
+                                    // A regex that does not compile matches
+                                    // nothing either.
                                     let affinity_would_be_empty =
                                         *affinity_enabled && picker.cpulist().is_empty();
-                                    let can_save =
-                                        !rule.pattern.is_empty() && !affinity_would_be_empty;
+                                    rule.refresh_pattern_caches();
+                                    let can_save = !rule.pattern.is_empty()
+                                        && rule.pattern_error().is_none()
+                                        && !affinity_would_be_empty;
                                     if ui.add_enabled(can_save, save).clicked() {
                                         close_as = Some(true);
                                     }
@@ -892,7 +903,7 @@ impl RuleEditDialog {
                             // describes — the whole point of the pattern is
                             // what it currently catches.
                             th::form_row_w(ui, LW, "", |ui| {
-                                let (msg, color) = match_summary(rule, proc_names, s.ok, ui);
+                                let (msg, color) = match_summary(rule, proc_names, &s, ui);
                                 ui.label(
                                     egui::RichText::new(msg)
                                         .size(tokens::FONT_HELP)
@@ -941,14 +952,24 @@ impl RuleEditDialog {
 
                             action_row(ui, LW, ionice_enabled, "I/O priority", |ui, on| {
                                 let class = rule.ionice_class.get_or_insert(2);
-                                ui.add_enabled(on, egui::DragValue::new(class).range(0..=3));
-                                ui.label(
-                                    egui::RichText::new("class, level")
-                                        .size(tokens::FONT_HELP)
-                                        .color(ui.visuals().weak_text_color()),
-                                );
+                                ui.add_enabled_ui(on, |ui| {
+                                    egui::ComboBox::from_id_salt("ionice_class")
+                                        .selected_text(ionice_class_name(*class))
+                                        .width(150.0)
+                                        .show_ui(ui, |ui| {
+                                            for c in 0..=3 {
+                                                ui.selectable_value(class, c, ionice_class_name(c));
+                                            }
+                                        });
+                                });
+                                // Only real-time and best-effort have levels.
+                                let leveled = matches!(*class, 1 | 2);
                                 let level = rule.ionice_level.get_or_insert(4);
-                                ui.add_enabled(on, egui::DragValue::new(level).range(0..=7));
+                                ui.add_enabled(
+                                    on && leveled,
+                                    egui::DragValue::new(level).range(0..=7).prefix("level "),
+                                )
+                                .on_hover_text("0 is the highest priority, 7 the lowest");
                             });
                         });
                     });
@@ -975,6 +996,12 @@ impl RuleEditDialog {
                 if !self.ionice_enabled {
                     self.rule.ionice_class = None;
                     self.rule.ionice_level = None;
+                } else if !matches!(self.rule.ionice_class, Some(1 | 2)) {
+                    self.rule.ionice_level = None;
+                }
+                // The name is how the table and the log refer to the rule.
+                if self.rule.name.trim().is_empty() {
+                    self.rule.name = self.rule.pattern.clone();
                 }
                 self.rule.refresh_pattern_caches();
                 self.result = Some(Some(self.rule.clone()));
@@ -985,6 +1012,17 @@ impl RuleEditDialog {
             }
         }
         None
+    }
+}
+
+/// A name for an I/O scheduling class number.
+pub fn ionice_class_name(class: i32) -> &'static str {
+    match class {
+        0 => "None (follows nice)",
+        1 => "Real-time",
+        2 => "Best-effort",
+        3 => "Idle",
+        _ => "Unknown",
     }
 }
 
@@ -1018,7 +1056,7 @@ fn action_row(
 fn match_summary(
     rule: &Rule,
     proc_names: &[String],
-    ok_color: egui::Color32,
+    sem: &crate::gui::theme::Sem,
     ui: &egui::Ui,
 ) -> (String, egui::Color32) {
     if rule.pattern.is_empty() {
@@ -1028,10 +1066,13 @@ fn match_summary(
         );
     }
     // Match against a probe rule so the live count uses exactly the same
-    // logic the engine will, including an invalid regex matching nothing.
+    // logic the engine will.
     let mut probe = rule.clone();
     probe.enabled = true;
     probe.refresh_pattern_caches();
+    if let Some(e) = probe.pattern_error() {
+        return (format!("Not a valid regular expression: {e}"), sem.negative);
+    }
     let hits: Vec<&String> = proc_names
         .iter()
         .filter(|n| {
@@ -1059,7 +1100,7 @@ fn match_summary(
             if hits.len() == 1 { "" } else { "es" },
             sample.join(", ")
         ),
-        ok_color,
+        sem.ok,
     )
 }
 
@@ -1428,7 +1469,7 @@ impl SteamGamePickerDialog {
             result: None,
             loaded: false,
         };
-        dlg.games = scan_steam_library();
+        dlg.games = crate::game_library::steam_games();
         dlg.loaded = true;
         dlg
     }
@@ -1544,79 +1585,6 @@ impl SteamGamePickerDialog {
     }
 }
 
-fn scan_steam_library() -> Vec<(String, String)> {
-    use std::path::PathBuf;
-    let Some(home) = crate::config::home_dir() else {
-        return Vec::new();
-    };
-    let roots = vec![
-        PathBuf::from(&home).join(".steam/steam"),
-        PathBuf::from(&home).join(".local/share/Steam"),
-    ];
-    let mut seen = std::collections::HashSet::new();
-    let mut lib_dirs: Vec<PathBuf> = Vec::new();
-    for root in roots {
-        if let Ok(resolved) = root.canonicalize() {
-            if seen.insert(resolved.clone()) {
-                lib_dirs.push(resolved.join("steamapps"));
-            }
-        }
-    }
-    // Parse libraryfolders.vdf for additional paths
-    let extra: Vec<_> = lib_dirs.clone();
-    for lib in extra {
-        let vdf = lib.join("libraryfolders.vdf");
-        if let Ok(text) = std::fs::read_to_string(&vdf) {
-            for cap in text.lines() {
-                if cap.contains("\"path\"") {
-                    if let Some(p) = cap.split('"').nth(3) {
-                        let apps = PathBuf::from(p).join("steamapps");
-                        if let Ok(r) = apps.canonicalize() {
-                            if seen.insert(r.clone()) {
-                                lib_dirs.push(r);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let mut games: std::collections::HashMap<String, String> = Default::default();
-    for apps_dir in &lib_dirs {
-        if let Ok(entries) = std::fs::read_dir(apps_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let fname = name.to_string_lossy();
-                if fname.starts_with("appmanifest_") && fname.ends_with(".acf") {
-                    if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                        let appid = extract_vdf_field(&text, "appid");
-                        let gname = extract_vdf_field(&text, "name");
-                        if let (Some(id), Some(n)) = (appid, gname) {
-                            games.insert(id, n);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let mut sorted: Vec<_> = games.into_iter().collect();
-    sorted.sort_by_key(|a| a.1.to_lowercase());
-    sorted
-}
-
-fn extract_vdf_field(text: &str, field: &str) -> Option<String> {
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with(&format!("\"{field}\"")) {
-            let parts: Vec<_> = trimmed.splitn(4, '"').collect();
-            if parts.len() >= 4 {
-                return Some(parts[3].to_string());
-            }
-        }
-    }
-    None
-}
-
 // ── LutrisGamePickerDialog ────────────────────────────────────────────────────
 
 pub struct LutrisGamePickerDialog {
@@ -1630,7 +1598,7 @@ pub struct LutrisGamePickerDialog {
 
 impl LutrisGamePickerDialog {
     pub fn new() -> Self {
-        let (games, status) = scan_lutris_library();
+        let (games, status) = crate::game_library::lutris_games();
         Self {
             open: true,
             games,
@@ -1745,48 +1713,5 @@ impl LutrisGamePickerDialog {
             return Some(None);
         }
         None
-    }
-}
-
-fn scan_lutris_library() -> (Vec<(String, String)>, String) {
-    let Some(home) = crate::config::home_dir() else {
-        return (vec![], "Home directory unknown.".into());
-    };
-    let db = format!("{}/.local/share/lutris/pga.db", home.display());
-    if !std::path::Path::new(&db).exists() {
-        return (vec![], "Lutris database not found.".into());
-    }
-    // We don't want to pull in rusqlite; parse the sqlite file via the sqlite3 CLI.
-    let output = std::process::Command::new("sqlite3")
-        .args([
-            &db,
-            "SELECT name,slug,runner FROM games WHERE installed=1 ORDER BY name COLLATE NOCASE",
-        ])
-        .output();
-    match output {
-        Ok(o) if o.status.success() => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            let games: Vec<(String, String)> = text
-                .lines()
-                .filter_map(|line| {
-                    let parts: Vec<_> = line.splitn(3, '|').collect();
-                    if parts.len() == 3 {
-                        let name = parts[0].trim().to_string();
-                        let slug = parts[1].trim().to_string();
-                        let runner = parts[2].trim().to_string();
-                        Some((slug, format!("{name}  [{runner}]")))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let count = games.len();
-            (games, format!("{count} installed games found"))
-        }
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            (vec![], format!("sqlite3 error: {err}"))
-        }
-        Err(e) => (vec![], format!("sqlite3 not found: {e}")),
     }
 }

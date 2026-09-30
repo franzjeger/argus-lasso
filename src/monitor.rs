@@ -19,7 +19,7 @@ use crate::config::Config;
 use crate::cpu_park;
 use crate::hw_monitor::{HwCollector, HwMonitorData};
 use crate::probalance::{ProBalance, ProcSnapshot};
-use crate::rules::RuleEngine;
+use crate::rules::{Policy, RuleEngine, RuleState, Target};
 use crate::utils;
 
 // ── Commands from GUI → daemon ────────────────────────────────────────────────
@@ -90,6 +90,9 @@ pub struct ProcInfo {
     /// start time. Callers that track a pid across scans (e.g. Gaming Mode's
     /// nice-restore list) should key on (pid, start_ticks), not pid alone.
     pub start_ticks: u64,
+    /// Stopped by a signal (state T), as "Pause process" does. From the
+    /// kernel, so a pause or resume made elsewhere shows too.
+    pub stopped: bool,
 }
 
 impl Default for ProcInfo {
@@ -108,6 +111,7 @@ impl Default for ProcInfo {
             disk_write_bps: 0,
             cmdline: std::sync::Arc::new(String::new()),
             start_ticks: 0,
+            stopped: false,
         }
     }
 }
@@ -155,8 +159,6 @@ pub struct AppState {
     pub proc_cpu_history: HashMap<u32, std::collections::VecDeque<f32>>,
     /// CPU model string from /proc/cpuinfo
     pub cpu_model: String,
-    /// PIDs manually suspended via SIGSTOP from the GUI
-    pub suspended_pids: std::collections::HashSet<u32>,
     /// Set by the daemon once a Shutdown command has finished restoring state
     pub shutdown_complete: bool,
     /// Notable events (throttles, alerts, gaming mode, kills) for the
@@ -209,6 +211,11 @@ pub fn read_cpu_model() -> String {
         .clone()
 }
 
+/// Tag on the log lines about ending processes, which the notification
+/// center surfaces. Producers and the matcher below share it, so rewording a
+/// message cannot silently drop it from the notification center.
+pub const KILL_TAG: &str = "[Kill]";
+
 impl AppState {
     pub fn append_log(&mut self, msg: String) {
         let ts = chrono_ts();
@@ -222,7 +229,7 @@ impl AppState {
             "[HW Alert]",
             "[Gaming Mode]",
             "[Shutdown]",
-            "illed ", // "Killed" / "Force killed"
+            KILL_TAG,
             "[Park]",
             "[Power]",
         ];
@@ -403,9 +410,10 @@ pub fn spawn(
     cmd_rx: Receiver<DaemonCmd>,
     initial_config: Config,
     rule_engine: Arc<Mutex<RuleEngine>>,
+    gui_context: crate::gui::SharedContext,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        run_loop(state, cmd_rx, initial_config, rule_engine);
+        Daemon::start(state, initial_config, rule_engine, gui_context).run(&cmd_rx);
     })
 }
 
@@ -561,15 +569,6 @@ fn get_ram_info() -> (f32, f32) {
     })
 }
 
-fn run_loop(
-    state: Arc<Mutex<AppState>>,
-    cmd_rx: Receiver<DaemonCmd>,
-    initial_config: Config,
-    rule_engine: Arc<Mutex<RuleEngine>>,
-) {
-    Daemon::start(state, initial_config, rule_engine).run(&cmd_rx);
-}
-
 /// A log sink that appends to the shared state's log.
 fn logger(state: &Arc<Mutex<AppState>>) -> impl Fn(String) + Send + Clone + 'static {
     let state = state.clone();
@@ -601,6 +600,8 @@ struct GamingState {
 struct Daemon {
     state: Arc<Mutex<AppState>>,
     rule_engine: Arc<Mutex<RuleEngine>>,
+    /// For showing the window when a second launch asks.
+    gui_context: crate::gui::SharedContext,
     config: Config,
     ipc: ipc_server::Broadcaster,
     log: Box<dyn Fn(String) + Send>,
@@ -623,9 +624,14 @@ struct Daemon {
     original_affinities: HashMap<u32, HashSet<u32>>,
     /// pid → expiry Instant (suppress rule re-enforcement after manual change)
     manual_overrides: HashMap<u32, Instant>,
-    /// (rule_id, pid) pairs whose set_nice failed during enforcement — retried
-    /// once, not every 500ms tick; pruned when the PID dies.
-    enforce_nice_failed: HashSet<(String, u32)>,
+    /// What rule enforcement changed, to put back when no rule asks for it
+    /// any more, and what failed, to not retry every pass. New-process and
+    /// periodic enforcement share it.
+    rule_state: RuleState,
+    /// PIDs first seen by the last snapshot. They got their rules there, so
+    /// that pass's enforcement, reading their not-yet-updated snapshot
+    /// values, must not apply (and log) them a second time.
+    fresh_pids: HashSet<u32>,
     gaming: GamingState,
     /// Previously throttled PIDs, for change-based notifications
     prev_throttled: HashSet<u32>,
@@ -647,17 +653,16 @@ impl Daemon {
         state: Arc<Mutex<AppState>>,
         config: Config,
         rule_engine: Arc<Mutex<RuleEngine>>,
+        gui_context: crate::gui::SharedContext,
     ) -> Self {
         let ipc = ipc_server::Broadcaster::start();
         ipc.broadcast(&argus_ipc::IpcMessage::Config(
             config.gaming_mode.overlay.clone(),
         ));
 
-        let mut probalance = ProBalance::new(config.probalance.clone());
+        let mut probalance = ProBalance::new(config.probalance.clone())
+            .with_journal(crate::probalance::journal_path());
         probalance.set_log_callback(logger(&state));
-        if let Ok(mut re) = rule_engine.lock() {
-            re.set_log_callback(logger(&state));
-        }
         let log = Box::new(logger(&state));
 
         // Startup log entry so users can see the log is working
@@ -676,6 +681,7 @@ impl Daemon {
         Self {
             state,
             rule_engine,
+            gui_context,
             config,
             ipc,
             log,
@@ -692,7 +698,8 @@ impl Daemon {
             first_snapshot: true,
             original_affinities: HashMap::new(),
             manual_overrides: HashMap::new(),
-            enforce_nice_failed: HashSet::new(),
+            rule_state: RuleState::default(),
+            fresh_pids: HashSet::new(),
             gaming: GamingState::default(),
             prev_throttled: HashSet::new(),
             last_alert_times: HashMap::new(),
@@ -708,7 +715,7 @@ impl Daemon {
 
     fn run(mut self, cmd_rx: &Receiver<DaemonCmd>) {
         loop {
-            self.poll_overlay_toggle();
+            self.poll_requests();
             while let Ok(cmd) = cmd_rx.try_recv() {
                 if self.handle(cmd).is_break() {
                     return;
@@ -749,17 +756,27 @@ impl Daemon {
         }
     }
 
-    /// With no enabled rules and no default affinity there is nothing for
-    /// an enforce pass to do, so it should not be a reason to walk /proc.
-    /// On a default install that halves the walks: two a second down to
-    /// ProBalance's one. Cheap to recheck — the engine holds a Vec.
+    /// With no enabled rules, no default affinity and no change left to put
+    /// back there is nothing for an enforce pass to do, so it should not be
+    /// a reason to walk /proc. On a default install that halves the walks:
+    /// two a second down to ProBalance's one. Cheap to recheck — the engine
+    /// holds a Vec.
     fn enforcing(&self) -> bool {
-        self.config.cpu.default_affinity.is_some()
+        default_affinity(&self.config).is_some()
+            || self.rule_state.has_changes()
             || self
                 .rule_engine
                 .lock()
                 .map(|re| re.get_rules().iter().any(|r| r.enabled))
                 .unwrap_or(false)
+    }
+
+    /// Requests left by the CLI and by a second launch.
+    fn poll_requests(&mut self) {
+        if crate::overlay_toggle::drain_show_window(&self.toggle_dir) > 0 {
+            crate::gui::show_main_window(&self.gui_context);
+        }
+        self.poll_overlay_toggle();
     }
 
     fn poll_overlay_toggle(&mut self) {
@@ -851,12 +868,7 @@ impl Daemon {
             DaemonCmd::ResetAffinities => {
                 reset_all_affinities(&mut self.original_affinities, &self.log);
             }
-            DaemonCmd::ReapplyDefaults => {
-                // Rules may have changed — failed nice attempts get a fresh
-                // chance (an edited rule can now have an achievable nice).
-                self.enforce_nice_failed.clear();
-                reapply_defaults(&self.config, &self.rule_engine, &self.known_pids, &self.log);
-            }
+            DaemonCmd::ReapplyDefaults => self.reapply_rules(),
             DaemonCmd::Shutdown => {
                 self.shutdown();
                 // Stop the loop entirely: if it kept running, the very
@@ -914,10 +926,11 @@ impl Daemon {
         self.prune_dead(&current_pids);
 
         // ── New PIDs: apply rules or default affinity ───────────────────
+        self.fresh_pids = current_pids.difference(&self.known_pids).copied().collect();
         for proc in self
             .raw_snapshot
             .iter()
-            .filter(|p| !self.known_pids.contains(&p.pid))
+            .filter(|p| self.fresh_pids.contains(&p.pid))
         {
             apply_new_pid(
                 proc,
@@ -925,6 +938,7 @@ impl Daemon {
                 &self.rule_engine,
                 &mut self.original_affinities,
                 &mut self.gaming,
+                &mut self.rule_state,
                 &self.log,
             );
         }
@@ -966,8 +980,12 @@ impl Daemon {
             niced.retain(|pid, entry| live_start_ticks.get(pid).copied() == Some(entry.0));
         }
         self.caches.retain_live(current_pids);
-        self.enforce_nice_failed
-            .retain(|(_, pid)| current_pids.contains(pid));
+        let live: HashMap<u32, u64> = self
+            .raw_snapshot
+            .iter()
+            .map(|p| (p.pid, p.start_ticks))
+            .collect();
+        self.rule_state.retain_live(&live);
     }
 
     /// Auto Gaming Mode (Steam/Proton detection).
@@ -1018,28 +1036,59 @@ impl Daemon {
         // enforcement does procfs reads and renice/ionice subprocess spawns
         // per process, and the GUI thread locks the same engine to edit
         // rules — holding it here would freeze the UI for the whole pass.
-        let rules: Vec<crate::rules::Rule> = self
-            .rule_engine
-            .lock()
-            .map(|re| re.get_rules().to_vec())
-            .unwrap_or_default();
-        if !rules.is_empty() {
-            for proc in &self.raw_snapshot {
-                if self.manual_overrides.contains_key(&proc.pid) {
-                    continue;
-                }
-                crate::rules::apply_rules(
-                    &rules,
-                    proc.pid,
-                    &proc.name,
-                    Some(proc.nice),
-                    crate::utils::get_ionice_raw(proc.pid), // Could be cached, but only queried if rule matches
-                    &mut self.enforce_nice_failed,
-                    &self.log,
-                );
+        let rules = self.rules();
+        let policy = Policy {
+            rules: &rules,
+            default_affinity: default_affinity(&self.config),
+        };
+        for proc in &self.raw_snapshot {
+            if self.manual_overrides.contains_key(&proc.pid) || self.fresh_pids.contains(&proc.pid)
+            {
+                continue;
             }
+            crate::rules::apply_rules(
+                &policy,
+                target(proc, Some(proc.nice)),
+                || utils::get_ionice_raw(proc.pid),
+                &mut self.rule_state,
+                &self.log,
+            );
         }
         self.last_enforce = now;
+    }
+
+    /// A copy of the rules, so enforcement does not hold the engine lock.
+    fn rules(&self) -> Vec<crate::rules::Rule> {
+        self.rule_engine
+            .lock()
+            .map(|re| re.get_rules().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The rules or the default affinity changed: apply them to every
+    /// process now, and put back what they no longer ask for.
+    fn reapply_rules(&mut self) {
+        // An edited rule can now have an achievable value.
+        self.rule_state.rules_changed();
+        let rules = self.rules();
+        let policy = Policy {
+            rules: &rules,
+            default_affinity: default_affinity(&self.config),
+        };
+        for proc in &self.raw_snapshot {
+            if self.manual_overrides.contains_key(&proc.pid) {
+                continue;
+            }
+            let target = target(proc, utils::get_nice(proc.pid));
+            let ionice = || utils::get_ionice_raw(proc.pid);
+            crate::rules::apply_rules(&policy, target, ionice, &mut self.rule_state, &self.log);
+            if let Some(affinity) = policy.default_affinity {
+                if !crate::rules::any_matches(&rules, &proc.name) {
+                    self.rule_state
+                        .apply_default_affinity(target, affinity, &self.log);
+                }
+            }
+        }
     }
 
     fn tick_probalance(&mut self, now: Instant) {
@@ -1524,6 +1573,7 @@ fn collect_snapshot(
             disk_write_bps,
             cmdline,
             start_ticks: stat.starttime,
+            stopped: stat.state == b'T',
         });
     }
 
@@ -1685,22 +1735,13 @@ fn apply_new_pid(
     rule_engine: &Arc<Mutex<RuleEngine>>,
     original_affinities: &mut HashMap<u32, HashSet<u32>>,
     gaming: &mut GamingState,
+    rule_state: &mut RuleState,
     log_cb: &impl Fn(String),
 ) {
     let pid = proc.pid;
     capture_original(pid, original_affinities);
-
-    // "Matched" must come from the rule patterns, NOT from whether applying
-    // produced actions: a matching rule whose settings are already correct
-    // returns no actions, and treating that as "unmatched" would clobber the
-    // rule's affinity with the default affinity below.
-    let matched = if let Ok(mut re) = rule_engine.lock() {
-        let m = re.matches_any(&proc.name);
-        re.apply_to_process(pid, &proc.name);
-        m
-    } else {
-        false
-    };
+    let target = target(proc, utils::get_nice(pid));
+    let matched = apply_matching_rules(rule_engine, config, target, rule_state, log_cb);
 
     if matched {
         // Rule matched — if gaming mode + elevate_nice, apply nice -1 and pin to preferred cores
@@ -1722,17 +1763,27 @@ fn apply_new_pid(
                 }
             }
         }
-    } else {
-        // No rule matched — apply default affinity if configured
-        if let Some(ref default_aff) = config.cpu.default_affinity {
-            if !default_aff.is_empty() && utils::set_affinity_if_changed(pid, default_aff) {
-                log_cb(format!(
-                    "[Default] affinity={default_aff} → {}({pid})",
-                    proc.name
-                ));
-            }
-        }
+    } else if let Some(affinity) = default_affinity(config) {
+        rule_state.apply_default_affinity(target, affinity, log_cb);
     }
+}
+
+fn target(proc: &ProcInfo, nice: Option<i32>) -> Target<'_> {
+    Target {
+        pid: proc.pid,
+        start_ticks: proc.start_ticks,
+        name: &proc.name,
+        nice,
+    }
+}
+
+/// The affinity for processes no rule matches, if one is set.
+fn default_affinity(config: &Config) -> Option<&str> {
+    config
+        .cpu
+        .default_affinity
+        .as_deref()
+        .filter(|affinity| !affinity.is_empty())
 }
 
 fn capture_original(pid: u32, original_affinities: &mut HashMap<u32, HashSet<u32>>) {
@@ -1788,40 +1839,32 @@ fn reset_all_affinities(
     ));
 }
 
-// ── Reapply defaults ──────────────────────────────────────────────────────────
+// ── Rules on one process ──────────────────────────────────────────────────────
 
-fn reapply_defaults(
-    config: &Config,
+/// Apply every matching rule to one process, reading its current I/O
+/// priority live. Returns whether any rule matches.
+///
+/// "Matched" comes from the rule patterns, NOT from whether applying produced
+/// actions: a matching rule whose settings are already correct returns no
+/// actions, and treating that as "unmatched" would clobber the rule's
+/// affinity with the default affinity.
+fn apply_matching_rules(
     rule_engine: &Arc<Mutex<RuleEngine>>,
-    known_pids: &HashSet<u32>,
+    config: &Config,
+    target: Target,
+    rule_state: &mut RuleState,
     log_cb: &impl Fn(String),
-) {
-    let default_aff = match &config.cpu.default_affinity {
-        Some(a) if !a.is_empty() => a.clone(),
-        _ => return,
+) -> bool {
+    let Ok(re) = rule_engine.lock() else {
+        return false;
     };
-
-    for &pid in known_pids {
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
-        let comm = comm.trim();
-        let cmdline_raw: Vec<String> = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
-            .unwrap_or_default()
-            .split('\0')
-            .map(|s| s.to_string())
-            .collect();
-        let name = utils::resolve_process_name(pid, comm, &cmdline_raw);
-
-        let matched = if let Ok(mut re) = rule_engine.lock() {
-            let m = re.matches_any(&name);
-            re.apply_to_process(pid, &name);
-            m
-        } else {
-            false
-        };
-        if !matched && utils::set_affinity_if_changed(pid, &default_aff) {
-            log_cb(format!("[Default] affinity={default_aff} → {name}({pid})"));
-        }
-    }
+    let policy = Policy {
+        rules: re.get_rules(),
+        default_affinity: default_affinity(config),
+    };
+    let ionice = || utils::get_ionice_raw(target.pid);
+    crate::rules::apply_rules(&policy, target, ionice, rule_state, log_cb);
+    re.matches_any(target.name)
 }
 
 // ── HW temperature alerts ────────────────────────────────────────────────────
@@ -2100,6 +2143,18 @@ mod cpu_accounting_tests {
 
 #[cfg(test)]
 mod persistence_tests {
+
+    /// Ending a process is a notable event. The old matcher looked for
+    /// "illed " after the messages had been reworded, so none were shown.
+    #[test]
+    fn kill_lines_reach_the_notification_center() {
+        let mut state = AppState::default();
+        state.append_log(format!("{KILL_TAG} Termination requested for game (42)"));
+        state.append_log("[Rule:x] Set nice=5 on game(42)".into());
+        assert_eq!(state.notable_events.len(), 1);
+        assert!(state.notable_events[0].contains("Termination requested"));
+    }
+
     use super::*;
     #[test]
     fn writes_latest_shared_values_and_surfaces_then_clears_failures() {

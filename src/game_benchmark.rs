@@ -49,14 +49,13 @@ impl Default for GameBenchmark {
     }
 }
 impl GameBenchmark {
+    /// Compare the two latest recordings: A the earlier, B the later, so
+    /// "Change B vs A" reads as what changed since.
     pub fn compare_recent(&mut self) -> bool {
-        if self.results.len() < 2 {
+        let Some([earlier, later]) = latest_two_runs(&self.results) else {
             return false;
-        }
-        let next = [
-            Some(self.results[0].0.clone()),
-            Some(self.results[1].0.clone()),
-        ];
+        };
+        let next = [Some(earlier.clone()), Some(later.clone())];
         if self.compare != next {
             self.compare = next;
             self.comparison_dirty = true;
@@ -139,7 +138,7 @@ impl GameBenchmark {
                 })
                 .clicked()
             {
-                match capture::toggle(self.duration.load(Ordering::Relaxed)) {
+                match capture::set_active(!self.active, self.duration.load(Ordering::Relaxed)) {
                     Ok(c) => {
                         self.active = c.active;
                         self.checked = None;
@@ -207,7 +206,7 @@ impl GameBenchmark {
         }
         if ui
             .add_enabled(
-                self.results.len() >= 2,
+                latest_two_runs(&self.results).is_some(),
                 egui::Button::new("Compare latest two"),
             )
             .clicked()
@@ -470,11 +469,34 @@ fn delta(a: Option<f64>, b: Option<f64>) -> String {
         _ => "—".into(),
     }
 }
+/// The main result of each of the two latest recording sessions, earlier
+/// first. One session writes a result per swapchain, so a game that
+/// recreates its swapchain (resize, fullscreen, settings) leaves several,
+/// and one that presented once leaves an empty one; the run is the one with
+/// the most frames. `results` is newest first.
+fn latest_two_runs(results: &[(PathBuf, Summary)]) -> Option<[&PathBuf; 2]> {
+    let mut runs: Vec<(&PathBuf, &Summary)> = Vec::new();
+    for (path, summary) in results.iter().filter(|(_, s)| s.frames > 0) {
+        match runs
+            .iter_mut()
+            .find(|(_, run)| run.session == summary.session)
+        {
+            Some(run) if summary.frames > run.1.frames => *run = (path, summary),
+            Some(_) => {}
+            None => runs.push((path, summary)),
+        }
+    }
+    match runs.as_slice() {
+        [later, earlier, ..] => Some([earlier.0, later.0]),
+        _ => None,
+    }
+}
+
 fn recording_label(s: &Summary) -> String {
-    let name = std::path::Path::new(&s.executable)
-        .file_name()
-        .map(|p| p.to_string_lossy())
-        .unwrap_or("Unknown application".into());
+    let name = match capture::program_file_name(&s.executable) {
+        "" => "Unknown application",
+        name => name,
+    };
     let date = s
         .session
         .split('-')
@@ -527,7 +549,7 @@ fn read_graph(summary: &std::path::Path, duration: f64) -> Result<Vec<(f64, f64)
     }
     let mut reader = std::io::BufReader::new(file.take(LIMIT + 1));
     let mut line = String::new();
-    let mut bins: Vec<Option<(f64, f64)>> = vec![None; 1000];
+    let mut bins = PeakBins::new(duration / GRAPH_BINS as f64);
     let mut total = 0;
     loop {
         line.clear();
@@ -557,12 +579,57 @@ fn read_graph(summary: &std::path::Path, duration: f64) -> Result<Vec<(f64, f64)
             .and_then(|s| s.parse::<u64>().ok())
             .ok_or("Invalid CSV interval")? as f64
             / 1e6;
-        let bin = ((t / duration) * 999.0).clamp(0.0, 999.0) as usize;
-        if bins[bin].is_none_or(|(_, old)| ms > old) {
-            bins[bin] = Some((t, ms));
+        bins.add(t, ms);
+    }
+    Ok(bins.into_points())
+}
+
+const GRAPH_BINS: usize = 1000;
+
+/// The slowest frame in each of `GRAPH_BINS` equal time slots, over a
+/// recording whose end is not known up front: the summary's duration counts
+/// only accepted intervals, so a recording with failed presents runs past
+/// it. A frame beyond the last slot merges neighbouring slots and doubles
+/// their width instead of piling up in the last one.
+struct PeakBins {
+    width: f64,
+    bins: Vec<Option<(f64, f64)>>,
+}
+
+impl PeakBins {
+    fn new(width: f64) -> Self {
+        Self {
+            width,
+            bins: vec![None; GRAPH_BINS],
         }
     }
-    Ok(bins.into_iter().flatten().collect())
+
+    fn add(&mut self, t: f64, ms: f64) {
+        let slot = |width: f64| (t / width) as usize;
+        while slot(self.width) >= GRAPH_BINS {
+            self.width *= 2.0;
+            let merged: Vec<_> = self
+                .bins
+                .chunks(2)
+                .map(|pair| {
+                    pair.iter()
+                        .flatten()
+                        .copied()
+                        .max_by(|a, b| a.1.total_cmp(&b.1))
+                })
+                .collect();
+            self.bins = merged;
+            self.bins.resize(GRAPH_BINS, None);
+        }
+        let bin = &mut self.bins[slot(self.width)];
+        if bin.is_none_or(|(_, old)| ms > old) {
+            *bin = Some((t, ms));
+        }
+    }
+
+    fn into_points(self) -> Vec<(f64, f64)> {
+        self.bins.into_iter().flatten().collect()
+    }
 }
 fn draw_comparison(ui: &mut egui::Ui, graphs: &Graphs) {
     if graphs.iter().all(Vec::is_empty) {
@@ -613,6 +680,55 @@ fn draw_comparison(ui: &mut egui::Ui, graphs: &Graphs) {
 #[cfg(test)]
 mod comparison_tests {
     use super::*;
+
+    fn run(name: &str, session: &str, frames: usize) -> (PathBuf, Summary) {
+        let summary = Summary {
+            session: session.into(),
+            frames,
+            ..Summary::default()
+        };
+        (PathBuf::from(name), summary)
+    }
+
+    /// Frames after the summary's duration (which leaves out failed
+    /// presents) used to collapse into the last slot of the graph.
+    #[test]
+    fn a_recording_longer_than_its_duration_keeps_its_shape() {
+        let mut bins = PeakBins::new(1.0 / GRAPH_BINS as f64);
+        for i in 0..3000 {
+            let t = i as f64 / 1000.0; // three seconds for a one-second duration
+            bins.add(t, if i == 2500 { 50.0 } else { 16.0 });
+        }
+        let points = bins.into_points();
+        assert!(points.len() > GRAPH_BINS / 2, "{} points", points.len());
+        assert!(points.last().unwrap().0 > 2.9);
+        assert!(
+            points
+                .iter()
+                .any(|&(t, ms)| ms == 50.0 && (t - 2.5).abs() < 1e-9),
+            "the spike survives"
+        );
+        assert!(points.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    /// A swapchain recreated during the latest recording used to be
+    /// compared with the rest of that same recording, newest as A.
+    #[test]
+    fn the_latest_two_runs_are_two_sessions_earlier_first() {
+        // Newest first, as load_summaries lists them.
+        let results = [
+            run("s2-swapchain-b", "s2", 900),
+            run("s2-swapchain-a", "s2", 3000),
+            run("s2-one-present", "s2", 0),
+            run("s1-swapchain", "s1", 2800),
+            run("s0-swapchain", "s0", 2500),
+        ];
+        let [a, b] = latest_two_runs(&results).unwrap();
+        assert_eq!(a, &PathBuf::from("s1-swapchain"));
+        assert_eq!(b, &PathBuf::from("s2-swapchain-a"));
+
+        assert!(latest_two_runs(&results[..3]).is_none(), "one session only");
+    }
     #[test]
     fn differences_handle_missing_zero_and_nonfinite_metrics() {
         assert_eq!(delta(Some(100.0), Some(110.0)), "+10.0%");

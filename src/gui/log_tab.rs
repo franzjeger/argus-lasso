@@ -141,7 +141,7 @@ impl LogTab {
             ui.add_space(tokens::SPACE_S);
             for cat in Category::ALL {
                 let on = self.active.contains(&cat);
-                if cat_chip(ui, cat.label(), on, cat.color(&sem)) {
+                if theme::category_chip(ui, cat.label(), on, cat.color(&sem)) {
                     if on {
                         self.active.retain(|c| *c != cat);
                     } else {
@@ -252,46 +252,4 @@ impl LogTab {
 
         (clear, save)
     }
-}
-
-/// Pill filter chip in a category colour — same geometry as [`theme::chip`],
-/// which is accent-only, but tinted per category so the colour code in the
-/// rows and the chips match.
-fn cat_chip(ui: &mut egui::Ui, label: &str, active: bool, color: egui::Color32) -> bool {
-    let galley = ui.painter().layout_no_wrap(
-        if active {
-            format!("{label} ✕")
-        } else {
-            label.to_string()
-        },
-        egui::FontId::proportional(tokens::FONT_LABEL),
-        color,
-    );
-    let pad = egui::vec2(9.0, 4.0);
-    let size = galley.size() + pad * 2.0;
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    if ui.is_rect_visible(rect) {
-        let fill = if active {
-            theme::tint(color, 46)
-        } else if resp.hovered() {
-            ui.visuals().widgets.hovered.bg_fill
-        } else {
-            egui::Color32::TRANSPARENT
-        };
-        let stroke = if active {
-            egui::Stroke::new(1.0_f32, color)
-        } else {
-            egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color)
-        };
-        ui.painter().rect(
-            rect,
-            egui::CornerRadius::same(12),
-            fill,
-            stroke,
-            egui::StrokeKind::Inside,
-        );
-        ui.painter()
-            .galley(rect.min + pad, galley, egui::Color32::WHITE);
-    }
-    resp.clicked()
 }

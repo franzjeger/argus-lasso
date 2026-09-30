@@ -7,6 +7,7 @@ mod cpu_park;
 mod fast_proc;
 mod file_dialog;
 mod game_benchmark;
+mod game_library;
 mod gui;
 mod hw_monitor;
 mod icon;
@@ -41,7 +42,7 @@ fn make_icon_rgba() -> Vec<u8> {
 struct ArgusLassoTray {
     state: Arc<Mutex<monitor::AppState>>,
     cmd_tx: crossbeam_channel::Sender<monitor::DaemonCmd>,
-    context: Arc<Mutex<Option<egui::Context>>>,
+    context: gui::SharedContext,
 }
 
 /// Convert embedded RGBA bytes to ARGB32 network-byte-order as required by D-Bus SNI.
@@ -84,10 +85,21 @@ impl ksni::Tray for ArgusLassoTray {
         }
     }
 
+    /// Left click on the tray icon.
+    fn activate(&mut self, _x: i32, _y: i32) {
+        gui::show_main_window(&self.context);
+    }
+
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         let gaming_active = self.state.lock().map(|s| s.gaming_active).unwrap_or(false);
 
         vec![
+            ksni::MenuItem::Standard(ksni::menu::StandardItem {
+                label: "Open Argus-Lasso".into(),
+                activate: Box::new(|tray: &mut Self| gui::show_main_window(&tray.context)),
+                ..Default::default()
+            }),
+            ksni::MenuItem::Separator,
             ksni::MenuItem::Checkmark(ksni::menu::CheckmarkItem {
                 label: "Gaming Mode".into(),
                 checked: gaming_active,
@@ -370,7 +382,14 @@ fn main() {
         match acquire_single_instance_lock() {
             Ok(Some(lock)) => Some(lock),
             Ok(None) => {
-                eprintln!("Argus-Lasso is already running; exiting this instance.");
+                // Launching from the app menu while the tray service runs
+                // should bring up the existing window, not do nothing.
+                match overlay_toggle::request_show_window(&config::config_dir()) {
+                    Ok(()) => eprintln!("Argus-Lasso is already running; showing its window."),
+                    Err(e) => eprintln!(
+                        "Argus-Lasso is already running, and could not be asked to show its window: {e}"
+                    ),
+                }
                 return;
             }
             // Not being able to create the lock is not evidence of another
@@ -428,12 +447,6 @@ fn main() {
     // Build rule engine
     let rule_engine = {
         let mut re = rules::RuleEngine::new();
-        let state_clone = state.clone();
-        re.set_log_callback(move |msg| {
-            if let Ok(mut s) = state_clone.lock() {
-                s.append_log(msg);
-            }
-        });
         re.load_rules(&cfg.rules);
         Arc::new(Mutex::new(re))
     };
@@ -442,6 +455,9 @@ fn main() {
     // so a daemon stuck mid-restore is detected and logged rather than
     // silently abandoned when the process image is torn down.
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+    // Filled in once eframe creates the context; the tray and the monitor use
+    // it to show the window on request.
+    let gui_context: gui::SharedContext = Arc::new(Mutex::new(None));
     let daemon_handle = if args.ui_tour.is_some() {
         monitor::spawn_preview(Arc::clone(&state), cmd_rx)
     } else {
@@ -450,12 +466,12 @@ fn main() {
             cmd_rx,
             cfg.clone(),
             Arc::clone(&rule_engine),
+            Arc::clone(&gui_context),
         )
     };
 
     // System tray via D-Bus StatusNotifierItem (KDE/freedesktop, no libxdo).
     // Spawned after state + cmd_tx exist so the menu can read/toggle gaming mode.
-    let gui_context = Arc::new(Mutex::new(None));
     let _tray_handle = if !args.no_tray && args.ui_tour.is_none() {
         use ksni::blocking::TrayMethods;
         match (ArgusLassoTray {
@@ -505,6 +521,19 @@ fn main() {
             .with_transparent(true)
             .with_visible(!args.minimized)
             .with_icon(window_icon),
+        // The tour renders into the X server in $DISPLAY — Xvfb under
+        // xvfb-run. winit prefers Wayland whenever $WAYLAND_DISPLAY is set,
+        // which put the tour window on the user's desktop instead, where a
+        // hidden window gets no frames and the tour waits forever.
+        event_loop_builder: args
+            .ui_tour
+            .is_some()
+            .then(|| -> eframe::EventLoopBuilderHook {
+                Box::new(|builder| {
+                    use winit::platform::x11::EventLoopBuilderExtX11;
+                    builder.with_x11();
+                })
+            }),
         ..Default::default()
     };
 

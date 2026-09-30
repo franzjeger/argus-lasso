@@ -151,14 +151,18 @@ fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> std::io::Resul
         }
     }
 
+    let reported = only_changed.then(|| reported_mask(&cpuset));
+
     let mut any_ok = false;
     let mut first_err = None;
     // Affinity belongs to each thread, not to the process as a whole.
     for_each_thread(pid, |tid| {
-        if only_changed
-            && sched_getaffinity(Pid::from_raw(tid as i32)).is_ok_and(|current| current == cpu_set)
-        {
-            return;
+        if let Some(reported) = &reported {
+            if sched_getaffinity(Pid::from_raw(tid as i32))
+                .is_ok_and(|current| current == *reported)
+            {
+                return;
+            }
         }
         match sched_setaffinity(Pid::from_raw(tid as i32), &cpu_set) {
             Ok(_) => any_ok = true,
@@ -177,6 +181,40 @@ fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> std::io::Resul
             Ok(any_ok)
         }
     }
+}
+
+/// `cpus` as sched_getaffinity(2) reports it: limited to online CPUs, so with
+/// CPUs parked a thread never "matches" the full request.
+fn reported_mask(cpus: &HashSet<u32>) -> CpuSet {
+    let online = get_online_cpus();
+    let mut set = CpuSet::new();
+    for cpu in cpus.iter().filter(|cpu| online.contains(cpu)) {
+        let _ = set.set(*cpu as usize);
+    }
+    set
+}
+
+/// Whether the main thread's affinity is `cpulist`, as far as the kernel shows.
+pub fn affinity_matches(pid: u32, cpulist: &str) -> bool {
+    use nix::sched::sched_getaffinity;
+    use nix::unistd::Pid;
+    let Ok(cpus) = cpulist_to_set(cpulist) else {
+        return false;
+    };
+    sched_getaffinity(Pid::from_raw(pid as i32))
+        .is_ok_and(|current| current == reported_mask(&cpus))
+}
+
+/// The main thread's affinity, to put back later. A process allowed every
+/// online CPU is recorded as allowed every CPU: its mask still includes
+/// parked CPUs the kernel does not report, and restoring only the online
+/// ones would keep it off them once they return.
+pub fn get_affinity_to_restore(pid: u32) -> String {
+    let current = get_affinity_str(pid);
+    if cpulist_to_set(&current).is_ok_and(|cpus| cpus == get_online_cpus()) {
+        return cpuset_to_cpulist(&(0..get_cpu_count()).collect());
+    }
+    current
 }
 
 /// Apply affinity to every thread whose CPU mask differs from `cpulist`.
@@ -950,6 +988,33 @@ mod tests {
         assert!(!set_affinity_if_changed(pid, &target_cpu.to_string()));
         done_tx.send(()).unwrap();
         worker.join().unwrap();
+    }
+
+    /// With CPUs parked the kernel reports only the online part of a mask,
+    /// which used to look like a difference and re-apply every pass.
+    #[test]
+    fn affinity_naming_offline_cpus_settles() {
+        let online = get_online_cpus();
+        let Some(offline) = (0..CpuSet::count() as u32)
+            .rev()
+            .find(|c| !online.contains(c))
+        else {
+            return;
+        };
+        let Some(&cpu) = online.iter().min() else {
+            return;
+        };
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let cpulist = format!("{cpu},{offline}");
+        let first = set_affinity_if_changed(child.id(), &cpulist);
+        let second = set_affinity_if_changed(child.id(), &cpulist);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(first);
+        assert!(!second, "an online-limited mask must count as applied");
     }
 
     #[test]

@@ -165,6 +165,8 @@ pub struct ArgusLassoApp {
     cpu_temp: Option<f32>,
     // Pending kill awaiting undo
     pending_kill: Option<crate::gui::process_tab::PendingKill>,
+    /// Pause/resume requests the next snapshot has not caught up with.
+    pending_stops: crate::gui::process_tab::PendingStops,
     // Pending "create a rule from this manual change?" offer
     detail_window: crate::gui::detail_window::DetailWindow,
     // How many notable events the user has seen (bell badge = len - seen)
@@ -279,6 +281,7 @@ impl ArgusLassoApp {
             last_saved_theme,
             cpu_temp,
             pending_kill: None,
+            pending_stops: Default::default(),
             detail_window: Default::default(),
             tour: tour_dir.map(|d| match crate::ui_tour::Tour::new(d) {
                 Ok(t) => t,
@@ -446,6 +449,13 @@ impl eframe::App for ArgusLassoApp {
     /// thing that had to change — so it is taken from the `Ui` we are given.
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &root_ui.ctx().clone();
+        // Without the compositor's alpha modifier, opacity is the alpha of
+        // the root UI's fills, which is rebuilt from the theme every frame,
+        // so it is set every frame too: at startup, and after a theme change
+        // or Apply, as well as while the slider moves.
+        if self.wayland_opacity.is_none() {
+            crate::gui::theme::apply_viewport_opacity(root_ui, self.opacity);
+        }
         if self.state.lock().is_ok_and(|s| s.quit_requested) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -458,10 +468,11 @@ impl eframe::App for ArgusLassoApp {
         }
         self.log_repaint_rate();
 
-        let Some(frame) = self.read_frame() else {
+        let Some(mut frame) = self.read_frame() else {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
             return;
         };
+        frame.suspended_pids = self.pending_stops.stopped_pids(&frame.snapshot);
         let FrameData {
             ref snapshot,
             ref cpu_pcts,
@@ -480,6 +491,8 @@ impl eframe::App for ArgusLassoApp {
         // show its state rather than keeping their own.
         self.gaming_mode_tab
             .sync_gaming_state(gaming_active, gaming_changes);
+        self.gaming_mode_tab
+            .follow_overlay_shown(config.gaming_mode.overlay.show_overlay);
 
         // Only push CPU bars + history when the daemon has emitted a new sample.
         // The hwmon temp scan (a full /sys/class/hwmon walk) also lives here —
@@ -522,12 +535,11 @@ impl eframe::App for ArgusLassoApp {
         self.show_kill_toast(ctx);
         self.show_error_banners(root_ui);
 
+        // The root UI's fill carries the opacity fallback; the global
+        // style's does not.
+        let panel_fill = root_ui.visuals().panel_fill;
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(ctx.global_style().visuals.panel_fill)
-                    .inner_margin(16),
-            )
+            .frame(egui::Frame::new().fill(panel_fill).inner_margin(16))
             .show_inside(root_ui, |ui| {
                 // Tab bar: five primary workflow tabs on the left; the occasional
                 // tools live behind a "Tools ▾" menu and Settings behind the gear,
@@ -631,8 +643,14 @@ impl ArgusLassoApp {
                     }
                 }
                 GamingEvent::ConfigChanged(cfg) => {
+                    let tab = &self.gaming_mode_tab;
                     self.update_config(|c| {
+                        let shown = tab.overlay_shown(
+                            cfg.gaming_mode.overlay.show_overlay,
+                            c.gaming_mode.overlay.show_overlay,
+                        );
                         c.gaming_mode = cfg.gaming_mode;
+                        c.gaming_mode.overlay.show_overlay = shown;
                         c.ui.global_overlay = cfg.ui.global_overlay;
                     });
                     self.save_config();
@@ -640,8 +658,13 @@ impl ArgusLassoApp {
             }
         }
         if self.gaming_mode_tab.overlay_window(ctx, self.opacity) {
-            let overlay = self.gaming_mode_tab.config.gaming_mode.overlay.clone();
-            self.update_config(|c| c.gaming_mode.overlay = overlay);
+            let tab = &self.gaming_mode_tab;
+            let mut overlay = tab.config.gaming_mode.overlay.clone();
+            self.update_config(|c| {
+                overlay.show_overlay =
+                    tab.overlay_shown(overlay.show_overlay, c.gaming_mode.overlay.show_overlay);
+                c.gaming_mode.overlay = overlay;
+            });
             self.save_config();
         }
     }
@@ -681,7 +704,7 @@ impl ArgusLassoApp {
             cpu_pcts: s.cpu_percents.clone(),
             cpu_gen: s.cpu_generation,
             throttled_pids: s.throttled_pids.clone(),
-            suspended_pids: s.suspended_pids.clone(),
+            suspended_pids: Default::default(),
             throttle_infos: if on_pb_tab {
                 s.throttle_infos.clone()
             } else {
@@ -754,7 +777,7 @@ impl ArgusLassoApp {
                         .show();
                 }
                 if let Ok(mut s) = self.state.lock() {
-                    s.append_log(msg);
+                    s.append_log(format!("{} {msg}", crate::monitor::KILL_TAG));
                 }
                 self.pending_kill = None;
             }
@@ -896,12 +919,18 @@ impl ArgusLassoApp {
                 let pid = pk.pid;
                 if let Ok(mut s) = self.state.lock() {
                     match cont {
-                        Ok(()) => {
-                            s.append_log(format!("Kill cancelled — resumed {} ({})", name, pid))
-                        }
+                        Ok(()) => s.append_log(format!(
+                            "{} Kill cancelled — resumed {} ({})",
+                            crate::monitor::KILL_TAG,
+                            name,
+                            pid
+                        )),
                         Err(e) => s.append_log(format!(
-                            "Kill cancelled but resume failed ({}); {} ({}) is still suspended",
-                            e, name, pid
+                            "{} Kill cancelled but resume failed ({}); {} ({}) is still suspended",
+                            crate::monitor::KILL_TAG,
+                            e,
+                            name,
+                            pid
                         )),
                     }
                 }
@@ -992,6 +1021,13 @@ impl ArgusLassoApp {
                     galley.size().y + pad.y * 2.0,
                 );
                 let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                resp.widget_info(|| {
+                    let name = match &badge_txt {
+                        Some(count) => format!("{label} ({count})"),
+                        None => label.to_string(),
+                    };
+                    egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, name)
+                });
                 if ui.is_rect_visible(rect) {
                     if selected {
                         ui.painter().rect_filled(
@@ -1264,6 +1300,7 @@ impl ArgusLassoApp {
             snapshot,
             &self.state,
             &mut self.pending_kill,
+            &mut self.pending_stops,
             &mut self.dialog_manager,
             &mut self.detail_window,
             &notify_error,
@@ -1344,20 +1381,8 @@ impl ArgusLassoApp {
         let new_opacity = self.settings_tab.opacity;
         if (new_opacity - self.opacity).abs() > 0.001 {
             self.opacity = new_opacity;
-            eprintln!("[opacity] applying opacity={new_opacity:.3}");
             if let Some(ref wo) = self.wayland_opacity {
                 wo.set(new_opacity);
-            } else {
-                // Fallback: control opacity via window_fill alpha so the
-                // compositor sees a semi-transparent clear colour.
-                let alpha = (new_opacity * 255.0) as u8;
-                let theme = &self.settings_tab.theme;
-                ctx.global_style_mut(|s| {
-                    let (r, g, b) = crate::gui::theme::window_bg_rgb(theme);
-                    let col = egui::Color32::from_rgba_unmultiplied(r, g, b, alpha);
-                    s.visuals.window_fill = col;
-                    s.visuals.panel_fill = col;
-                });
             }
         }
 
