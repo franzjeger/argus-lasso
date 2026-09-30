@@ -302,6 +302,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Clearing the default affinity also releases processes that inherited it from a
   process it had pinned; they had the mask from the start, so nothing recorded
   them and they stayed pinned.
+- A ProBalance cgroup throttle whose systemctl call timed out keeps its record of
+  the unit's original CPU policy, so it is put back if the change landed anyway.
+  Forgetting it let a later throttle record the throttled weight as the original.
 
 ### Changed
 

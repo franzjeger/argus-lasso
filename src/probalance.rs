@@ -454,7 +454,8 @@ impl ProBalance {
                         self.unit_refs
                             .insert(unit.clone(), UnitThrottle { count: 1, original });
                         self.save_journal();
-                        if crate::cgroup::throttle_unit(&unit, &set) {
+                        let outcome = crate::cgroup::throttle_unit(&unit, &set);
+                        if outcome == crate::cgroup::Outcome::Done {
                             let what = if set == crate::cgroup::CpuPolicy::default() {
                                 "already limited further".to_string()
                             } else {
@@ -466,7 +467,17 @@ impl ProBalance {
                             ));
                             return Some(Applied::Cgroup { unit });
                         }
-                        self.unit_refs.remove(&unit);
+                        if outcome == crate::cgroup::Outcome::Unknown {
+                            // The change may still land. Keep the original
+                            // with no holder, so the pending-restore retry
+                            // puts it back; forgetting it let a later
+                            // throttle read the throttled weight as original.
+                            if let Some(t) = self.unit_refs.get_mut(&unit) {
+                                t.count = 0;
+                            }
+                        } else {
+                            self.unit_refs.remove(&unit);
+                        }
                         self.save_journal();
                     }
                     self.cgroup_failed_units.insert(unit.clone());

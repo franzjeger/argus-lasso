@@ -268,20 +268,35 @@ pub fn plan_throttle(
     (set, original)
 }
 
+/// How a set-property call ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Done,
+    Refused,
+    /// systemctl timed out: the manager may still apply the change.
+    Unknown,
+}
+
 /// Set `policy` on a unit; nothing to set succeeds without a call.
-/// `--runtime` scopes the change to this boot — exactly the lifetime we want.
-pub fn throttle_unit(unit: &str, policy: &CpuPolicy) -> bool {
+/// `--runtime` keeps the change out of the unit's files: it lasts until the
+/// user manager's runtime directory goes away (logout or reboot), not
+/// beyond, and not only for this process (see the throttle journal).
+pub fn throttle_unit(unit: &str, policy: &CpuPolicy) -> Outcome {
     set_property(unit, policy)
 }
 
-fn set_property(unit: &str, policy: &CpuPolicy) -> bool {
+fn set_property(unit: &str, policy: &CpuPolicy) -> Outcome {
     let assignments = policy.assignments();
     if assignments.is_empty() {
-        return true;
+        return Outcome::Done;
     }
     let mut args = vec!["set-property", "--runtime", "--", unit];
     args.extend(assignments.iter().map(String::as_str));
-    systemctl_user(&args).is_some_and(|o| o.status.success())
+    match systemctl_user(&args) {
+        Some(output) if output.status.success() => Outcome::Done,
+        Some(_) => Outcome::Refused,
+        None => Outcome::Unknown,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -294,7 +309,7 @@ pub enum Restore {
 
 /// Put back the properties a throttle changed.
 pub fn restore_unit(unit: &str, original: &CpuPolicy) -> Restore {
-    if set_property(unit, original) {
+    if set_property(unit, original) == Outcome::Done {
         return Restore::Done;
     }
     let gone = systemctl_user(&["show", "-p", "LoadState", "--", unit])
@@ -448,7 +463,7 @@ mod tests {
         assert_eq!(current.quota, Some(Quota::Hundredths(3700)));
 
         let (set, original) = plan_throttle(&current, 25, 10);
-        assert!(throttle_unit(&unit, &set));
+        assert_eq!(throttle_unit(&unit, &set), Outcome::Done);
         assert_eq!(read_unit_cpu_policy(&unit, pid, true), Some(set));
         assert_eq!(restore_unit(&unit, &original), Restore::Done);
         assert_eq!(read_unit_cpu_policy(&unit, pid, true), Some(current));
