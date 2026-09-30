@@ -44,6 +44,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- A template picked, or "Add rule" chosen in Processes, while the rule editor is
+  open is no longer dropped with a note to pick it again. The open editor comes
+  to the front, and the new rule opens as soon as it is saved or cancelled. A
+  rule from a template is titled "New rule", not "Edit Rule".
 - Helper installation no longer trusts the user-writable staging directory: root
   installs only copies matching SHA-256 digests in its own command, so a file
   swapped while the polkit prompt is open is refused instead of installed.
