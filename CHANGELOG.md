@@ -119,6 +119,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
   quote (`steam -applaunch 620"`), so the launcher rejected the command; names
   showed the stray quote too. Lutris names containing `|` are no longer split,
   and the Lutris database is read read-only.
+- Rules that match the same process no longer undo each other: the last matching
+  rule to set a value wins, as the rules tab already showed, and the value is
+  changed once instead of on every pass. I/O priority failures are reported once
+  instead of retried silently forever, the "none" I/O class no longer sends a
+  level the kernel rejects, and I/O priority is read only for processes a rule
+  sets it on. An affinity naming parked CPUs is no longer re-applied every pass.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

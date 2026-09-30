@@ -2,7 +2,7 @@
 //!
 //! Mirrors Python rules.py exactly:
 //!   - match_type: contains (case-insensitive), exact, regex
-//!   - apply_rules applies ALL matching rules (not first-match-stop)
+//!   - apply_rules merges ALL matching rules; the last one to set a value wins
 
 use regex::Regex;
 
@@ -37,7 +37,7 @@ pub fn preview_effect<'a>(rules: &'a [Rule], name: &str) -> RuleEffect<'a> {
             effect.nice = Some(v);
         }
         if let Some(class) = rule.ionice_class {
-            let v = (class, rule.ionice_level.unwrap_or(0));
+            let v = ionice_target(class, rule.ionice_level);
             effect.conflict |= effect.ionice.is_some_and(|old| old != v);
             effect.ionice = Some(v);
         }
@@ -234,94 +234,121 @@ impl RuleEngine {
     }
 }
 
-/// Enforce a rule slice against one process. Standalone so the monitor daemon
+/// A rule's nice or I/O priority change that failed for one process. It is
+/// not retried every pass: a permission failure never heals by itself, and
+/// retrying would spawn a syscall and a log line every 500 ms forever.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FailKey {
+    rule_id: String,
+    pub pid: u32,
+    attr: Attr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Attr {
+    Nice,
+    Ionice,
+}
+
+pub type FailedChanges = std::collections::HashSet<FailKey>;
+
+/// Enforce the rules matching one process. Standalone so the monitor daemon
 /// can clone the rules and run enforcement WITHOUT holding the RuleEngine
 /// mutex across procfs reads and renice/ionice subprocess spawns (the GUI
 /// locks the same engine to edit rules and would freeze otherwise).
-/// Dirty-checks each attribute before calling the syscall so that periodic
-/// re-enforcement does not spam the log with no-op "already correct" entries.
+///
+/// Matching rules are merged first, as the rules tab previews them: for each
+/// attribute the last rule that sets it wins. Each attribute is then
+/// dirty-checked and changed at most once, so two rules that disagree no
+/// longer undo each other on every pass. `current_ionice` is only called when
+/// a matching rule sets I/O priority.
 pub fn apply_rules(
     rules: &[Rule],
     pid: u32,
     proc_name: &str,
     current_nice: Option<i32>,
-    current_ionice: Option<(i32, i32)>,
-    nice_failed: &mut std::collections::HashSet<(String, u32)>,
+    current_ionice: impl FnOnce() -> Option<(i32, i32)>,
+    failed: &mut FailedChanges,
     log: &impl Fn(String),
 ) -> Vec<String> {
+    let effect = preview_effect(rules, proc_name);
     let mut actions = Vec::new();
-    let proc_name_lower = proc_name.to_lowercase();
-    // Track what we believe the live nice/ionice values are as rules apply,
-    // so a later rule in this same pass sees what an earlier one in this
-    // pass just set — mirroring the affinity check below, which re-reads
-    // from the OS fresh every iteration for the same reason. Without this,
-    // two enabled rules that both set nice (or both set ionice) on the same
-    // process compared against the same pre-loop snapshot, so the second
-    // rule could wrongly believe its target already matched — leaving the
-    // process stuck on the first rule's value, or oscillating between the
-    // two on alternating enforcement ticks.
-    let mut current_nice = current_nice;
-    let mut current_ionice = current_ionice;
-    for rule in rules {
-        if !rule.matches(proc_name, &proc_name_lower) {
-            continue;
-        }
+    let mut report = |msg: String| {
+        log(msg.clone());
+        actions.push(msg);
+    };
+    let last_setting =
+        |sets: fn(&Rule) -> bool| effect.matches.iter().rev().copied().find(|r| sets(r));
 
-        // ── Affinity ─────────────────────────────────────────────────
-        if let Some(ref aff) = rule.affinity {
-            if utils::set_affinity_if_changed(pid, aff) {
-                let msg = format!(
-                    "[Rule:{}] Set affinity={} on {}({})",
-                    rule.name, aff, proc_name, pid
-                );
-                log(msg.clone());
-                actions.push(msg);
-            }
+    if let Some(rule) = last_setting(|r| r.affinity.is_some()) {
+        let aff = rule.affinity.as_deref().unwrap_or_default();
+        if utils::set_affinity_if_changed(pid, aff) {
+            report(format!(
+                "[Rule:{}] Set affinity={} on {}({})",
+                rule.name, aff, proc_name, pid
+            ));
         }
+    }
 
-        // ── Nice ─────────────────────────────────────────────────────
-        if let Some(nice) = rule.nice {
-            let fail_key = (rule.rule_id.clone(), pid);
-            if current_nice != Some(nice) && !nice_failed.contains(&fail_key) {
-                if let Err(e) = utils::set_nice(pid, nice) {
-                    // Don't retry every tick: a permission failure would spawn
-                    // a renice subprocess and a log line every 500 ms forever.
-                    nice_failed.insert(fail_key);
-                    let msg = format!(
+    if let Some(rule) = last_setting(|r| r.nice.is_some()) {
+        // The kernel clamps out-of-range values, so an unclamped target
+        // would never read back as reached.
+        let nice = rule.nice.unwrap_or_default().clamp(-20, 19);
+        let key = FailKey {
+            rule_id: rule.rule_id.clone(),
+            pid,
+            attr: Attr::Nice,
+        };
+        if current_nice != Some(nice) && !failed.contains(&key) {
+            match utils::set_nice(pid, nice) {
+                Ok(()) => report(format!(
+                    "[Rule:{}] Set nice={} on {}({})",
+                    rule.name, nice, proc_name, pid
+                )),
+                Err(e) => {
+                    failed.insert(key);
+                    report(format!(
                         "[Rule:{}] nice={} FAILED for {}({}): {e} — giving up for this process",
                         rule.name, nice, proc_name, pid
-                    );
-                    log(msg.clone());
-                    actions.push(msg);
-                } else {
-                    current_nice = Some(nice);
-                    let msg = format!(
-                        "[Rule:{}] Set nice={} on {}({})",
-                        rule.name, nice, proc_name, pid
-                    );
-                    log(msg.clone());
-                    actions.push(msg);
+                    ));
                 }
             }
         }
+    }
 
-        // ── Ionice ───────────────────────────────────────────────────
-        if let Some(class) = rule.ionice_class {
-            let target_level = rule.ionice_level.unwrap_or(0);
-            if current_ionice != Some((class, target_level))
-                && utils::set_ionice(pid, class, rule.ionice_level).is_ok()
-            {
-                current_ionice = Some((class, target_level));
-                let msg = format!(
-                    "[Rule:{}] Set ionice class={} level={:?} on {}({})",
-                    rule.name, class, rule.ionice_level, proc_name, pid
-                );
-                log(msg.clone());
-                actions.push(msg);
+    if let Some(rule) = last_setting(|r| r.ionice_class.is_some()) {
+        let target = ionice_target(rule.ionice_class.unwrap_or_default(), rule.ionice_level);
+        let key = FailKey {
+            rule_id: rule.rule_id.clone(),
+            pid,
+            attr: Attr::Ionice,
+        };
+        if !failed.contains(&key) && current_ionice() != Some(target) {
+            match utils::set_ionice(pid, target.0, Some(target.1)) {
+                Ok(()) => report(format!(
+                    "[Rule:{}] Set ionice class={} level={} on {}({})",
+                    rule.name, target.0, target.1, proc_name, pid
+                )),
+                Err(e) => {
+                    failed.insert(key);
+                    report(format!(
+                        "[Rule:{}] ionice class={} level={} FAILED for {}({}): {e} — giving up for this process",
+                        rule.name, target.0, target.1, proc_name, pid
+                    ));
+                }
             }
         }
     }
     actions
+}
+
+/// The (class, level) a rule asks for, as the kernel will accept and report
+/// it: class 0 ("none") takes no level, and a missing level means 0.
+pub fn ionice_target(class: i32, level: Option<i32>) -> (i32, i32) {
+    match class {
+        0 => (0, 0),
+        _ => (class, level.unwrap_or(0).clamp(0, 7)),
+    }
 }
 
 impl Default for RuleEngine {
@@ -472,8 +499,8 @@ mod tests {
             0,
             "firefox",
             None,
-            None,
-            &mut std::collections::HashSet::new(),
+            || None,
+            &mut FailedChanges::new(),
             &|_| {},
         );
         assert!(actions.is_empty());
@@ -527,27 +554,18 @@ mod tests {
         assert_eq!(back.enabled, cfg.enabled);
     }
 
-    /// Regression test for the nice/ionice staleness bug: apply_rules() used
-    /// to dirty-check every rule against the snapshot taken *before* the
-    /// loop, instead of re-checking against what an earlier rule in the same
-    /// pass just set (the way the affinity check re-reads from the OS every
-    /// iteration).
-    ///
-    /// Both rules here target the *same* raised nice value. Under the fix,
-    /// rule 2 sees rule 1's just-applied live value, recognizes its own
-    /// target is already met, and skips — one action. Under the bug, rule 2
-    /// compares against the frozen pre-pass snapshot (which does differ from
-    /// its target) and wrongly fires a second, redundant syscall — two
-    /// actions. This deliberately never asks the process to *lower* its own
-    /// nice value (not even back to where it started): setpriority(2) lets
-    /// an unprivileged process always raise its own nice value, but lowering
-    /// it — even back to a value it held a moment ago — is governed by
-    /// RLIMIT_NICE, which a locked-down CI runner enforces far more strictly
-    /// than a typical desktop session. An earlier version of this test raised
-    /// nice and then tried to restore the original value, which passed
-    /// locally but failed deterministically in CI for exactly that reason.
+    /// Two matching rules with the same nice target change it once, not
+    /// once per rule against a stale snapshot. This deliberately never asks
+    /// the process to *lower* its own nice value (not even back to where it
+    /// started): setpriority(2) lets an unprivileged process always raise
+    /// its own nice value, but lowering it — even back to a value it held a
+    /// moment ago — is governed by RLIMIT_NICE, which a locked-down CI runner
+    /// enforces far more strictly than a typical desktop session. An earlier
+    /// version of this test raised nice and then tried to restore the
+    /// original value, which passed locally but failed deterministically in
+    /// CI for exactly that reason.
     #[test]
-    fn apply_rules_lets_a_later_rule_see_an_earlier_ones_just_applied_nice() {
+    fn rules_sharing_a_nice_target_change_it_once() {
         // This test renices the test binary's own process — see the lock's
         // own doc comment for why that needs serializing against sibling
         // tests that do the same (cpu_park.rs's renice_succeeds_when_..).
@@ -563,13 +581,13 @@ mod tests {
         rule2.rule_id = "r2".into();
         rule2.nice = Some(target);
 
-        let mut nice_failed = std::collections::HashSet::new();
+        let mut nice_failed = FailedChanges::new();
         let actions = apply_rules(
             &[rule1, rule2],
             pid,
             "apply-rules-staleness-test",
             Some(starting),
-            None,
+            || None,
             &mut nice_failed,
             &|_| {},
         );
@@ -582,10 +600,90 @@ mod tests {
         assert_eq!(
             actions.len(),
             1,
-            "the second rule must recognize its target is already met via \
-             the first rule's live change, not re-fire against a stale \
-             snapshot: {actions:?}"
+            "one merged change, not one per rule: {actions:?}"
         );
         assert_eq!(ended_at, Some(target));
+    }
+
+    /// Two rules that disagree used to undo each other on every pass: set
+    /// the first rule's value, then the second's, forever. The merged effect
+    /// sets the last rule's value once and then leaves it alone.
+    #[test]
+    fn disagreeing_rules_settle_on_the_last_one() {
+        let _guard = utils::PROCESS_NICE_TEST_LOCK.lock().unwrap();
+        let pid = std::process::id();
+        let starting = utils::get_nice(pid).unwrap_or(0);
+        if starting + 2 > 19 {
+            return;
+        }
+        let mut first = rule_with("apply-rules-disagree-test", MatchType::Contains);
+        first.rule_id = "first".into();
+        first.nice = Some(starting + 2);
+        let mut last = rule_with("apply-rules-disagree-test", MatchType::Contains);
+        last.rule_id = "last".into();
+        last.nice = Some(starting + 1);
+        let rules = [first, last];
+        let mut failed = FailedChanges::new();
+        let pass = |current: Option<i32>, failed: &mut FailedChanges| {
+            apply_rules(
+                &rules,
+                pid,
+                "apply-rules-disagree-test",
+                current,
+                || None,
+                failed,
+                &|_| {},
+            )
+        };
+
+        assert_eq!(pass(Some(starting), &mut failed).len(), 1);
+        assert_eq!(utils::get_nice(pid), Some(starting + 1));
+        assert!(pass(utils::get_nice(pid), &mut failed).is_empty());
+    }
+
+    /// I/O class 0 ("none") takes no level: asking for level 4 with it is
+    /// EINVAL, which the editor's defaults produced.
+    #[test]
+    fn ionice_targets_are_what_the_kernel_accepts() {
+        assert_eq!(ionice_target(0, Some(4)), (0, 0));
+        assert_eq!(ionice_target(2, None), (2, 0));
+        assert_eq!(ionice_target(2, Some(9)), (2, 7));
+    }
+
+    /// A refused I/O priority change is reported once and not retried each
+    /// pass, as nice failures already were.
+    #[test]
+    fn a_refused_ionice_change_is_logged_once() {
+        // Real-time I/O class needs CAP_SYS_ADMIN or CAP_SYS_NICE.
+        // SAFETY: getuid(2) cannot fail and takes no arguments.
+        if unsafe { nix::libc::getuid() } == 0 {
+            return;
+        }
+        let mut rule = rule_with("apply-rules-ionice-test", MatchType::Contains);
+        rule.ionice_class = Some(1);
+        rule.ionice_level = Some(0);
+        let rules = [rule];
+        let pid = std::process::id();
+        let mut failed = FailedChanges::new();
+        let reads = std::cell::Cell::new(0);
+        let mut pass = || {
+            apply_rules(
+                &rules,
+                pid,
+                "apply-rules-ionice-test",
+                None,
+                || {
+                    reads.set(reads.get() + 1);
+                    None
+                },
+                &mut failed,
+                &|_| {},
+            )
+        };
+        let first = pass();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].contains("FAILED"), "{first:?}");
+        assert!(pass().is_empty());
+        assert_eq!(reads.get(), 1, "a known failure needs no ioprio read");
     }
 }

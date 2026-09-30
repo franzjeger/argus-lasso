@@ -624,10 +624,10 @@ struct Daemon {
     original_affinities: HashMap<u32, HashSet<u32>>,
     /// pid → expiry Instant (suppress rule re-enforcement after manual change)
     manual_overrides: HashMap<u32, Instant>,
-    /// (rule_id, pid) pairs whose set_nice failed — tried once, not every
+    /// Rule nice / I/O priority changes that failed — tried once, not every
     /// 500ms tick; pruned when the PID dies, cleared when rules change. The
     /// only such set: new-process and periodic enforcement share it.
-    nice_failed: HashSet<(String, u32)>,
+    nice_failed: crate::rules::FailedChanges,
     /// PIDs first seen by the last snapshot. They got their rules there, so
     /// that pass's enforcement, reading their not-yet-updated snapshot
     /// values, must not apply (and log) them a second time.
@@ -697,7 +697,7 @@ impl Daemon {
             first_snapshot: true,
             original_affinities: HashMap::new(),
             manual_overrides: HashMap::new(),
-            nice_failed: HashSet::new(),
+            nice_failed: Default::default(),
             fresh_pids: HashSet::new(),
             gaming: GamingState::default(),
             prev_throttled: HashSet::new(),
@@ -989,7 +989,7 @@ impl Daemon {
         }
         self.caches.retain_live(current_pids);
         self.nice_failed
-            .retain(|(_, pid)| current_pids.contains(pid));
+            .retain(|failed| current_pids.contains(&failed.pid));
     }
 
     /// Auto Gaming Mode (Steam/Proton detection).
@@ -1057,7 +1057,7 @@ impl Daemon {
                     proc.pid,
                     &proc.name,
                     Some(proc.nice),
-                    crate::utils::get_ionice_raw(proc.pid), // Could be cached, but only queried if rule matches
+                    || crate::utils::get_ionice_raw(proc.pid),
                     &mut self.nice_failed,
                     &self.log,
                 );
@@ -1710,7 +1710,7 @@ fn apply_new_pid(
     rule_engine: &Arc<Mutex<RuleEngine>>,
     original_affinities: &mut HashMap<u32, HashSet<u32>>,
     gaming: &mut GamingState,
-    nice_failed: &mut HashSet<(String, u32)>,
+    nice_failed: &mut crate::rules::FailedChanges,
     log_cb: &impl Fn(String),
 ) {
     let pid = proc.pid;
@@ -1816,7 +1816,7 @@ fn apply_matching_rules(
     rule_engine: &Arc<Mutex<RuleEngine>>,
     pid: u32,
     name: &str,
-    nice_failed: &mut HashSet<(String, u32)>,
+    nice_failed: &mut crate::rules::FailedChanges,
     log_cb: &impl Fn(String),
 ) -> bool {
     let Ok(re) = rule_engine.lock() else {
@@ -1827,7 +1827,7 @@ fn apply_matching_rules(
         pid,
         name,
         utils::get_nice(pid),
-        utils::get_ionice_raw(pid),
+        || utils::get_ionice_raw(pid),
         nice_failed,
         log_cb,
     );
@@ -1838,7 +1838,7 @@ fn reapply_defaults(
     config: &Config,
     rule_engine: &Arc<Mutex<RuleEngine>>,
     known_pids: &HashSet<u32>,
-    nice_failed: &mut HashSet<(String, u32)>,
+    nice_failed: &mut crate::rules::FailedChanges,
     log_cb: &impl Fn(String),
 ) {
     let default_aff = match &config.cpu.default_affinity {

@@ -151,14 +151,28 @@ fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> std::io::Resul
         }
     }
 
+    // sched_getaffinity(2) reports the requested mask limited to online
+    // CPUs, so with CPUs parked the thread never "matches" the full request;
+    // compare against what the kernel can actually show instead.
+    let reported = only_changed.then(|| {
+        let online = get_online_cpus();
+        let mut set = CpuSet::new();
+        for cpu in cpuset.iter().filter(|cpu| online.contains(cpu)) {
+            let _ = set.set(*cpu as usize);
+        }
+        set
+    });
+
     let mut any_ok = false;
     let mut first_err = None;
     // Affinity belongs to each thread, not to the process as a whole.
     for_each_thread(pid, |tid| {
-        if only_changed
-            && sched_getaffinity(Pid::from_raw(tid as i32)).is_ok_and(|current| current == cpu_set)
-        {
-            return;
+        if let Some(reported) = &reported {
+            if sched_getaffinity(Pid::from_raw(tid as i32))
+                .is_ok_and(|current| current == *reported)
+            {
+                return;
+            }
         }
         match sched_setaffinity(Pid::from_raw(tid as i32), &cpu_set) {
             Ok(_) => any_ok = true,
@@ -950,6 +964,33 @@ mod tests {
         assert!(!set_affinity_if_changed(pid, &target_cpu.to_string()));
         done_tx.send(()).unwrap();
         worker.join().unwrap();
+    }
+
+    /// With CPUs parked the kernel reports only the online part of a mask,
+    /// which used to look like a difference and re-apply every pass.
+    #[test]
+    fn affinity_naming_offline_cpus_settles() {
+        let online = get_online_cpus();
+        let Some(offline) = (0..CpuSet::count() as u32)
+            .rev()
+            .find(|c| !online.contains(c))
+        else {
+            return;
+        };
+        let Some(&cpu) = online.iter().min() else {
+            return;
+        };
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let cpulist = format!("{cpu},{offline}");
+        let first = set_affinity_if_changed(child.id(), &cpulist);
+        let second = set_affinity_if_changed(child.id(), &cpulist);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(first);
+        assert!(!second, "an online-limited mask must count as applied");
     }
 
     #[test]
