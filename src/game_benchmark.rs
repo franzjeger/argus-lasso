@@ -26,6 +26,10 @@ pub struct GameBenchmark {
     graphs: [Vec<(f64, f64)>; 2],
     graph_job: Option<mpsc::Receiver<GraphResult>>,
     graph_error: String,
+    /// Bytes the recordings directory holds, as of the last scan.
+    disk_bytes: u64,
+    /// The recording whose "Delete…" was clicked, awaiting confirmation.
+    confirm_delete: Option<PathBuf>,
 }
 impl Default for GameBenchmark {
     fn default() -> Self {
@@ -45,6 +49,8 @@ impl Default for GameBenchmark {
             graphs: Default::default(),
             graph_job: None,
             graph_error: String::new(),
+            disk_bytes: 0,
+            confirm_delete: None,
         }
     }
 }
@@ -77,6 +83,7 @@ impl GameBenchmark {
                 Ok(data) => {
                     self.active = data.active;
                     self.results = data.results;
+                    self.disk_bytes = data.disk_bytes;
                     self.error = data.error;
                     self.scan = None;
                 }
@@ -100,6 +107,7 @@ impl GameBenchmark {
                 let _ = tx.send(RecordingScan {
                     active: capture::read_control().is_active(),
                     results: capture::load_summaries(),
+                    disk_bytes: capture::disk_use(),
                     error: read_bounded_text(&capture::directory().join("latest-error.txt")),
                 });
                 ctx.request_repaint();
@@ -203,7 +211,12 @@ impl GameBenchmark {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.label(theme::bold(ui, "Recent recordings", tokens::FONT_HEADING));
+        ui.horizontal(|ui| {
+            ui.label(theme::bold(ui, "Recent recordings", tokens::FONT_HEADING));
+            if self.disk_bytes > 0 {
+                ui.weak(format!("· {} on disk", disk_size(self.disk_bytes)));
+            }
+        });
         if self.results.is_empty() {
             ui.weak("Your completed recordings will appear here.");
         }
@@ -217,6 +230,7 @@ impl GameBenchmark {
             self.compare_recent();
         }
         let mut selection_changed = std::mem::take(&mut self.comparison_dirty);
+        let mut delete_now = None;
         for (path, result) in &self.results {
             egui::CollapsingHeader::new(recording_label(result)).id_salt(path).show(ui, |ui| {
                 ui.label(format!("Average {} FPS · 1% low {} FPS · p99 {} ms", metric(result.average_fps), metric(result.low_1_fps), metric(result.p99_frametime_ms)));
@@ -234,8 +248,41 @@ impl GameBenchmark {
                     if ui.button("Open recording folder").clicked() {
                         let _ = std::process::Command::new("xdg-open").arg(capture::directory()).spawn();
                     }
+                    if ui.button("Delete…").clicked() {
+                        self.confirm_delete = Some(path.clone());
+                    }
                 });
+                if self.confirm_delete.as_ref() == Some(path) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Delete this recording and its files?");
+                        if ui.button("Delete").clicked() {
+                            delete_now = Some(path.clone());
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_delete = None;
+                        }
+                    });
+                }
             });
+        }
+        if let Some(path) = delete_now {
+            self.confirm_delete = None;
+            match capture::delete_recording(&path) {
+                Ok(()) => {
+                    self.results.retain(|(p, _)| *p != path);
+                    for slot in &mut self.compare {
+                        if slot.as_ref() == Some(&path) {
+                            *slot = None;
+                            selection_changed = true;
+                        }
+                    }
+                    self.status = "Recording deleted.".into();
+                }
+                Err(e) => self.status = format!("Could not delete the recording: {e}"),
+            }
+            // A scan started before the deletion would list it again.
+            self.scan = None;
+            self.checked = None;
         }
         if selection_changed {
             self.graphs = Default::default();
@@ -452,6 +499,7 @@ fn read_bounded_text(path: &std::path::Path) -> String {
 struct RecordingScan {
     active: bool,
     results: Vec<(PathBuf, Summary)>,
+    disk_bytes: u64,
     error: String,
 }
 type Graphs = [Vec<(f64, f64)>; 2];
@@ -492,6 +540,25 @@ fn latest_two_runs(results: &[(PathBuf, Summary)]) -> Option<[&PathBuf; 2]> {
     match runs.as_slice() {
         [later, earlier, ..] => Some([earlier.0, later.0]),
         _ => None,
+    }
+}
+
+/// A size in bytes for people: "512 KB", "37.4 MB", "1.2 GB".
+fn disk_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value < 10.0 && unit > 0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
     }
 }
 
@@ -712,6 +779,15 @@ mod comparison_tests {
             "the spike survives"
         );
         assert!(points.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    fn disk_sizes_read_like_a_file_manager() {
+        assert_eq!(disk_size(512 * 1024), "512 KB");
+        assert_eq!(disk_size(37_400_000), "36 MB");
+        assert_eq!(disk_size(5_500_000), "5.2 MB");
+        assert_eq!(disk_size(1_288_490_189), "1.2 GB");
+        assert_eq!(disk_size(100), "100 B");
     }
 
     /// A swapchain recreated during the latest recording used to be
