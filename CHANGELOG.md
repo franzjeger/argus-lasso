@@ -265,6 +265,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - Start or Stop recording is no longer undone by a recordings scan that read the
   state just before the click, which put the button back so a second click
   restarted the recording.
+- Changing the theme no longer resets the zoom or applies the display scale from
+  startup, which showed the UI at the wrong size after moving to a monitor with a
+  different scale.
 
 ### Changed
 

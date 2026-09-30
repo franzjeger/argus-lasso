@@ -77,13 +77,16 @@ pub fn apply_viewport_opacity(ui: &mut egui::Ui, opacity: f32) {
 }
 
 /// Apply the selected theme.
-pub fn apply_theme(ctx: &Context, native_ppp: f32, theme: &AppTheme) {
+/// Apply the selected theme. It leaves the display scale alone: setting
+/// it here reset the user's zoom, and used the scale of the monitor at
+/// startup on whichever monitor the window was on now.
+pub fn apply_theme(ctx: &Context, theme: &AppTheme) {
     install_fonts(ctx);
     match theme {
-        AppTheme::BreezeDark => apply(ctx, native_ppp),
-        AppTheme::BreezeLight => apply_light(ctx, native_ppp),
-        AppTheme::AdwaitaDark => apply_adwaita(ctx, native_ppp, true),
-        AppTheme::AdwaitaLight => apply_adwaita(ctx, native_ppp, false),
+        AppTheme::BreezeDark => apply(ctx),
+        AppTheme::BreezeLight => apply_light(ctx),
+        AppTheme::AdwaitaDark => apply_adwaita(ctx, true),
+        AppTheme::AdwaitaLight => apply_adwaita(ctx, false),
     }
     ctx.global_style_mut(|style| {
         use egui::TextStyle::*;
@@ -1109,10 +1112,7 @@ fn scroll_style() -> egui::style::ScrollStyle {
     s
 }
 
-pub fn apply(ctx: &Context, native_ppp: f32) {
-    // Ensure the rendering scale matches the display's native DPI so fonts
-    // don't shrink when the theme is reapplied (e.g. after toggling system theme).
-    ctx.set_pixels_per_point(native_ppp);
+pub fn apply(ctx: &Context) {
     let mut style = Style::default();
 
     let mut vis = Visuals::dark();
@@ -1190,8 +1190,7 @@ pub fn apply(ctx: &Context, native_ppp: f32) {
 
 // ── Breeze Light theme ────────────────────────────────────────────────────────
 
-pub fn apply_light(ctx: &Context, native_ppp: f32) {
-    ctx.set_pixels_per_point(native_ppp);
+pub fn apply_light(ctx: &Context) {
     let mut style = Style::default();
 
     let mut vis = Visuals::light();
@@ -1278,8 +1277,7 @@ pub fn apply_light(ctx: &Context, native_ppp: f32) {
 // session instead of standing out as a KDE transplant. The two modes share
 // structure and differ only in colour values, hence one parameterised fn.
 
-pub fn apply_adwaita(ctx: &Context, native_ppp: f32, dark: bool) {
-    ctx.set_pixels_per_point(native_ppp);
+pub fn apply_adwaita(ctx: &Context, dark: bool) {
     let mut style = Style::default();
 
     let mut vis = if dark {
@@ -1382,8 +1380,8 @@ mod viewport_opacity_tests {
     fn bundled_fonts_are_installed_for_each_independent_context() {
         for _ in 0..2 {
             let ctx = egui::Context::default();
-            apply_theme(&ctx, 1.0, &AppTheme::BreezeDark);
-            apply_theme(&ctx, 1.0, &AppTheme::BreezeDark);
+            apply_theme(&ctx, &AppTheme::BreezeDark);
+            apply_theme(&ctx, &AppTheme::BreezeDark);
             let output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 ui.label(bold(ui, "Heading", 16.0));
             });
@@ -1396,7 +1394,7 @@ mod viewport_opacity_tests {
     fn native_panel_alpha_is_local_live_and_restorable() {
         let ctx = egui::Context::default();
         for theme in [AppTheme::BreezeDark, AppTheme::AdwaitaLight] {
-            apply_theme(&ctx, 1.0, &theme);
+            apply_theme(&ctx, &theme);
             let original = ctx.global_style().visuals.panel_fill;
             for opacity in [0.35, 0.78, 1.0] {
                 let output = ctx.run_ui(egui::RawInput::default(), |ui| {
@@ -1425,7 +1423,7 @@ mod accessibility_tests {
     #[test]
     fn painted_controls_have_names_and_states() {
         let ctx = egui::Context::default();
-        apply_theme(&ctx, 1.0, &AppTheme::BreezeDark);
+        apply_theme(&ctx, &AppTheme::BreezeDark);
         ctx.enable_accesskit();
         let output = ctx.run_ui(Default::default(), |root| {
             egui::CentralPanel::default().show_inside(root, |ui| {
@@ -1501,5 +1499,22 @@ mod accessibility_tests {
         run(vec![key(egui::Key::Enter)], false, &mut value);
         run(vec![], false, &mut value);
         assert_eq!(value, 95.0);
+    }
+
+    /// Picking a theme used to set the display scale captured at startup,
+    /// resetting the user's zoom.
+    #[test]
+    fn a_theme_leaves_the_zoom_alone() {
+        let ctx = egui::Context::default();
+        // A new zoom takes effect with the next frame.
+        let frame = |ctx: &egui::Context| {
+            let _ = ctx.run_ui(Default::default(), |_| {});
+        };
+        ctx.set_zoom_factor(1.5);
+        frame(&ctx);
+        super::apply_theme(&ctx, &super::AppTheme::BreezeLight);
+        super::apply_theme(&ctx, &super::AppTheme::AdwaitaDark);
+        frame(&ctx);
+        assert_eq!(ctx.zoom_factor(), 1.5);
     }
 }

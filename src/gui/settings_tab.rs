@@ -28,7 +28,6 @@ pub struct SettingsTab {
     affinity_error: Option<String>,
     pub cpu_dialog: Option<AffinityDialog>,
     pub opacity: f32,
-    pub native_ppp: f32,
     pub autostart_enabled: bool,
     /// A check or change of autostart in progress: systemctl can be slow,
     /// so it runs off the UI thread. Yields whether autostart is enabled
@@ -70,7 +69,6 @@ impl SettingsTab {
             cpu_dialog: None,
             config,
             opacity,
-            native_ppp: 1.0,
             autostart_enabled,
             autostart_job: Some(spawn_autostart(|| {
                 (check_autostart_enabled(), String::new())
@@ -421,7 +419,7 @@ impl SettingsTab {
                                     }
                                 });
                             if self.theme != prev_theme {
-                                theme::apply_theme(ctx, self.native_ppp, &self.theme);
+                                theme::apply_theme(ctx, &self.theme);
                             }
                         });
 
@@ -1036,7 +1034,7 @@ mod tests {
     /// Clicks in the tab, rendered headless; returns what `show` reported.
     fn click(tab: &mut super::SettingsTab, label: &str) -> Option<crate::config::Config> {
         let ctx = egui::Context::default();
-        crate::gui::theme::apply_theme(&ctx, 1.0, &crate::gui::theme::AppTheme::BreezeDark);
+        crate::gui::theme::apply_theme(&ctx, &crate::gui::theme::AppTheme::BreezeDark);
         ctx.enable_accesskit();
         let mut updates = crate::updater::UpdateState::default();
         let mut reported = None;

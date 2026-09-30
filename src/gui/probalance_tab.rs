@@ -433,7 +433,7 @@ mod tests {
     /// returns what `show` reported.
     fn click(tab: &mut ProBalanceTab, label: &str) -> Option<ProBalanceConfig> {
         let ctx = egui::Context::default();
-        crate::gui::theme::apply_theme(&ctx, 1.0, &crate::gui::theme::AppTheme::BreezeDark);
+        crate::gui::theme::apply_theme(&ctx, &crate::gui::theme::AppTheme::BreezeDark);
         ctx.enable_accesskit();
         let mut reported = None;
         let mut frame = |events: Vec<egui::Event>, tab: &mut ProBalanceTab| {

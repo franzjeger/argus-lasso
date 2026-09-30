@@ -1447,7 +1447,7 @@ mod tests {
     #[test]
     fn filter_chips_are_visible_to_screen_readers() {
         let ctx = egui::Context::default();
-        theme::apply_theme(&ctx, 1.0, &theme::AppTheme::BreezeDark);
+        theme::apply_theme(&ctx, &theme::AppTheme::BreezeDark);
         ctx.enable_accesskit();
         let mut tab = ProcessTab::new(&[], &[]);
         tab.chip_throttled = true;
@@ -1530,7 +1530,7 @@ mod tests {
     #[test]
     fn long_pid_and_multicore_numbers_fit_after_old_widths_and_window_resize() {
         let ctx = egui::Context::default();
-        theme::apply_theme(&ctx, 1.0, &theme::AppTheme::BreezeDark);
+        theme::apply_theme(&ctx, &theme::AppTheme::BreezeDark);
         let mut tab = ProcessTab::new(&[30.0; 9], &[]);
         let snapshot = [ProcInfo {
             pid: 2_147_483_647,

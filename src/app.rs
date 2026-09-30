@@ -186,10 +186,8 @@ impl ArgusLassoApp {
         config: Config,
         tour_dir: Option<std::path::PathBuf>,
     ) -> Self {
-        // native_pixels_per_point is set by the platform integration before new() is called.
-        let native_ppp = cc.egui_ctx.pixels_per_point();
         let startup_theme = crate::gui::theme::AppTheme::from_str(&config.ui.theme);
-        crate::gui::theme::apply_theme(&cc.egui_ctx, native_ppp, &startup_theme);
+        crate::gui::theme::apply_theme(&cc.egui_ctx, &startup_theme);
         // Child dialogs are native windows so they can be moved to another
         // monitor. Ordinary tooltips/popups retain egui's normal popup behavior.
         cc.egui_ctx.set_embed_viewports(false);
@@ -201,8 +199,7 @@ impl ArgusLassoApp {
 
         let probalance_tab = ProBalanceTab::new(config.probalance.clone());
         let gaming_mode_tab = GamingModeTab::new(config.clone());
-        let mut settings_tab = SettingsTab::new(config.clone());
-        settings_tab.native_ppp = native_ppp;
+        let settings_tab = SettingsTab::new(config.clone());
 
         // Initialise Wayland compositor-side opacity via wp_alpha_modifier_v1.
         // Extract the raw wl_display* and wl_surface* that eframe already holds.

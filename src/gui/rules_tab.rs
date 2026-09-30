@@ -848,7 +848,7 @@ mod tests {
     impl Harness {
         fn new(rules: &[RuleConfig]) -> Self {
             let ctx = egui::Context::default();
-            theme::apply_theme(&ctx, 1.0, &theme::AppTheme::BreezeDark);
+            theme::apply_theme(&ctx, &theme::AppTheme::BreezeDark);
             ctx.enable_accesskit();
             let mut engine = RuleEngine::new();
             engine.load_rules(rules);
