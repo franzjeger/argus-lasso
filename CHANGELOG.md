@@ -10,6 +10,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ## [Unreleased]
 
+### Fixed
+
+- `--ui-tour` captures the window opaque. It used the window opacity of whoever
+  ran it, and at 80 % every screenshot was drawn over black: dark themes came out
+  a muddy brown-grey and light themes grey.
+
 ## [1.4.0] — 2026-09-30
 
 A Vulkan HUD for games, frame-time recording with A/B comparison, and signed

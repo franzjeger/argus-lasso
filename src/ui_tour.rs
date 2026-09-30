@@ -97,6 +97,16 @@ pub const STEPS: &[Step] = &[
     Step::RuleOffer,
 ];
 
+/// Settle the configuration the tour renders with.
+///
+/// Screenshots show the window as it looks opaque, whatever opacity the person
+/// running the tour chose for their own window. At 80 % every capture was
+/// composited over black: the dark themes came out a muddy brown-grey and the
+/// light ones grey. The tour never saves, so this stays in the throwaway copy.
+pub fn prepare_config(config: &mut crate::config::Config) {
+    config.ui.opacity = 1.0;
+}
+
 /// Frames to render before capturing a step.
 ///
 /// One frame is not enough: egui is immediate-mode, so a screen that sizes
@@ -317,6 +327,14 @@ mod tests {
         for step in all {
             assert!(STEPS.contains(&step), "{step:?} is missing from STEPS");
         }
+    }
+
+    #[test]
+    fn captures_are_opaque_whatever_the_window_opacity() {
+        let mut config = crate::config::Config::default();
+        config.ui.opacity = 0.8;
+        prepare_config(&mut config);
+        assert_eq!(config.ui.opacity, 1.0);
     }
 
     #[test]

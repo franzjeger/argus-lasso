@@ -449,7 +449,10 @@ fn main() {
     // Load config
     // The tour renders a throwaway session: it must not write a config,
     // which migrating an old one would.
-    let (cfg, load_error) = config::load(args.ui_tour.is_none());
+    let (mut cfg, load_error) = config::load(args.ui_tour.is_none());
+    if args.ui_tour.is_some() {
+        ui_tour::prepare_config(&mut cfg);
+    }
     // Set the unreadable file aside before anything can save over it — but
     // never from the read-only tour, which must not write configuration.
     let load_notice = match load_error {
