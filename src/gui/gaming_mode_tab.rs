@@ -35,19 +35,40 @@ pub enum GamingEvent {
 /// its "Force quit".
 pub(crate) struct LaunchedGame {
     pub pid: u32,
+    /// Start time in clock ticks, which orders candidates (see `find`).
+    start: u64,
     handle: crate::process_control::ProcessHandle,
 }
 
 impl LaunchedGame {
-    /// None if the process is already gone, or started before `not_before`
-    /// (process start ticks): a game is never older than its own launch.
+    /// None if the process is already gone — including a zombie, which has
+    /// exited but not been reaped, and whose /proc entry would otherwise be
+    /// taken for a running game — or started before `not_before` (process
+    /// start ticks): a game is never older than its own launch.
     fn open(pid: u32, not_before: u64) -> Option<Self> {
-        let start = crate::fast_proc::read_stat(pid, &mut [0; 1024])?.starttime;
-        if start < not_before {
+        let stat = crate::fast_proc::read_stat(pid, &mut [0; 1024])?;
+        if stat.state == b'Z' || stat.starttime < not_before {
             return None;
         }
-        let handle = crate::process_control::ProcessHandle::open(pid, start).ok()?;
-        Some(Self { pid, handle })
+        let handle = crate::process_control::ProcessHandle::open(pid, stat.starttime).ok()?;
+        Some(Self {
+            pid,
+            start: stat.starttime,
+            handle,
+        })
+    }
+
+    /// The game called `name`, started since `not_before`. Several processes
+    /// can carry the name (a stub and the game, a crash handler); the one
+    /// started first is taken, ties by PID, so which one is watched does not
+    /// depend on the unspecified order of /proc.
+    fn find(name: &str, not_before: u64) -> Option<Self> {
+        std::fs::read_dir("/proc")
+            .ok()?
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|&pid| proc_name_matches(name, pid))
+            .filter_map(|pid| Self::open(pid, not_before))
+            .min_by_key(|game| (game.start, game.pid))
     }
 }
 
@@ -381,14 +402,7 @@ impl GamingModeTab {
 
         let name = self.game_name.clone();
         let not_before = self.launch_start_ticks;
-        // The first candidate that is still alive by the time it is opened.
-        let find_game = || -> Option<LaunchedGame> {
-            std::fs::read_dir("/proc")
-                .ok()?
-                .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
-                .filter(|&pid| proc_name_matches(&name, pid))
-                .find_map(|pid| LaunchedGame::open(pid, not_before))
-        };
+        let find_game = || LaunchedGame::find(&name, not_before);
 
         match self.watch_phase {
             WatchPhase::Idle => {}
@@ -1316,7 +1330,75 @@ fn parse_launch_command(command: &str) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod launcher_tests {
-    use super::{is_game_process, parse_launch_command};
+    use super::{is_game_process, parse_launch_command, LaunchedGame};
+
+    /// Runs `sleep` under `name`, which becomes its process name; killed and
+    /// reaped when dropped.
+    struct Named(std::process::Child);
+
+    impl Named {
+        fn spawn(dir: &std::path::Path, name: &str) -> Self {
+            let link = dir.join(name);
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink("/usr/bin/sleep", &link).unwrap();
+            Self(std::process::Command::new(&link).arg("30").spawn().unwrap())
+        }
+
+        fn start(&self) -> u64 {
+            crate::fast_proc::read_stat(self.0.id(), &mut [0; 1024])
+                .unwrap()
+                .starttime
+        }
+    }
+
+    impl Drop for Named {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// With several processes of the game's name, the one latched onto
+    /// depended on the unspecified order of /proc.
+    #[test]
+    fn the_earliest_started_game_process_is_taken() {
+        let dir = std::env::temp_dir().join(format!("argus-latch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = format!("aglatch{}", std::process::id() % 10_000_000);
+        let first = Named::spawn(&dir, &name);
+        // Start times are counted in 10 ms clock ticks.
+        while Named::spawn(&dir, "aglatchprobe").start() <= first.start() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let second = Named::spawn(&dir, &name);
+        assert!(second.start() > first.start());
+
+        assert_eq!(LaunchedGame::find(&name, 0).unwrap().pid, first.0.id());
+        let later = LaunchedGame::find(&name, second.start()).unwrap();
+        assert_eq!(
+            later.pid,
+            second.0.id(),
+            "one started before the launch is not the game"
+        );
+        drop((first, second));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An exited process nobody has reaped keeps its /proc entry, and was
+    /// taken for a running game.
+    #[test]
+    fn a_zombie_is_not_a_running_game() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let zombie = (0..400).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            crate::fast_proc::read_stat(pid, &mut [0; 1024]).is_some_and(|s| s.state == b'Z')
+        });
+        let opened = LaunchedGame::open(pid, 0).is_some();
+        child.wait().unwrap();
+        assert!(zombie, "the child never became a zombie");
+        assert!(!opened);
+    }
 
     #[test]
     fn game_names_match_the_game_and_not_its_launch_helpers() {
