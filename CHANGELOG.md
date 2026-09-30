@@ -248,6 +248,13 @@ current source, release and verification status, see [docs/status.md](docs/statu
   window. With both open, clicks meant for the visible one went to the other, so
   a process's affinity could be changed from Settings. "Pick CPUs…" also stays
   open when another Settings section is shown.
+- "Start with session" uses one mechanism: the installed service if there is one,
+  otherwise an XDG autostart entry. Both were set up, so two instances started at
+  login and the window came up. A second `--minimized` launch no longer asks for
+  the window, a request left while Argus was not running is dropped at start, and
+  one that arrives before the window exists is kept until it does. The autostart
+  entry points at the binary on disk, not at the " (deleted)" image after an
+  update, and systemctl runs in the background.
 
 ### Changed
 

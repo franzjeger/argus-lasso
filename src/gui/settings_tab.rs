@@ -30,6 +30,10 @@ pub struct SettingsTab {
     pub opacity: f32,
     pub native_ppp: f32,
     pub autostart_enabled: bool,
+    /// A check or change of autostart in progress: systemctl can be slow,
+    /// so it runs off the UI thread. Yields whether autostart is enabled
+    /// afterwards, and what to say about it.
+    autostart_job: Option<std::sync::mpsc::Receiver<(bool, String)>>,
     pub status: String,
     /// Active theme — changes are applied immediately in show().
     pub theme: AppTheme,
@@ -52,7 +56,7 @@ impl SettingsTab {
     pub fn new(config: Config) -> Self {
         let current_affinity = config.cpu.default_affinity.clone().unwrap_or_default();
         let default_affinity_enabled = !current_affinity.is_empty();
-        let autostart_enabled = check_autostart_enabled();
+        let autostart_enabled = xdg_entry().is_some_and(|entry| entry.exists());
         // Restore opacity and theme from persisted config.
         let opacity = config.ui.opacity.clamp(0.1, 1.0);
         let theme = AppTheme::from_str(&config.ui.theme);
@@ -68,6 +72,9 @@ impl SettingsTab {
             opacity,
             native_ppp: 1.0,
             autostart_enabled,
+            autostart_job: Some(spawn_autostart(|| {
+                (check_autostart_enabled(), String::new())
+            })),
             status: String::new(),
             theme,
             cpu_governor: governor,
@@ -151,16 +158,39 @@ impl SettingsTab {
     /// Register or remove autostart as the checkbox now says, then show
     /// what is actually in place.
     fn commit_autostart(&mut self) {
-        let result = if self.autostart_enabled {
-            write_autostart()
-        } else {
-            disable_autostart()
+        let enable = self.autostart_enabled;
+        self.autostart_job = Some(spawn_autostart(move || {
+            let result = if enable {
+                write_autostart()
+            } else {
+                disable_autostart()
+            };
+            let note = match result {
+                Ok(note) => note,
+                Err(e) => format!("Autostart failed: {e}"),
+            };
+            (check_autostart_enabled(), note)
+        }));
+    }
+
+    fn poll_autostart(&mut self, ctx: &egui::Context) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(job) = &self.autostart_job else {
+            return;
         };
-        self.status = match result {
-            Ok(note) => note,
-            Err(e) => format!("Autostart failed: {e}"),
-        };
-        self.autostart_enabled = check_autostart_enabled();
+        match job.try_recv() {
+            Ok((enabled, note)) => {
+                self.autostart_enabled = enabled;
+                if !note.is_empty() {
+                    self.status = note;
+                }
+                self.autostart_job = None;
+            }
+            Err(TryRecvError::Disconnected) => self.autostart_job = None,
+            Err(TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
     }
 
     /// Set a governor or EPP just picked. pkexec can wait on an
@@ -221,6 +251,7 @@ impl SettingsTab {
             changed |= self.finish_editing().is_some();
         }
         self.poll_power(ctx);
+        self.poll_autostart(ctx);
         let stale = self
             .power_synced
             .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
@@ -531,10 +562,14 @@ impl SettingsTab {
                 if self.section == SettingsSection::Startup {
                     theme::card(ui, "Startup", |ui| {
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Start with session", |ui| {
+                            let idle = self.autostart_job.is_none();
                             if ui
-                                .checkbox(
-                                    &mut self.autostart_enabled,
-                                    "Launch Argus-Lasso automatically with your desktop session",
+                                .add_enabled(
+                                    idle,
+                                    egui::Checkbox::new(
+                                        &mut self.autostart_enabled,
+                                        "Launch Argus-Lasso automatically with your desktop session",
+                                    ),
                                 )
                                 .changed()
                             {
@@ -780,28 +815,44 @@ fn set_epp(epp: &str) -> Result<(), String> {
     )
 }
 
-fn check_autostart_enabled() -> bool {
-    // Check XDG autostart first (works on GNOME and KDE).
-    if crate::config::home_dir()
-        .is_some_and(|home| home.join(".config/autostart/argus-lasso.desktop").exists())
-    {
-        return true;
-    }
-    // Fall back to systemd user service check.
-    std::process::Command::new("systemctl")
-        .args(["--user", "is-enabled", "argus-lasso.service"])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled")
-        .unwrap_or(false)
+const SERVICE_UNIT: &str = "argus-lasso.service";
+
+fn spawn_autostart(
+    work: impl FnOnce() -> (bool, String) + Send + 'static,
+) -> std::sync::mpsc::Receiver<(bool, String)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx
 }
 
-/// Without a home, an empty $HOME would turn every path below into one
-/// relative to wherever the app happened to be started.
-fn home_or_err() -> std::io::Result<String> {
-    crate::config::home_dir()
-        .map(|home| home.to_string_lossy().into_owned())
-        .ok_or_else(|| std::io::Error::other("home directory unknown"))
+/// `systemctl --user <args>`'s output, if it ran and succeeded.
+fn systemctl_user(args: &[&str]) -> Option<String> {
+    std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// Whether the service unit the installer or a package set up is known to
+/// the user's service manager, from the user's or the system's unit
+/// directories. Starting with the session then means enabling it.
+fn service_unit_installed() -> bool {
+    systemctl_user(&["show", "-p", "LoadState", "--value", SERVICE_UNIT])
+        .is_some_and(|state| state == "loaded")
+}
+
+fn xdg_entry() -> Option<std::path::PathBuf> {
+    crate::config::home_dir().map(|home| home.join(".config/autostart/argus-lasso.desktop"))
+}
+
+fn check_autostart_enabled() -> bool {
+    xdg_entry().is_some_and(|entry| entry.exists())
+        || systemctl_user(&["is-enabled", SERVICE_UNIT]).is_some_and(|state| state == "enabled")
 }
 
 /// `path` as one argument of a desktop entry's Exec key. The spec applies
@@ -826,107 +877,62 @@ fn desktop_exec_arg(path: &std::path::Path) -> String {
     out
 }
 
-/// `path` as the command of a systemd ExecStart: quoted, with `\` and `"`
-/// escaped and `%` (a specifier) doubled.
-fn systemd_exec_arg(path: &std::path::Path) -> String {
-    let mut out = String::from("\"");
-    for c in path.to_string_lossy().chars() {
-        match c {
-            '"' | '\\' => {
-                out.push('\\');
-                out.push(c);
-            }
-            '%' => out.push_str("%%"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
+/// Start with the session through one mechanism only: the installed service
+/// if there is one, otherwise an XDG autostart entry. Both used to be set up,
+/// so two instances started at login, and the one that lost the instance
+/// lock asked the other to show its window.
 fn write_autostart() -> std::io::Result<String> {
-    let home = home_or_err()?;
-    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("argus-lasso"));
-
-    // ── XDG autostart (works on GNOME, KDE, XFCE, and most other DEs) ────────
-    let xdg_dir = format!("{home}/.config/autostart");
-    std::fs::create_dir_all(&xdg_dir)?;
-    let xdg_entry = format!(
-        "[Desktop Entry]\nType=Application\nName=Argus-Lasso\n\
-         Exec={} --minimized\nIcon=argus-lasso\nHidden=false\n\
-         X-GNOME-Autostart-enabled=true\n",
-        desktop_exec_arg(&exe)
-    );
-    std::fs::write(format!("{xdg_dir}/argus-lasso.desktop"), xdg_entry)?;
-
-    // ── systemd user service (KDE / systemd-based desktops) ──────────────────
-    // An existing unit is the installer's or the user's, possibly customised
-    // (the installer keeps it across updates for that reason): enable it,
-    // never rewrite it.
-    let systemd_dir = format!("{home}/.config/systemd/user");
-    let unit_path = format!("{systemd_dir}/argus-lasso.service");
-    let unit_ready = if std::path::Path::new(&unit_path).exists() {
-        Ok(())
-    } else {
-        std::fs::create_dir_all(&systemd_dir).and_then(|()| {
-            std::fs::write(
-                &unit_path,
-                format!(
-                    "[Unit]\nDescription=Argus-Lasso Linux\nAfter=graphical-session.target\n\
-                     PartOf=graphical-session.target\n\n\
-                     [Service]\nExecStart={} --minimized\nRestart=on-failure\nRestartSec=5\n\n\
-                     [Install]\nWantedBy=graphical-session.target\n",
-                    systemd_exec_arg(&exe)
-                ),
-            )
-        })
-    };
-    let systemd_note = match unit_ready {
-        Ok(()) => {
-            if std::process::Command::new("systemctl")
-                .args(["--user", "enable", "argus-lasso.service"])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-            {
-                " + systemd".to_string()
-            } else {
-                " (systemd unit present but not enabled)".to_string()
-            }
-        }
-        Err(e) => format!(" (systemd unit not written: {e})"),
-    };
-
-    Ok(format!("Autostart enabled (XDG{systemd_note})"))
+    let entry = xdg_entry().ok_or_else(|| std::io::Error::other("home directory unknown"))?;
+    if service_unit_installed() {
+        let _ = std::fs::remove_file(&entry);
+        return match systemctl_user(&["enable", SERVICE_UNIT]) {
+            Some(_) => Ok("Autostart enabled (systemd service)".into()),
+            None => Err(std::io::Error::other(format!(
+                "systemctl --user enable {SERVICE_UNIT} failed"
+            ))),
+        };
+    }
+    // The path of the binary on disk: after an update, before a restart,
+    // the running image's path ends in " (deleted)".
+    let exe = crate::updater::install_target()
+        .unwrap_or_else(|_| std::path::PathBuf::from("argus-lasso"));
+    if let Some(dir) = entry.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(
+        &entry,
+        format!(
+            "[Desktop Entry]\nType=Application\nName=Argus-Lasso\n\
+             Exec={} --minimized\nIcon=argus-lasso\nHidden=false\n\
+             X-GNOME-Autostart-enabled=true\n",
+            desktop_exec_arg(&exe)
+        ),
+    )?;
+    Ok("Autostart enabled".into())
 }
 
 fn disable_autostart() -> std::io::Result<String> {
-    let home = home_or_err()?;
-
-    // Remove XDG autostart entry (best-effort: it may not exist).
-    let xdg = format!("{home}/.config/autostart/argus-lasso.desktop");
-    let _ = std::fs::remove_file(&xdg);
-
-    // Disable systemd unit if present.
-    let systemd_ok = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "argus-lasso.service"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    let systemd_note = if systemd_ok {
-        " + systemd"
-    } else {
-        " (systemd unit still enabled)"
-    };
-
-    Ok(format!("Autostart disabled (XDG{systemd_note})"))
+    if let Some(entry) = xdg_entry() {
+        match std::fs::remove_file(&entry) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    let enabled =
+        || systemctl_user(&["is-enabled", SERVICE_UNIT]).is_some_and(|state| state == "enabled");
+    if enabled() && systemctl_user(&["disable", SERVICE_UNIT]).is_none() {
+        return Err(std::io::Error::other(format!(
+            "systemctl --user disable {SERVICE_UNIT} failed"
+        )));
+    }
+    Ok("Autostart disabled".into())
 }
 
 #[cfg(test)]
 mod tests {
 
     #[test]
-    fn exec_paths_are_quoted_for_their_file_format() {
+    fn exec_paths_are_quoted_for_a_desktop_entry() {
         let path = std::path::Path::new("/home/a b/100%/\"x\"/$bin");
         assert_eq!(
             desktop_exec_arg(path),
@@ -936,10 +942,9 @@ mod tests {
             desktop_exec_arg(std::path::Path::new(r"/a\b")),
             r#""/a\\\\b""#
         );
-        assert_eq!(systemd_exec_arg(path), r#""/home/a b/100%%/\"x\"/$bin""#);
     }
 
-    use super::{desktop_exec_arg, systemd_exec_arg, write_sysfs_all_cpus_at};
+    use super::{desktop_exec_arg, write_sysfs_all_cpus_at};
     use std::cell::Cell;
 
     fn fake_cpu_dir(root: &std::path::Path, writable_cpus: &[u32], cpu_count: u32) {

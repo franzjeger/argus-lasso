@@ -249,7 +249,7 @@ pub fn recover_pending_update() -> Result<bool, String> {
 // ── Install ───────────────────────────────────────────────────────────────
 
 /// Where this process's own binary lives, resolved through any symlink.
-fn install_target() -> Result<PathBuf, String> {
+pub(crate) fn install_target() -> Result<PathBuf, String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("could not find the running binary: {e}"))?;
     // Once the updater replaces the binary via rename, the kernel marks the
