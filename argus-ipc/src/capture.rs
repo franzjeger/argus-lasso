@@ -206,6 +206,52 @@ const MAX_SUMMARIES_READ: usize = 500;
 /// Largest recording CSV read to recover it (two million rows fit).
 const MAX_RECOVERED_CSV: u64 = 96 * 1024 * 1024;
 
+/// Delete the recording `summary` lists: its summary, CSV (finished or
+/// partial) and metadata. Only a `.summary.json` directly in the recordings
+/// directory is accepted, so nothing else can be removed through this.
+pub fn delete_recording(summary: &Path) -> io::Result<()> {
+    delete_recording_in(&directory(), summary)
+}
+
+fn delete_recording_in(dir: &Path, summary: &Path) -> io::Result<()> {
+    let stem = summary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".summary.json"))
+        .filter(|stem| !stem.is_empty() && summary.parent() == Some(dir))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a recording", summary.display()),
+            )
+        })?;
+    // The summary goes last: until it does, a deletion that failed half way
+    // is still listed and can be tried again.
+    for suffix in [".csv", ".csv.partial", ".metadata.json", ".summary.json"] {
+        match fs::remove_file(dir.join(format!("{stem}{suffix}"))) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Bytes the files in the recordings directory take.
+pub fn disk_use() -> u64 {
+    disk_use_in(&directory())
+}
+
+fn disk_use_in(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
+
 pub fn load_summaries() -> Vec<(PathBuf, Summary)> {
     let dir = directory();
     recover_orphans(&dir, |pid| Path::new(&format!("/proc/{pid}")).exists());
@@ -475,6 +521,38 @@ mod tests {
         let toggled = update(&dir, 5, |old| !old.is_active()).unwrap();
         assert!(toggled.is_active(), "the CLI toggle still starts one");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Recordings were never deleted: CSVs of up to ~60 MB piled up.
+    #[test]
+    fn a_recording_is_deleted_with_all_its_files_and_nothing_else() {
+        let dir = temp_path("argus-ipc-delete");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let files = |stem: &str| {
+            [".summary.json", ".csv", ".csv.partial", ".metadata.json"]
+                .map(|s| dir.join(format!("{stem}{s}")))
+        };
+        for path in files("1-2-a-1").iter().chain(&files("1-2-b-2")) {
+            fs::write(path, b"x").unwrap();
+        }
+        fs::write(dir.join("control.json"), b"{}").unwrap();
+        assert_eq!(disk_use_in(&dir), 10);
+
+        delete_recording_in(&dir, &dir.join("1-2-a-1.summary.json")).unwrap();
+        assert!(files("1-2-a-1").iter().all(|p| !p.exists()));
+        assert!(files("1-2-b-2").iter().all(|p| p.exists()));
+        assert_eq!(disk_use_in(&dir), 6);
+
+        for refused in [
+            dir.join("control.json"),
+            dir.join(".summary.json"),
+            temp_path("elsewhere").join("1-2-b-2.summary.json"),
+        ] {
+            assert!(delete_recording_in(&dir, &refused).is_err(), "{refused:?}");
+        }
+        assert!(dir.join("control.json").exists());
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

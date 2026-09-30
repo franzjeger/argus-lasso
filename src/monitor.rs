@@ -1938,8 +1938,6 @@ fn check_hw_alerts(
     }
 }
 
-// ── Restore gaming nices ──────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1338,10 +1338,29 @@ mod launcher_tests {
 
     impl Named {
         fn spawn(dir: &std::path::Path, name: &str) -> Self {
+            use std::os::unix::process::CommandExt;
             let link = dir.join(name);
             let _ = std::fs::remove_file(&link);
             std::os::unix::fs::symlink("/usr/bin/sleep", &link).unwrap();
-            Self(std::process::Command::new(&link).arg("30").spawn().unwrap())
+            // argv[0] stays "sleep" for a sleep that picks its tool by name.
+            let child = std::process::Command::new(&link)
+                .arg0("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            // spawn() returns once the child's memory is replaced, which the
+            // kernel does before it renames the process: until then /proc
+            // still shows the parent's name. It failed on a busy aarch64 CI
+            // runner that way.
+            let comm = format!("/proc/{}/comm", child.id());
+            let renamed = (0..400).any(|_| {
+                std::fs::read_to_string(&comm).is_ok_and(|c| c.trim() == name) || {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    false
+                }
+            });
+            assert!(renamed, "{name} never showed its name");
+            Self(child)
         }
 
         fn start(&self) -> u64 {

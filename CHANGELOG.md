@@ -12,6 +12,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Added
 
+- Recordings can be deleted from Gaming → Recording ("Delete…", then confirm),
+  which removes the summary, CSV and metadata; the list shows how much space the
+  recordings take. Nothing deleted them before, and CSVs of up to ~60 MB piled up.
 - `argus-lasso install-helpers` installs or updates the CPU control helpers from a
   terminal, for example over SSH: pkexec asks for authentication in that terminal.
 - Readable game recording history and A/B comparison with average/1% low FPS,
@@ -49,6 +52,16 @@ current source, release and verification status, see [docs/status.md](docs/statu
   (CVE-2020-8694). `install-sensors.sh` hands the program to root on stdin and
   installs it only if its SHA-256 still matches, instead of having root copy it
   from a user-writable build directory. Reinstall the sensor service to apply.
+- ProBalance's nice throttles are recorded like its unit throttles, so the next
+  run puts them back after a crash or kill instead of leaving them for good.
+- A rule's I/O priority is put back per thread, as its nice value already was,
+  instead of giving every thread the main thread's old value.
+- Clearing the default affinity also releases processes that had it with no
+  record behind them (their pinning parent had exited, or an earlier run pinned
+  them); they get every CPU back.
+- Losing the display (logout, a compositor crash) no longer panics in the middle
+  of restoring CPUs and priorities: the app restores, then exits with an error so
+  systemd restarts it after a crash.
 - The launcher no longer takes an exited, unreaped process of the game's name for
   the running game, and when several processes carry the name it watches the one
   started first instead of whichever `/proc` listed first.
@@ -60,9 +73,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
   open is no longer dropped with a note to pick it again. The open editor comes
   to the front, and the new rule opens as soon as it is saved or cancelled. A
   rule from a template is titled "New rule", not "Edit Rule".
-- Helper installation no longer trusts the user-writable staging directory: root
-  installs only copies matching SHA-256 digests in its own command, so a file
-  swapped while the polkit prompt is open is refused instead of installed.
+- Installing the CPU control helpers no longer trusts files in the user's own
+  directories: the helper files travel inside the root command, and root checks
+  each against its SHA-256 before installing it. A file swapped while the polkit
+  prompt was open used to be installed, a FIFO or device node in its place could
+  hang root, and home directories with spaces or non-ASCII characters could not
+  install at all.
 - Nice and I/O priority now reach every thread of a process, as affinity already
   did. Rules, ProBalance and the Gaming Mode boost previously changed only the
   main thread. The renice helper is updated (v5) and asks to be reinstalled.
@@ -277,9 +293,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   open switched it to that row. "Show all rules" under Live rule effects clears
   the rule filter again.
 - Dragging a slider or colour in the HUD customization window updates the HUD
-  live but saves the configuration once it settles, and the Activity log records
-  only what changed: it got a "Config updated" line, and the file a save, for
-  every frame of the drag.
+  live but saves the configuration at most every 300 ms while dragging, and the
+  Activity log records only what changed: it got a "Config updated" line, and the
+  file a save, for every frame of the drag.
 - Start or Stop recording is no longer undone by a recordings scan that read the
   state just before the click, which put the button back so a second click
   restarted the recording.
@@ -340,11 +356,6 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - `make uninstall` also removes the update backups, the rollback record and the
   autostart entry, and prints the commands to remove the system-wide CPU control
   helpers when they are installed; they still granted their actions afterwards.
-- Installing the CPU control helpers no longer has root read a staging directory
-  in the user's configuration: the files travel in the root command itself. A
-  process of the user could replace a staged file with a FIFO that hung root or a
-  device node; home directories with spaces or non-ASCII characters no longer stop
-  the install.
 - A recording is no longer lost when the game exits or crashes before finishing
   it. The layer writes rows out every 100 ms and finishes recordings when the game
   tears down its device; a recording left unfinished is listed as incomplete, with
@@ -366,6 +377,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Changed
 
+- The GitHub Actions the workflows use are pinned by commit SHA, and CI fails on
+  one that is not; the release job, which holds the signing key, no longer
+  restores a build cache.
 - Building from source needs Rust **1.95** or newer, the floor of egui 0.36.
   Dependencies are updated: egui, eframe and egui_extras 0.36, nix 0.31, png 0.18
   and nvml-wrapper 0.13.
