@@ -12,6 +12,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Added
 
+- Recordings can be deleted from Gaming → Recording ("Delete…", then confirm),
+  which removes the summary, CSV and metadata; the list shows how much space the
+  recordings take. Nothing deleted them before, and CSVs of up to ~60 MB piled up.
 - `argus-lasso install-helpers` installs or updates the CPU control helpers from a
   terminal, for example over SSH: pkexec asks for authentication in that terminal.
 - Readable game recording history and A/B comparison with average/1% low FPS,
