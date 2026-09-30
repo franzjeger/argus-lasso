@@ -1,9 +1,10 @@
 # Installation
 
-These instructions apply to the current source tree. As checked on 2026-09-28,
-the latest published release is v1.3.1. Its packages
-contain the earlier desktop app; they do not contain the new overlay/recorder.
-Do not mix daemon and layer files from arbitrary revisions.
+These instructions apply to the current source tree. As checked on 2026-09-30,
+the latest published release is v1.4.0; its archives contain the app, the
+Vulkan layer and the sensor helper as a matched pair (see
+[binary archives](#binary-archives)). Do not mix daemon and layer files from
+arbitrary revisions.
 
 ## Dependencies
 

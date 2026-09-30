@@ -12,11 +12,13 @@ HUD, and record game present intervals for performance comparisons.
 
 **Main-page screenshots: September 28, 2026.** [Browse every main menu and settings section](docs/screenshots.md).
 
-**This README describes the current source tree.** The latest published release,
-[v1.3.1](https://github.com/franzjeger/argus-lasso/releases/tag/v1.3.1)
-(checked 2026-09-28), predates the overlay, recording and navigation work documented here. Build
-from source for these features. The repository was renamed from
-`process-lasso-linux-rs`; GitHub redirects the old address.
+**This README describes the current source tree.** The latest published release is
+[v1.4.0](https://github.com/franzjeger/argus-lasso/releases/tag/v1.4.0)
+(checked 2026-09-30): the app, Vulkan HUD layer and sensor helper as one signed,
+matched archive. Coming from 1.3.1 or older, [install it by
+hand](docs/installation.md#binary-archives) once; later updates work from the app.
+The repository was renamed from `process-lasso-linux-rs`; GitHub redirects the
+old address.
 
 [Install](docs/installation.md) · [User guide](docs/user-guide.md) ·
 [All menus and screenshots](docs/screenshots.md) ·
