@@ -47,6 +47,8 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- The layer manifest written by `make install` names the build's IPC protocol
+  (it said 5 after the move to 6), read from the build instead of written in.
 - The sensor service's CPU package power is readable by the installing user's group
   only, not by every local user; the kernel keeps it root-only for a reason
   (CVE-2020-8694). `install-sensors.sh` hands the program to root on stdin and

@@ -11,6 +11,8 @@ cd "$(dirname "$0")/.."
 for file in argus-lasso libargus_layer.so; do
     test -f "$binary_dir/$file" || { echo "Missing $binary_dir/$file" >&2; exit 1; }
 done
+# The manifest names the IPC protocol of the build being installed.
+protocol=$("$binary_dir/argus-lasso" build-info | python3 -c 'import sys,json;print(int(json.load(sys.stdin)["protocol"]))')
 service_pid=$(systemctl --user show argus-lasso -p MainPID --value 2>/dev/null || true)
 for pid in $(pgrep -u "$(id -u)" -x argus-lasso || true); do
     if [ "$pid" != "$service_pid" ]; then
@@ -35,17 +37,17 @@ install -m755 "$binary_dir/libargus_layer.so" "$layer_dir/libargus_layer.so.new"
 mv "$layer_dir/libargus_layer.so.new" "$layer_dir/libargus_layer.so"
 install -m755 "$binary_dir/argus-lasso" "$HOME/.local/bin/argus-lasso.new"
 mv "$HOME/.local/bin/argus-lasso.new" "$HOME/.local/bin/argus-lasso"
-python3 - "$layer_dir/libargus_layer.so" "$manifest_dir/ArgusOverlay.json" <<'PY'
+python3 - "$layer_dir/libargus_layer.so" "$manifest_dir/ArgusOverlay.json" "$protocol" <<'PY'
 import sys,json,pathlib
-path=pathlib.Path(sys.argv[2]);tmp=path.with_suffix('.json.new')
+path=pathlib.Path(sys.argv[2]);tmp=path.with_suffix('.json.new');protocol=sys.argv[3]
 try:
  global_loading='enable_environment' not in json.loads(path.read_text())['layer']
 except (OSError,ValueError,KeyError):
  global_loading=False
 tmp.write_text(json.dumps({'file_format_version':'1.0.0','layer':{
  'name':'VK_LAYER_ARGUS_OVERLAY','type':'GLOBAL','library_path':sys.argv[1],
- 'library_arch':'64','api_version':'1.3.200','implementation_version':'5',
- 'description':'Argus-Lasso telemetry HUD (IPC v5)',
+ 'library_arch':'64','api_version':'1.3.200','implementation_version':protocol,
+ 'description':f'Argus-Lasso telemetry HUD (IPC v{protocol})',
  **({} if global_loading else {'enable_environment':{'ARGUS_LASSO_HUD':'1'}}),
  'disable_environment':{'ARGUS_LASSO_HUD_DISABLE':'1'}}},indent=2)+'\n')
 tmp.replace(path)
