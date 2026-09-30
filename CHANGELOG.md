@@ -17,6 +17,13 @@ current source, release and verification status, see [docs/status.md](docs/statu
   configuration without changing it. The overlay settings preview takes the same
   `--theme <THEME>` in place of `--light`.
 
+### Changed
+
+- The screenshots in the README and the gallery are retaken in Breeze Dark and
+  Breeze Light at full opacity, and GitHub shows the set that matches the
+  reader's appearance. The superseded screenshot sets are removed, which makes
+  each release archive about 18 MB smaller.
+
 ### Fixed
 
 - `--ui-tour` captures the window opaque. It used the window opacity of whoever
