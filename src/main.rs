@@ -467,6 +467,14 @@ fn main() {
         }
     }
 
+    // The app's log also goes to a file. The throwaway tour's does not, and
+    // nothing else turns it on, so tests log in memory only.
+    if args.ui_tour.is_none() {
+        if let Some(path) = logfile::default_path() {
+            logfile::enable(path);
+        }
+    }
+
     // Build shared state
     let state = Arc::new(Mutex::new(monitor::AppState::default()));
     {
