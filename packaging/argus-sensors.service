@@ -6,10 +6,13 @@ Documentation=https://github.com/franzjeger/argus-lasso
 Type=simple
 ExecStart=/usr/local/libexec/argus-sensors
 User=root
+# Package power is root-only in the kernel (CVE-2020-8694), so the snapshot
+# is readable by root and the service's group only. install-sensors.sh sets
+# that group to the installing user's in a drop-in (reader.conf).
 Group=root
 RuntimeDirectory=argus-sensors
-RuntimeDirectoryMode=0755
-UMask=0022
+RuntimeDirectoryMode=0750
+UMask=0027
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=yes

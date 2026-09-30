@@ -48,6 +48,11 @@ by the user. The helper successfully read measured CPU power and configured
 8000 MT/s RAM speed on that Ryzen 9 9950X3D host. This is evidence for that host,
 not a promise that every motherboard exports the same data.
 
+The service publishes its snapshot readable by root and the installing user's
+group only (`install-sensors.sh` sets the group in a drop-in), since the kernel
+keeps package power root-only for a reason (CVE-2020-8694). The installer hands
+the program to root on stdin and installs it only if its SHA-256 still matches.
+
 Argus first uses available unprivileged CPU power sources. It does not replace a
 missing measurement with a TDP estimate. Permission denied, missing interfaces
 and stale helper data have distinct status descriptions in Gaming → Sensors.
