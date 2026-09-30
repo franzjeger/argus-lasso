@@ -70,7 +70,7 @@ notify-rust = { version = "4", features = ["z"] }
 serde_json = "1"
 
 # NVIDIA GPU monitoring via NVML (no nvidia-smi process spawn)
-nvml-wrapper = "0.12"
+nvml-wrapper = "0.13"
 
 # Wayland compositor-side opacity via wp_alpha_modifier_v1
 # "system" enables Backend::from_foreign_display + ObjectId::from_ptr
