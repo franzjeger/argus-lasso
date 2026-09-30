@@ -179,6 +179,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
   for the units' own settings. Only application and background units are
   throttled, never the desktop's own session services, and only the unit that
   owns the process's cgroup. `systemctl` calls time out after 5 seconds.
+- A recording's frametime graph keeps its shape to the end when the recording had
+  failed presents, instead of collapsing everything after the summed duration
+  into a single point.
 - One configuration writer persists current shared settings; unique staging files
   prevent collisions, directory fsync improves durability and save errors appear
   with a retry action.

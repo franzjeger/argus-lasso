@@ -549,7 +549,7 @@ fn read_graph(summary: &std::path::Path, duration: f64) -> Result<Vec<(f64, f64)
     }
     let mut reader = std::io::BufReader::new(file.take(LIMIT + 1));
     let mut line = String::new();
-    let mut bins: Vec<Option<(f64, f64)>> = vec![None; 1000];
+    let mut bins = PeakBins::new(duration / GRAPH_BINS as f64);
     let mut total = 0;
     loop {
         line.clear();
@@ -579,12 +579,57 @@ fn read_graph(summary: &std::path::Path, duration: f64) -> Result<Vec<(f64, f64)
             .and_then(|s| s.parse::<u64>().ok())
             .ok_or("Invalid CSV interval")? as f64
             / 1e6;
-        let bin = ((t / duration) * 999.0).clamp(0.0, 999.0) as usize;
-        if bins[bin].is_none_or(|(_, old)| ms > old) {
-            bins[bin] = Some((t, ms));
+        bins.add(t, ms);
+    }
+    Ok(bins.into_points())
+}
+
+const GRAPH_BINS: usize = 1000;
+
+/// The slowest frame in each of `GRAPH_BINS` equal time slots, over a
+/// recording whose end is not known up front: the summary's duration counts
+/// only accepted intervals, so a recording with failed presents runs past
+/// it. A frame beyond the last slot merges neighbouring slots and doubles
+/// their width instead of piling up in the last one.
+struct PeakBins {
+    width: f64,
+    bins: Vec<Option<(f64, f64)>>,
+}
+
+impl PeakBins {
+    fn new(width: f64) -> Self {
+        Self {
+            width,
+            bins: vec![None; GRAPH_BINS],
         }
     }
-    Ok(bins.into_iter().flatten().collect())
+
+    fn add(&mut self, t: f64, ms: f64) {
+        let slot = |width: f64| (t / width) as usize;
+        while slot(self.width) >= GRAPH_BINS {
+            self.width *= 2.0;
+            let merged: Vec<_> = self
+                .bins
+                .chunks(2)
+                .map(|pair| {
+                    pair.iter()
+                        .flatten()
+                        .copied()
+                        .max_by(|a, b| a.1.total_cmp(&b.1))
+                })
+                .collect();
+            self.bins = merged;
+            self.bins.resize(GRAPH_BINS, None);
+        }
+        let bin = &mut self.bins[slot(self.width)];
+        if bin.is_none_or(|(_, old)| ms > old) {
+            *bin = Some((t, ms));
+        }
+    }
+
+    fn into_points(self) -> Vec<(f64, f64)> {
+        self.bins.into_iter().flatten().collect()
+    }
 }
 fn draw_comparison(ui: &mut egui::Ui, graphs: &Graphs) {
     if graphs.iter().all(Vec::is_empty) {
@@ -643,6 +688,27 @@ mod comparison_tests {
             ..Summary::default()
         };
         (PathBuf::from(name), summary)
+    }
+
+    /// Frames after the summary's duration (which leaves out failed
+    /// presents) used to collapse into the last slot of the graph.
+    #[test]
+    fn a_recording_longer_than_its_duration_keeps_its_shape() {
+        let mut bins = PeakBins::new(1.0 / GRAPH_BINS as f64);
+        for i in 0..3000 {
+            let t = i as f64 / 1000.0; // three seconds for a one-second duration
+            bins.add(t, if i == 2500 { 50.0 } else { 16.0 });
+        }
+        let points = bins.into_points();
+        assert!(points.len() > GRAPH_BINS / 2, "{} points", points.len());
+        assert!(points.last().unwrap().0 > 2.9);
+        assert!(
+            points
+                .iter()
+                .any(|&(t, ms)| ms == 50.0 && (t - 2.5).abs() < 1e-9),
+            "the spike survives"
+        );
+        assert!(points.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
     /// A swapchain recreated during the latest recording used to be
