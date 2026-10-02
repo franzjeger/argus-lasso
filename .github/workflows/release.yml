@@ -24,6 +24,8 @@ jobs:
   release:
     name: build & publish (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    # Counted from the start of the job, after the environment approval.
+    timeout-minutes: 45
     # The job that signs. The "release" environment makes it wait for the
     # maintainer's approval and holds the signing key as its own secret, so
     # neither pushing a v* tag nor any other workflow gets a release signed.
@@ -125,6 +127,7 @@ jobs:
     name: release notes from CHANGELOG
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # The previous version of this job called generate-notes, which needs no
       # checkout. Reading the changelog does.

@@ -19,6 +19,10 @@ jobs:
   build-test:
     name: build & test (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    # A run takes 5–8 minutes. Without a limit, a runner that stopped
+    # reporting after the tests had passed kept a job "in progress" for two
+    # hours, and GitHub's default would have been six.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -60,6 +64,7 @@ jobs:
   lint:
     name: clippy & fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -103,6 +108,7 @@ jobs:
   msrv:
     name: minimum supported Rust
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
