@@ -30,4 +30,11 @@ jobs:
           # codegen) and cannot be upgraded from this crate. Not reachable
           # with remote untrusted XML here: only local D-Bus introspection is
           # parsed at runtime. Remove once eframe/zbus deps move to >= 0.41.
-          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195
+          # RUSTSEC-2026-0192: ttf-parser is unmaintained; no vulnerability is
+          # known. Its only path is winit -> sctk-adwaita -> ab_glyph, which
+          # draws the title text of the GNOME client-side titlebar from system
+          # fonts. ab_glyph 0.2.32, the newest, still uses it; avoiding it would
+          # mean no title text on GNOME (wayland-csd-adwaita-notitle) or
+          # freetype/fontconfig (crossfont). Remove once winit 0.31 or ab_glyph
+          # moves to a maintained parser such as skrifa (#33).
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195,RUSTSEC-2026-0192
