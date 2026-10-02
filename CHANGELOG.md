@@ -12,6 +12,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Added
 
+- **Close to tray** (Settings → Startup & updates): closing the window keeps
+  Argus running in the tray instead of quitting, and the window comes back from
+  the tray icon or the app menu; Quit stays in the tray menu ([#107]). The
+  window is closed rather than hidden, which Wayland does not allow, so a
+  closed one uses no window memory. Off by default, and unavailable without a
+  tray icon.
 - `--tour-theme <THEME>` picks the theme of the `--ui-tour` captures (for example
   `BreezeDark` or `BreezeLight`), so every theme's screenshots come from one
   configuration without changing it. The overlay settings preview takes the same
@@ -819,3 +825,4 @@ when the app asks, and the sensor service if you use it
 [#53]: https://github.com/franzjeger/argus-lasso/pull/53
 [#54]: https://github.com/franzjeger/argus-lasso/pull/54
 [#61]: https://github.com/franzjeger/argus-lasso/issues/61
+[#107]: https://github.com/franzjeger/argus-lasso/issues/107

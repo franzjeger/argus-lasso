@@ -69,6 +69,8 @@ context menu, expanded sensor group or process-action confirmation.
 
 ## Settings — Startup & updates
 
+Retaken on 2026-10-02, with **Close to tray**.
+
 <picture><source media="(prefers-color-scheme: dark)" srcset="../assets/screenshots/2026-09-30/dark/settingsstartup.png"><img alt="Settings — Startup &amp; updates" src="../assets/screenshots/2026-09-30/light/settingsstartup.png"></picture>
 
 ## Tools — Hardware sensors

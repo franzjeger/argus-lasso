@@ -37,6 +37,13 @@ One monitor-thread writer persists the latest shared configuration. A failed sav
 appears in a persistent banner with **Retry saving**; it is not silently treated
 as a successful disk write.
 
+**Close to tray** (Settings → Startup & updates) keeps Argus running when its
+window is closed: rules, ProBalance and Gaming Mode carry on, and the window
+comes back from the tray icon, its **Open Argus-Lasso** item or the app menu.
+**Quit** in the tray menu stops Argus and restores CPUs and priorities. Without a
+tray icon (`--no-tray`, or a desktop without a tray) the setting is unavailable
+and closing the window quits.
+
 ## Process table
 
 Wine/Proton processes use the executable filename where available. If a game
