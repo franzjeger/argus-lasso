@@ -10,6 +10,17 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-10-02
+
+Close to tray, a tray icon that waits for the desktop's tray instead of giving
+up, and recordings from games that exit without tearing down Vulkan listed
+Complete when nothing was lost.
+
+**Upgrading:** from 1.4.0, the in-app updater installs this release. From 1.3.1
+or older, [install it by
+hand](https://github.com/franzjeger/argus-lasso/blob/v1.5.0/docs/installation.md#binary-archives)
+once, as for 1.4.0. Restart running games afterwards to load the new layer.
+
 ### Added
 
 - **Close to tray** (Settings → Startup & updates): closing the window keeps
@@ -28,7 +39,7 @@ current source, release and verification status, see [docs/status.md](docs/statu
 - The screenshots in the README and the gallery are retaken in Breeze Dark and
   Breeze Light at full opacity, and GitHub shows the set that matches the
   reader's appearance. The superseded screenshot sets are removed, which makes
-  each release archive about 18 MB smaller.
+  the release archives about a third smaller (21.1 MB to 14.5 MB for x86_64).
 
 ### Fixed
 
@@ -798,7 +809,8 @@ when the app asks, and the sensor service if you use it
 
 - Virtualized the process table; dropped per-frame clones and sysfs reads.
 
-[Unreleased]: https://github.com/franzjeger/argus-lasso/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/franzjeger/argus-lasso/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/franzjeger/argus-lasso/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/franzjeger/argus-lasso/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/franzjeger/argus-lasso/compare/v1.3.0...v1.3.1
 [1.2.0]: https://github.com/franzjeger/argus-lasso/compare/v1.1.0...v1.2.0

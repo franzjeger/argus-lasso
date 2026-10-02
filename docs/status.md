@@ -1,13 +1,42 @@
 # Project status
 
-Reviewed on **2026-09-30**. Release
-[v1.4.0](https://github.com/franzjeger/argus-lasso/releases/tag/v1.4.0) is
-published and is GitHub's latest release: package version `1.4.0`, IPC protocol
-6, tagged on
-[`c753c5c`](https://github.com/franzjeger/argus-lasso/commit/c753c5c5c7be62c29e2c1043b29e08ddf59d31e1),
-the merge of [#103](https://github.com/franzjeger/argus-lasso/pull/103).
+Reviewed on **2026-10-02** for release **1.5.0**: package version `1.5.0`, IPC
+protocol 6. The version and changelog section are prepared in the release pull
+request; the tag and the published archives are recorded here once the release
+workflow has run and they have been checked on GitHub. Until then the latest
+published release is
+[v1.4.0](https://github.com/franzjeger/argus-lasso/releases/tag/v1.4.0).
 
-## Published archives
+## Release candidate verification
+
+Run on 2026-10-02 on the release branch (version 1.5.0, source otherwise equal
+to `master` at
+[`37bb8aa`](https://github.com/franzjeger/argus-lasso/commit/37bb8aa0a3e007a05deb390023432316a69e306c)):
+
+- `cargo fmt --all --check` and workspace Clippy with `-D warnings` passed.
+- Workspace tests passed: **302 tests**. The two opt-in tests (systemd unit
+  restore, NVML) passed separately on this host.
+- `cargo build --release --workspace --locked` passed. The release job's
+  packaging step, run on that build, wrote bundle metadata for 1.5.0 and protocol
+  6 and refused a 1.4.0 tag. The x86_64 archive is 14.5 MB, against 21.1 MB for
+  v1.4.0 (fewer screenshots). It installed into an empty home directory with its
+  own `install-binaries.sh` (service calls stubbed), and the updater's member
+  patterns each matched exactly one app, layer and `bundle.json`. Signing was not
+  run locally; the workflow checks each signature against `dist/argus-lasso.pub`
+  before publishing.
+- The read-only X11/Xvfb tour completed all 20 screens.
+- Close to tray was tested live under Xvfb with a private session bus and a
+  minimal StatusNotifierWatcher:
+  - Clicking the checkbox stores the setting. Closing the window with
+    `WM_DELETE_WINDOW` keeps the process running without a window.
+  - A second launch and the tray's Activate each reopen the window.
+  - Tray Quit and SIGTERM while the window is closed restore state and exit.
+  - With the setting off, or with no tray, closing quits.
+  - A tray that starts after Argus gets the icon. When that tray goes away, closing quits.
+
+  The maintainer confirmed it on COSMIC.
+
+## Published archives (v1.4.0)
 
 The [release run](https://github.com/franzjeger/argus-lasso/actions/runs/36763083800)
 built, signed and published both architectures after approval in the `release`
@@ -16,46 +45,24 @@ x86_64 and aarch64 archives were downloaded and checked on 2026-09-30:
 
 - Each matches its `.sha256` file, and its `.minisig` signature verifies with
   `minisign-verify` (the library the updater uses) against `dist/argus-lasso.pub`
-  (key `D53DAD0590FF1744`). Against the replaced 1.3.1 key the same signatures are
-  refused, as the updater of 1.3.1 and older will refuse them.
+  (key `D53DAD0590FF1744`). The replaced 1.3.1 key refuses the same signatures,
+  as the updater of 1.3.1 and older will refuse them.
 - `bundle.json` and `BUILD_ID` name build `c753c5c5c7be…` (the tagged commit),
   version 1.4.0 and protocol 6. The x86_64 app and layer match the SHA-256 values
   in `bundle.json`, and the app's `build-info` agrees with it.
 - The download URLs in [binary archives](installation.md#binary-archives)
   resolve for the archive, checksum and signature.
 
-The in-app updater has not yet installed a published release on a real
-installation; the first such update will be from a build that already carries the
-new key.
-
-## Release candidate verification
-
-Run on 2026-09-30 on the release branch (version 1.4.0, source otherwise equal
-to `master` at
-[`a07aa0b`](https://github.com/franzjeger/argus-lasso/commit/a07aa0b5919de8a1ff6f94b71d6e8574ec0779f3)):
-
-- `cargo fmt --all --check` and workspace Clippy with `-D warnings` passed.
-- Workspace tests passed: **289 tests**. The two opt-in tests passed separately
-  on this host: the systemd test restored an isolated transient unit's existing
-  quota and weight after throttling and removed the unit, and NVML read the
-  NVIDIA GPU.
-- `cargo build --release --workspace --locked` passed. The release job's
-  packaging step, run on that build, wrote bundle metadata matching the app's
-  `build-info` and refused a tag that did not match the version. The archive
-  installed into an empty home directory with its own `install-binaries.sh`
-  (service calls stubbed), and the updater's member patterns each matched exactly
-  one app, layer and `bundle.json` in it. Signing was not run locally; the
-  workflow checks each signature against `dist/argus-lasso.pub` before publishing.
-- The read-only X11/Xvfb tour (`LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=softpipe`)
-  completed all 20 screens; Settings → Startup & updates shows v1.4.0.
+On 2026-09-30 the in-app updater on the development host installed v1.4.0 from a
+build that already carried the new key. The installed app's SHA-256 matched the
+published `bundle.json`, and the rollback record was kept.
 
 ## Installation and releases
 
-`master` at `a07aa0b` is installed locally as build `a07aa0b5919d-d4efb49d238b`
-(protocol 6) and runs as the user service. It is the 1.4.0 source apart from
-the version number and documentation, reports version 1.3.1, and already
-carries the new release key, so its updater can install v1.4.0. Games running
-an earlier layer show "Telemetry disconnected" until restarted.
+`master` at `37bb8aa` is installed locally as build `37bb8aa0a3e0-95554a7ff2f9`
+(protocol 6) and runs as the user service. It is the 1.5.0 source apart from the
+version number and documentation, and reports version 1.4.0. Games running an
+earlier layer show "Telemetry disconnected" until restarted.
 
 Releases from 1.4.0 on are signed with a new key (ID `D53DAD0590FF1744`). The
 updater of 1.3.1 and older checks against the replaced key and refuses them, so
