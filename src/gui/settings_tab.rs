@@ -1124,6 +1124,26 @@ mod tests {
         assert_eq!(reported.monitor.display_refresh_interval_ms, 5000);
     }
 
+    /// Close to tray was drawn and reported as changed, but never stored:
+    /// the shared configuration takes only the fields this page owns, and it
+    /// was not one of them. Closing the window then quit as before.
+    #[test]
+    fn close_to_tray_chosen_here_reaches_the_shared_config() {
+        let mut tab = super::SettingsTab::new(crate::config::Config::default());
+        tab.tray_available = true;
+        tab.section = super::SettingsSection::Startup;
+        let reported = click(
+            &mut tab,
+            "Closing the window keeps Argus-Lasso running in the tray",
+        )
+        .expect("the change is reported at once");
+        assert!(reported.ui.close_to_tray);
+
+        let mut shared = crate::config::Config::default();
+        crate::app::take_settings_page_fields(&mut shared, reported);
+        assert!(shared.ui.close_to_tray);
+    }
+
     #[test]
     fn a_typed_cpu_list_is_checked_before_it_is_used() {
         let mut tab = super::SettingsTab::new(crate::config::Config::default());

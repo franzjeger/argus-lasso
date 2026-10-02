@@ -115,6 +115,20 @@ fn read_cpu_temp() -> Option<f32> {
     None
 }
 
+/// Put the fields the Settings page owns from `updated` into the shared
+/// configuration. Only these: the page's copy of anything else may be stale,
+/// and storing it would undo a newer change made on another page. A setting
+/// added to the page has to be added here as well, or it is shown as changed
+/// and never stored: Close to tray was, at first.
+pub(crate) fn take_settings_page_fields(c: &mut Config, updated: Config) {
+    c.cpu.default_affinity = updated.cpu.default_affinity;
+    c.monitor = updated.monitor;
+    c.hw_alerts = updated.hw_alerts;
+    c.ui.notifications_enabled = updated.ui.notifications_enabled;
+    c.ui.check_updates_on_start = updated.ui.check_updates_on_start;
+    c.ui.close_to_tray = updated.ui.close_to_tray;
+}
+
 /// Whether closing the window keeps Argus running in the tray: only when it
 /// is asked for, a tray icon exists to come back through, and Quit is not
 /// what closed it.
@@ -1427,13 +1441,7 @@ impl ArgusLassoApp {
         let affinity_changed = self.state.lock().map_or(true, |s| {
             s.config.cpu.default_affinity != updated.cpu.default_affinity
         });
-        self.update_config(|c| {
-            c.cpu.default_affinity = updated.cpu.default_affinity;
-            c.monitor = updated.monitor;
-            c.hw_alerts = updated.hw_alerts;
-            c.ui.notifications_enabled = updated.ui.notifications_enabled;
-            c.ui.check_updates_on_start = updated.ui.check_updates_on_start;
-        });
+        self.update_config(|c| take_settings_page_fields(c, updated));
         // Only a new default affinity has anything to reapply. Reapplying
         // also gives failed rule changes another try, which would log
         // their failures again on every settings click.
