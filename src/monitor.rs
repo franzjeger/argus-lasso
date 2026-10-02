@@ -163,6 +163,12 @@ pub struct AppState {
     pub cpu_model: String,
     /// Set by the daemon once a Shutdown command has finished restoring state
     pub shutdown_complete: bool,
+    /// The tray icon registered, so the window can close to it.
+    pub tray_available: bool,
+    /// The window was closed to the tray: the service runs on without one.
+    pub window_closed: bool,
+    /// While `window_closed`: the tray or a second launch asked for a window.
+    pub window_wanted: bool,
     /// Notable events (throttles, alerts, gaming mode, kills) for the
     /// status-bar notification center — small ring buffer, newest last.
     pub notable_events: std::collections::VecDeque<String>,
@@ -791,7 +797,9 @@ impl Daemon {
         // A request that arrives before the window exists is kept until it
         // does, not dropped.
         self.show_window_pending |= crate::overlay_toggle::drain_show_window(&self.toggle_dir) > 0;
-        if self.show_window_pending && crate::gui::show_main_window(&self.gui_context) {
+        if self.show_window_pending
+            && crate::gui::request_main_window(&self.state, &self.gui_context)
+        {
             self.show_window_pending = false;
         }
         self.poll_overlay_toggle();

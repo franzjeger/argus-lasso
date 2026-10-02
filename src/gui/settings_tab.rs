@@ -20,6 +20,8 @@ pub enum SettingsSection {
 
 pub struct SettingsTab {
     pub section: SettingsSection,
+    /// The tray icon registered, so closing the window can leave Argus in it.
+    pub tray_available: bool,
     /// The settings as in effect; every change is stored at once.
     pub config: Config,
     pub default_affinity_enabled: bool,
@@ -63,6 +65,7 @@ impl SettingsTab {
         let epp = read_epp();
         Self {
             section: SettingsSection::default(),
+            tray_available: false,
             default_affinity_text: current_affinity,
             default_affinity_enabled,
             affinity_error: None,
@@ -574,6 +577,25 @@ impl SettingsTab {
                                 self.commit_autostart();
                             }
                         });
+                        crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Close to tray", |ui| {
+                            changed |= ui
+                                .add_enabled(
+                                    self.tray_available,
+                                    egui::Checkbox::new(
+                                        &mut self.config.ui.close_to_tray,
+                                        "Closing the window keeps Argus-Lasso running in the tray",
+                                    ),
+                                )
+                                .changed();
+                        });
+                        help_text(
+                            ui,
+                            if self.tray_available {
+                                "Open the window again from the tray icon or the app menu. Quit is in the tray menu."
+                            } else {
+                                "No tray icon is available (started with --no-tray, or the desktop has no tray), so closing the window quits."
+                            },
+                        );
                     });
 
                     ui.add_space(tokens::SPACE_M);

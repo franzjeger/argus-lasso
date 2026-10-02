@@ -115,6 +115,13 @@ fn read_cpu_temp() -> Option<f32> {
     None
 }
 
+/// Whether closing the window keeps Argus running in the tray: only when it
+/// is asked for, a tray icon exists to come back through, and Quit is not
+/// what closed it.
+fn closes_to_tray(state: &AppState) -> bool {
+    state.config.ui.close_to_tray && state.tray_available && !state.quit_requested
+}
+
 // ── ArgusLassoApp ─────────────────────────────────────────────────────────────
 
 pub struct ArgusLassoApp {
@@ -175,7 +182,18 @@ pub struct ArgusLassoApp {
     /// Set only by --ui-tour: drives the app through every screen, capturing
     /// each, then exits. None in every normal run.
     tour: Option<crate::ui_tour::Tour>,
+    /// Decided when the window is asked to close: keep the service running in
+    /// the tray instead of restoring state and quitting.
+    close_to_tray: bool,
+    /// Where `updates` is left for the next window when this one closes to
+    /// the tray.
+    updates_carry: UpdatesCarry,
 }
+
+/// The update state handed from a window closed to the tray to the next one.
+/// A fresh state would not know that an update was already installed and only
+/// waits for a restart, and would offer the same release again.
+pub type UpdatesCarry = std::rc::Rc<std::cell::RefCell<Option<crate::updater::UpdateState>>>;
 
 impl ArgusLassoApp {
     pub fn new(
@@ -185,6 +203,7 @@ impl ArgusLassoApp {
         rule_engine: Arc<Mutex<RuleEngine>>,
         config: Config,
         tour_dir: Option<std::path::PathBuf>,
+        updates_carry: UpdatesCarry,
     ) -> Self {
         let startup_theme = crate::gui::theme::AppTheme::from_str(&config.ui.theme);
         crate::gui::theme::apply_theme(&cc.egui_ctx, &startup_theme);
@@ -194,14 +213,22 @@ impl ArgusLassoApp {
         // and a native child window never appears in it.
         cc.egui_ctx.set_embed_viewports(tour_dir.is_some());
 
-        let mut updates = crate::updater::UpdateState::default();
-        if config.ui.check_updates_on_start && tour_dir.is_none() {
-            updates.start_check();
-        }
+        // Only the first window checks on start; a later one carries on.
+        let carried = updates_carry.borrow_mut().take();
+        let updates = carried.unwrap_or_else(|| {
+            let mut updates = crate::updater::UpdateState::default();
+            if config.ui.check_updates_on_start && tour_dir.is_none() {
+                updates.start_check();
+            }
+            updates
+        });
 
         let probalance_tab = ProBalanceTab::new(config.probalance.clone());
         let gaming_mode_tab = GamingModeTab::new(config.clone());
-        let settings_tab = SettingsTab::new(config.clone());
+        let mut settings_tab = SettingsTab::new(config.clone());
+        // The tour has no tray icon, but documents the app as it runs with one.
+        settings_tab.tray_available =
+            tour_dir.is_some() || state.lock().is_ok_and(|s| s.tray_available);
 
         // Initialise Wayland compositor-side opacity via wp_alpha_modifier_v1.
         // Extract the raw wl_display* and wl_surface* that eframe already holds.
@@ -286,6 +313,8 @@ impl ArgusLassoApp {
                     std::process::exit(1);
                 }
             }),
+            close_to_tray: false,
+            updates_carry,
             events_seen: 0,
             cpu_model,
             pending_config_save: PendingConfigSave::new(std::time::Instant::now()),
@@ -444,6 +473,16 @@ impl eframe::App for ArgusLassoApp {
         if self.pending_config_save.dirty {
             self.save_config();
         }
+        if self.close_to_tray {
+            // The service and the tray run on; main opens a new window when
+            // one is asked for. Requests made before this one closed are spent.
+            *self.updates_carry.borrow_mut() = Some(std::mem::take(&mut self.updates));
+            if let Ok(mut s) = self.state.lock() {
+                s.window_closed = true;
+                s.window_wanted = false;
+            }
+            return;
+        }
         crate::monitor::shutdown_and_wait(&self.state, &self.cmd_tx);
     }
 
@@ -461,6 +500,10 @@ impl eframe::App for ArgusLassoApp {
         }
         if self.state.lock().is_ok_and(|s| s.quit_requested) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.close_to_tray =
+                self.tour.is_none() && self.state.lock().is_ok_and(|s| closes_to_tray(&s));
         }
         self.handle_gaming_events(ctx);
         // --ui-tour drives the UI from a script rather than from the user.
@@ -1548,6 +1591,37 @@ impl ArgusLassoApp {
                 crate::updater::restart()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod close_to_tray_tests {
+    use super::*;
+
+    #[test]
+    fn the_window_closes_to_the_tray_only_when_it_can_come_back() {
+        let mut state = AppState::default();
+        state.config.ui.close_to_tray = true;
+        state.tray_available = true;
+        assert!(closes_to_tray(&state));
+
+        state.quit_requested = true;
+        assert!(!closes_to_tray(&state), "Quit quits");
+        state.quit_requested = false;
+
+        state.tray_available = false;
+        assert!(!closes_to_tray(&state), "no tray icon to come back through");
+        state.tray_available = true;
+
+        state.config.ui.close_to_tray = false;
+        assert!(!closes_to_tray(&state), "off by default");
+    }
+
+    #[test]
+    fn close_to_tray_is_off_unless_chosen() {
+        assert!(!Config::default().ui.close_to_tray);
+        let old: Config = toml::from_str("[ui]\nopacity = 0.8\n").unwrap();
+        assert!(!old.ui.close_to_tray, "a config from before the setting");
     }
 }
 

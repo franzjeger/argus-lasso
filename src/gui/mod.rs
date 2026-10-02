@@ -41,6 +41,21 @@ pub type SharedContext = std::sync::Arc<std::sync::Mutex<Option<egui::Context>>>
 /// Show, un-minimize and focus the main window, from any thread: the tray's
 /// "Open" and a second launch bring the running window to the front.
 /// Returns false while eframe has not created the window yet.
+/// Bring the main window up: show it, or, when it was closed to the tray,
+/// ask for a new one. Returns false only when no window exists yet.
+pub fn request_main_window(
+    state: &std::sync::Arc<std::sync::Mutex<crate::monitor::AppState>>,
+    context: &SharedContext,
+) -> bool {
+    if let Ok(mut s) = state.lock() {
+        if s.window_closed {
+            s.window_wanted = true;
+            return true;
+        }
+    }
+    show_main_window(context)
+}
+
 pub fn show_main_window(context: &SharedContext) -> bool {
     let Ok(context) = context.lock() else {
         return false;
@@ -57,6 +72,19 @@ pub fn show_main_window(context: &SharedContext) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// With the window closed to the tray there is no window to show: the
+    /// request is left for main, which opens a new one.
+    #[test]
+    fn a_request_while_closed_to_the_tray_asks_for_a_new_window() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(crate::monitor::AppState {
+            window_closed: true,
+            ..Default::default()
+        }));
+        let none: super::SharedContext = Default::default();
+        assert!(super::request_main_window(&state, &none));
+        assert!(state.lock().unwrap().window_wanted);
+    }
+
     /// A second launch before eframe has made the window used to be
     /// consumed with nothing shown; the caller keeps it pending instead.
     #[test]

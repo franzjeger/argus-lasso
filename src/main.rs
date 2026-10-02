@@ -87,7 +87,7 @@ impl ksni::Tray for ArgusLassoTray {
 
     /// Left click on the tray icon.
     fn activate(&mut self, _x: i32, _y: i32) {
-        gui::show_main_window(&self.context);
+        gui::request_main_window(&self.state, &self.context);
     }
 
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
@@ -97,7 +97,7 @@ impl ksni::Tray for ArgusLassoTray {
             ksni::MenuItem::Standard(ksni::menu::StandardItem {
                 label: "Open Argus-Lasso".into(),
                 activate: Box::new(|tray: &mut Self| {
-                    gui::show_main_window(&tray.context);
+                    gui::request_main_window(&tray.state, &tray.context);
                 }),
                 ..Default::default()
             }),
@@ -555,6 +555,9 @@ fn main() {
     } else {
         None
     };
+    if let Ok(mut s) = state.lock() {
+        s.tray_available = _tray_handle.is_some();
+    }
 
     // Launch GUI
     // transparent: true enables per-pixel alpha compositing on Wayland/X11 so the
@@ -566,7 +569,7 @@ fn main() {
         height: crate::icon::H,
     };
 
-    let native_options = eframe::NativeOptions {
+    let native_options = |visible: bool| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Argus-Lasso — Linux")
             // app_id must match the .desktop filename (argus-lasso.desktop)
@@ -581,8 +584,8 @@ fn main() {
             })
             .with_min_inner_size([800.0, 500.0])
             .with_transparent(true)
-            .with_visible(!args.minimized)
-            .with_icon(window_icon),
+            .with_visible(visible)
+            .with_icon(window_icon.clone()),
         // The tour renders into the X server in $DISPLAY — Xvfb under
         // xvfb-run. winit prefers Wayland whenever $WAYLAND_DISPLAY is set,
         // which put the tour window on the user's desktop instead, where a
@@ -599,41 +602,82 @@ fn main() {
         ..Default::default()
     };
 
-    let state_gui = Arc::clone(&state);
-    let re_gui = Arc::clone(&rule_engine);
-    let cfg_gui = cfg.clone();
-    let cmd_tx_gui = cmd_tx.clone();
-    let tour_dir = args.ui_tour.clone();
-
-    let run = eframe::run_native(
-        "Argus-Lasso",
-        native_options,
-        Box::new(move |cc| {
-            if let Ok(mut context) = gui_context.lock() {
-                *context = Some(cc.egui_ctx.clone());
-            }
-            Ok(Box::new(app::ArgusLassoApp::new(
-                cc, state_gui, cmd_tx_gui, re_gui, cfg_gui, tour_dir,
-            )))
-        }),
-    );
-    // Losing the display (logout, a compositor crash) ends the window with
-    // an error, perhaps before on_exit ran. Panicking here ended the process
-    // in the middle of the restore a stop signal had started; restore, then
-    // exit with an error so systemd restarts the app after a crash.
-    if let Err(e) = run {
-        eprintln!("Argus-Lasso's window failed: {e}");
-        monitor::shutdown_and_wait(&state, &cmd_tx);
-        monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2));
-        std::process::exit(1);
+    // eframe keeps its event loop between runs, so a window closed to the
+    // tray is reopened by running it again: a new window with a new app on
+    // the current configuration. Hiding the old one instead is not possible
+    // on Wayland, where winit cannot unmap a window once shown.
+    let mut visible = !args.minimized;
+    let updates_carry = app::UpdatesCarry::default();
+    loop {
+        let state_gui = Arc::clone(&state);
+        let re_gui = Arc::clone(&rule_engine);
+        let cfg_gui = state
+            .lock()
+            .map(|s| s.config.clone())
+            .unwrap_or_else(|_| cfg.clone());
+        let cmd_tx_gui = cmd_tx.clone();
+        let tour_dir = args.ui_tour.clone();
+        let context_gui = Arc::clone(&gui_context);
+        let carry_gui = updates_carry.clone();
+        let run = eframe::run_native(
+            "Argus-Lasso",
+            native_options(visible),
+            Box::new(move |cc| {
+                if let Ok(mut context) = context_gui.lock() {
+                    *context = Some(cc.egui_ctx.clone());
+                }
+                Ok(Box::new(app::ArgusLassoApp::new(
+                    cc, state_gui, cmd_tx_gui, re_gui, cfg_gui, tour_dir, carry_gui,
+                )))
+            }),
+        );
+        // Losing the display (logout, a compositor crash) ends the window with
+        // an error, perhaps before on_exit ran. Panicking here ended the process
+        // in the middle of the restore a stop signal had started; restore, then
+        // exit with an error so systemd restarts the app after a crash.
+        if let Err(e) = run {
+            eprintln!("Argus-Lasso's window failed: {e}");
+            monitor::shutdown_and_wait(&state, &cmd_tx);
+            monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2));
+            std::process::exit(1);
+        }
+        if let Ok(mut context) = gui_context.lock() {
+            *context = None;
+        }
+        if !wait_for_window_request(&state) {
+            break;
+        }
+        visible = true;
     }
 
-    // The window is closed and on_exit already asked the daemon to restore
-    // state (shutdown_and_wait). Give it a bounded grace period to finish
-    // (unparking CPUs, restoring nices) rather than tearing down the process
-    // image mid-restore.
+    // The window closed for good. Its on_exit asked the daemon to restore
+    // state, unless it had closed to the tray and Quit came from there.
+    if !state.lock().map(|s| s.shutdown_complete).unwrap_or(true) {
+        monitor::shutdown_and_wait(&state, &cmd_tx);
+    }
+    // Give the daemon a bounded grace period to finish (unparking CPUs,
+    // restoring nices) rather than tearing down the process image mid-restore.
     if !monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2)) {
         log::warn!("daemon thread did not finish within 2s of exit; it may be stuck mid-restore");
+    }
+}
+
+/// After the window has closed: when it closed to the tray, wait until the
+/// tray or a second launch asks for a window (true) or something asks Argus
+/// to quit (false). A window that closed for good returns false at once.
+fn wait_for_window_request(state: &Arc<Mutex<monitor::AppState>>) -> bool {
+    loop {
+        match state.lock() {
+            Ok(s) if !s.window_closed || s.quit_requested => return false,
+            Ok(mut s) if s.window_wanted => {
+                s.window_closed = false;
+                s.window_wanted = false;
+                return true;
+            }
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -694,6 +738,38 @@ fn spawn_stop_signal_handler(
 #[cfg(test)]
 mod tests {
     use super::lock_instance_in;
+
+    /// Closed to the tray, main waits for a window request; anything else
+    /// ends the window loop.
+    #[test]
+    fn a_window_closed_to_the_tray_reopens_only_when_asked() {
+        use super::{monitor::AppState, wait_for_window_request};
+        use std::sync::{Arc, Mutex};
+        let state = |closed, wanted, quit| {
+            Arc::new(Mutex::new(AppState {
+                window_closed: closed,
+                window_wanted: wanted,
+                quit_requested: quit,
+                ..Default::default()
+            }))
+        };
+        assert!(
+            !wait_for_window_request(&state(false, false, false)),
+            "closed for good"
+        );
+        assert!(
+            !wait_for_window_request(&state(true, true, true)),
+            "Quit wins"
+        );
+
+        let wanted = state(true, true, false);
+        assert!(wait_for_window_request(&wanted));
+        let s = wanted.lock().unwrap();
+        assert!(
+            !s.window_closed && !s.window_wanted,
+            "spent on the new window"
+        );
+    }
 
     #[test]
     fn a_second_lock_reports_another_instance() {

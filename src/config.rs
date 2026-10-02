@@ -137,6 +137,9 @@ pub struct UiConfig {
     /// Check GitHub for a newer release on startup.
     #[serde(default = "default_true")]
     pub check_updates_on_start: bool,
+    /// Closing the window keeps Argus running in the tray instead of quitting.
+    /// Only with a tray icon: without one there would be no way back.
+    pub close_to_tray: bool,
     /// HW Monitor column widths: [val, min, max, avg]
     #[serde(default = "default_hw_mon_col_widths")]
     pub hw_mon_col_widths: Vec<f32>,
@@ -168,6 +171,7 @@ impl Default for UiConfig {
             col_widths: default_col_widths(),
             notifications_enabled: true,
             check_updates_on_start: true,
+            close_to_tray: false,
             hw_mon_col_widths: default_hw_mon_col_widths(),
             hidden_columns: Vec::new(),
         }
