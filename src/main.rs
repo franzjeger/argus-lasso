@@ -45,6 +45,15 @@ struct ArgusLassoTray {
     context: gui::SharedContext,
 }
 
+impl ArgusLassoTray {
+    /// Whether the icon is on screen, which Close to tray depends on.
+    fn set_shown(&self, shown: bool) {
+        if let Ok(mut s) = self.state.lock() {
+            s.tray_available = shown;
+        }
+    }
+}
+
 /// Convert embedded RGBA bytes to ARGB32 network-byte-order as required by D-Bus SNI.
 fn make_tray_icon() -> ksni::Icon {
     let mut data = crate::icon::RGBA.to_vec();
@@ -83,6 +92,22 @@ impl ksni::Tray for ArgusLassoTray {
             icon_name: String::new(),
             icon_pixmap: vec![make_tray_icon()],
         }
+    }
+
+    /// The desktop's tray (its StatusNotifierWatcher) appeared, at start
+    /// after Argus or after a panel restart, and shows the icon again.
+    fn watcher_online(&self) {
+        log::info!("Tray icon shown");
+        self.set_shown(true);
+    }
+
+    /// The desktop's tray went away or was not there yet. The service waits
+    /// for it to come back instead of ending: giving up left Argus without an
+    /// icon for the whole session whenever it started before the panel.
+    fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
+        log::warn!("Tray icon not shown until the desktop's tray returns: {reason:?}");
+        self.set_shown(false);
+        true
     }
 
     /// Left click on the tray icon.
@@ -536,15 +561,21 @@ fn main() {
     // Spawned after state + cmd_tx exist so the menu can read/toggle gaming mode.
     let _tray_handle = if !args.no_tray && args.ui_tour.is_none() {
         use ksni::blocking::TrayMethods;
+        // Shown unless the tray says otherwise while it registers.
+        if let Ok(mut s) = state.lock() {
+            s.tray_available = true;
+        }
         match (ArgusLassoTray {
             state: Arc::clone(&state),
             cmd_tx: cmd_tx.clone(),
             context: Arc::clone(&gui_context),
         })
+        .assume_sni_available(true)
         .spawn()
         {
             Ok(h) => {
-                log::info!("SNI tray icon registered");
+                // Shown or waiting for the desktop's tray; the tray logs which.
+                log::info!("Tray icon service started");
                 Some(h)
             }
             Err(e) => {
@@ -555,8 +586,10 @@ fn main() {
     } else {
         None
     };
-    if let Ok(mut s) = state.lock() {
-        s.tray_available = _tray_handle.is_some();
+    if _tray_handle.is_none() {
+        if let Ok(mut s) = state.lock() {
+            s.tray_available = false;
+        }
     }
 
     // Launch GUI
@@ -738,6 +771,33 @@ fn spawn_stop_signal_handler(
 #[cfg(test)]
 mod tests {
     use super::lock_instance_in;
+
+    /// The desktop's tray can start after Argus, or go away with a panel
+    /// restart. The icon used to give up for the session; now it waits, and
+    /// Close to tray follows whether it is shown.
+    #[test]
+    fn the_tray_follows_the_desktop_tray_as_it_comes_and_goes() {
+        use super::{monitor::AppState, ArgusLassoTray};
+        use ksni::Tray as _;
+        use std::sync::{Arc, Mutex};
+        let state = Arc::new(Mutex::new(AppState {
+            tray_available: true,
+            ..Default::default()
+        }));
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+        let tray = ArgusLassoTray {
+            state: Arc::clone(&state),
+            cmd_tx,
+            context: Default::default(),
+        };
+        assert!(
+            tray.watcher_offline(ksni::OfflineReason::No),
+            "the icon waits for the tray to return"
+        );
+        assert!(!state.lock().unwrap().tray_available);
+        tray.watcher_online();
+        assert!(state.lock().unwrap().tray_available);
+    }
 
     /// Closed to the tray, main waits for a window request; anything else
     /// ends the window loop.

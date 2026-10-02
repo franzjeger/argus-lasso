@@ -32,6 +32,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- The tray icon appears when the desktop's tray starts after Argus, as at login
+  when Argus starts first, or comes back after a panel restart. Argus gave up on
+  the icon for the whole session when the tray was not there at start.
+  Close to tray follows whether the icon is shown, and quits while it is not.
 - A ProBalance restore threshold with a fraction, such as 84.5 % under an
   activation at 85 %, is kept on Apply. It was cut to 84 %, a whole point below
   activation, although the form had accepted the value.
