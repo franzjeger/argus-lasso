@@ -1,13 +1,30 @@
 # Project status
 
-Reviewed on **2026-10-02** for release **1.5.0**: package version `1.5.0`, IPC
-protocol 6. The version and changelog section are prepared in the release pull
-request; the tag and the published archives are recorded here once the release
-workflow has run and they have been checked on GitHub. Until then the latest
-published release is
-[v1.4.0](https://github.com/franzjeger/argus-lasso/releases/tag/v1.4.0).
+Reviewed on **2026-10-02**. Release
+[v1.5.0](https://github.com/franzjeger/argus-lasso/releases/tag/v1.5.0) is
+published and is GitHub's latest release: package version `1.5.0`, IPC protocol
+6, tagged on
+[`360910f`](https://github.com/franzjeger/argus-lasso/commit/360910fde5d5425c03521be7724032a552a6895a),
+the merge of [#111](https://github.com/franzjeger/argus-lasso/pull/111).
 
-## Release candidate verification
+## Published archives (v1.5.0)
+
+The [release run](https://github.com/franzjeger/argus-lasso/actions/runs/36982262910)
+built, signed and published both architectures after approval in the `release`
+environment, and wrote the notes from the 1.5.0 changelog section. The published
+archives were downloaded and checked on 2026-10-02:
+
+- Each matches its `.sha256` file, and its `.minisig` signature verifies with
+  `minisign-verify` against `dist/argus-lasso.pub` (key `D53DAD0590FF1744`); the
+  replaced 1.3.1 key refuses it.
+- `bundle.json` names build `360910fde5d5…` (the tagged commit), version 1.5.0
+  and protocol 6 for x86_64 and aarch64. The x86_64 app and layer match the
+  SHA-256 values in `bundle.json`, and the app's `build-info` agrees with it.
+- The x86_64 archive is 14.5 MB (v1.4.0: 21.1 MB), the aarch64 one 13.8 MB.
+- The download URLs in [binary archives](installation.md#binary-archives)
+  resolve for the archive, checksum and signature.
+
+## Release candidate verification (1.5.0)
 
 Run on 2026-10-02 on the release branch (version 1.5.0, source otherwise equal
 to `master` at
@@ -66,7 +83,7 @@ earlier layer show "Telemetry disconnected" until restarted.
 
 Releases from 1.4.0 on are signed with a new key (ID `D53DAD0590FF1744`). The
 updater of 1.3.1 and older checks against the replaced key and refuses them, so
-those installations move to 1.4.0 by hand once; see
+those installations move to 1.4.0 or later by hand once; see
 [binary archives](installation.md#binary-archives). From 1.4.0 the updater
 compares stable release versions, not commits, installs matched app/layer
 bundles, keeps the previous pair for rollback and recovers pending transactions

@@ -1,7 +1,7 @@
 # Installation
 
-These instructions apply to the current source tree. As checked on 2026-09-30,
-the latest published release is v1.4.0; its archives contain the app, the
+These instructions apply to the current source tree. As checked on 2026-10-02,
+the latest published release is v1.5.0; its archives contain the app, the
 Vulkan layer and the sensor helper as a matched pair (see
 [binary archives](#binary-archives)). Do not mix daemon and layer files from
 arbitrary revisions.
@@ -95,7 +95,7 @@ signature against the release key ([`dist/argus-lasso.pub`](../dist/argus-lasso.
 before installing it, then install from the extracted directory:
 
 ```bash
-version=1.4.0
+version=1.5.0
 pkg=argus-lasso-$version-$(uname -m)-linux
 curl -fL --remote-name-all \
   https://github.com/franzjeger/argus-lasso/releases/download/v$version/$pkg.tar.gz{,.sha256,.minisig}
@@ -107,7 +107,7 @@ tar xzf "$pkg.tar.gz" && cd "$pkg"
 ./scripts/install-sensors.sh .
 ```
 
-This is also how 1.3.1 and older move to 1.4.0, once: their updater checks
+This is also how 1.3.1 and older move to 1.4.0 or later, once: their updater checks
 against the release key that was replaced on 2026-09-30 and refuses newer
 archives. From 1.4.0 on, the in-app updater installs a matched app/layer pair
 from signed archives containing bundle metadata and retains a rollback. The
