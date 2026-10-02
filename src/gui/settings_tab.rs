@@ -593,7 +593,7 @@ impl SettingsTab {
                             if self.tray_available {
                                 "Open the window again from the tray icon or the app menu. Quit is in the tray menu."
                             } else {
-                                "No tray icon is available (started with --no-tray, or the desktop has no tray), so closing the window quits."
+                                "The desktop's tray is not showing Argus-Lasso's icon (started with --no-tray, or no tray is running), so closing the window quits."
                             },
                         );
                     });

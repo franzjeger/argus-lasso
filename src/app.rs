@@ -240,9 +240,7 @@ impl ArgusLassoApp {
         let probalance_tab = ProBalanceTab::new(config.probalance.clone());
         let gaming_mode_tab = GamingModeTab::new(config.clone());
         let mut settings_tab = SettingsTab::new(config.clone());
-        // The tour has no tray icon, but documents the app as it runs with one.
-        settings_tab.tray_available =
-            tour_dir.is_some() || state.lock().is_ok_and(|s| s.tray_available);
+        settings_tab.tray_available = tour_dir.is_some();
 
         // Initialise Wayland compositor-side opacity via wp_alpha_modifier_v1.
         // Extract the raw wl_display* and wl_surface* that eframe already holds.
@@ -1462,6 +1460,10 @@ impl ArgusLassoApp {
     }
 
     fn show_settings_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // Followed live: the desktop's tray can start after Argus or go away.
+        // The tour has no tray icon, but documents the app as it runs with one.
+        self.settings_tab.tray_available =
+            self.tour.is_some() || self.state.lock().is_ok_and(|s| s.tray_available);
         let config_changed = self
             .settings_tab
             .show(ui, ctx, self.opacity, &mut self.updates);

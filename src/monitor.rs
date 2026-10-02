@@ -163,7 +163,8 @@ pub struct AppState {
     pub cpu_model: String,
     /// Set by the daemon once a Shutdown command has finished restoring state
     pub shutdown_complete: bool,
-    /// The tray icon registered, so the window can close to it.
+    /// The tray icon is shown by the desktop's tray right now, so the window
+    /// can close to it. Follows the tray as it comes and goes.
     pub tray_available: bool,
     /// The window was closed to the tray: the service runs on without one.
     pub window_closed: bool,
