@@ -32,9 +32,14 @@ pub fn take_window_error() -> Option<String> {
 
 struct Logger(env_logger::Logger);
 
+fn persist(metadata: &log::Metadata<'_>) -> bool {
+    metadata.level() <= log::Level::Warn
+        || (metadata.level() == log::Level::Info && metadata.target().starts_with("argus_lasso"))
+}
+
 impl log::Log for Logger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info || self.0.enabled(metadata)
+        persist(metadata) || self.0.enabled(metadata)
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -43,7 +48,7 @@ impl log::Log for Logger {
                 *error = Some(record.args().to_string());
             }
         }
-        if record.level() <= log::Level::Info {
+        if persist(record.metadata()) {
             let seconds = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -139,6 +144,15 @@ mod tests {
         state.append_log("[Rule:x] Set nice=5 on game(42)".into());
         assert!(PATH.get().is_none(), "a test enabled the real log file");
         assert!(state.log_lines.back().unwrap().ends_with("game(42)"));
+    }
+
+    #[test]
+    fn persistent_diagnostics_exclude_dependency_info_chatter() {
+        let metadata = |level, target| log::Metadata::builder().level(level).target(target).build();
+        assert!(!persist(&metadata(log::Level::Info, "zbus::object_server")));
+        assert!(persist(&metadata(log::Level::Warn, "winit")));
+        assert!(persist(&metadata(log::Level::Error, "eframe::native::run")));
+        assert!(persist(&metadata(log::Level::Info, "argus_lasso")));
     }
 
     #[test]
