@@ -267,7 +267,7 @@ fn lock_instance_in(
 }
 
 fn main() {
-    env_logger::init();
+    logfile::init_logger();
 
     let args = Args::parse();
 
@@ -619,26 +619,26 @@ fn main() {
             .with_transparent(true)
             .with_visible(visible)
             .with_icon(window_icon.clone()),
-        // The tour renders into the X server in $DISPLAY — Xvfb under
-        // xvfb-run. winit prefers Wayland whenever $WAYLAND_DISPLAY is set,
-        // which put the tour window on the user's desktop instead, where a
-        // hidden window gets no frames and the tour waits forever.
-        event_loop_builder: args
-            .ui_tour
-            .is_some()
-            .then(|| -> eframe::EventLoopBuilderHook {
-                Box::new(|builder| {
-                    use winit::platform::x11::EventLoopBuilderExtX11;
-                    builder.with_x11();
-                })
-            }),
         ..Default::default()
     };
 
-    // eframe keeps its event loop between runs, so a window closed to the
-    // tray is reopened by running it again: a new window with a new app on
-    // the current configuration. Hiding the old one instead is not possible
-    // on Wayland, where winit cannot unmap a window once shown.
+    // Own the loop so it can keep dispatching display events with no window.
+    // A sleeping tray loop leaves Wayland output globals stale on reopening.
+    use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
+    let mut builder = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event();
+    if args.ui_tour.is_some() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        builder.with_x11();
+    }
+    let mut event_loop = match builder.build() {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            log::error!("Cannot start the window event loop: {error}");
+            monitor::shutdown_and_wait(&state, &cmd_tx);
+            monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2));
+            std::process::exit(1);
+        }
+    };
     let mut visible = !args.minimized;
     let updates_carry = app::UpdatesCarry::default();
     loop {
@@ -652,7 +652,7 @@ fn main() {
         let tour_dir = args.ui_tour.clone();
         let context_gui = Arc::clone(&gui_context);
         let carry_gui = updates_carry.clone();
-        let run = eframe::run_native(
+        let mut window = eframe::create_native(
             "Argus-Lasso",
             native_options(visible),
             Box::new(move |cc| {
@@ -663,13 +663,21 @@ fn main() {
                     cc, state_gui, cmd_tx_gui, re_gui, cfg_gui, tour_dir, carry_gui,
                 )))
             }),
+            &event_loop,
         );
+        let run = event_loop.run_app_on_demand(&mut window);
+        drop(window);
+        // create_native logs renderer errors but does not expose its stored
+        // Result. Preserve the failure exit status for systemd restarts.
+        let run = run
+            .map_err(|e| e.to_string())
+            .and_then(|()| logfile::take_window_error().map_or(Ok(()), Err));
         // Losing the display (logout, a compositor crash) ends the window with
         // an error, perhaps before on_exit ran. Panicking here ended the process
         // in the middle of the restore a stop signal had started; restore, then
         // exit with an error so systemd restarts the app after a crash.
         if let Err(e) = run {
-            eprintln!("Argus-Lasso's window failed: {e}");
+            log::error!("Argus-Lasso's window failed: {e}");
             monitor::shutdown_and_wait(&state, &cmd_tx);
             monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2));
             std::process::exit(1);
@@ -677,9 +685,27 @@ fn main() {
         if let Ok(mut context) = gui_context.lock() {
             *context = None;
         }
-        if !wait_for_window_request(&state) {
+        if state
+            .lock()
+            .map_or(true, |s| !s.window_closed || s.quit_requested)
+        {
             break;
         }
+        log::info!("Window closed; processing display events while waiting in tray");
+        let mut tray_wait = TrayWait {
+            state: &state,
+            reopen: false,
+        };
+        if let Err(error) = event_loop.run_app_on_demand(&mut tray_wait) {
+            log::error!("Display connection failed while in tray: {error}");
+            monitor::shutdown_and_wait(&state, &cmd_tx);
+            monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2));
+            std::process::exit(1);
+        }
+        if !tray_wait.reopen {
+            break;
+        }
+        log::info!("Reopening window from tray");
         visible = true;
     }
 
@@ -695,22 +721,47 @@ fn main() {
     }
 }
 
-/// After the window has closed: when it closed to the tray, wait until the
-/// tray or a second launch asks for a window (true) or something asks Argus
-/// to quit (false). A window that closed for good returns false at once.
-fn wait_for_window_request(state: &Arc<Mutex<monitor::AppState>>) -> bool {
-    loop {
-        match state.lock() {
-            Ok(s) if !s.window_closed || s.quit_requested => return false,
-            Ok(mut s) if s.window_wanted => {
-                s.window_closed = false;
-                s.window_wanted = false;
-                return true;
-            }
-            Ok(_) => {}
-            Err(_) => return false,
+/// None keeps dispatching display events; Some decides whether to reopen.
+fn window_request(state: &Arc<Mutex<monitor::AppState>>) -> Option<bool> {
+    match state.lock() {
+        Ok(s) if !s.window_closed || s.quit_requested => Some(false),
+        Ok(mut s) if s.window_wanted => {
+            s.window_closed = false;
+            s.window_wanted = false;
+            Some(true)
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        Ok(_) => None,
+        Err(_) => Some(false),
+    }
+}
+
+struct TrayWait<'a> {
+    state: &'a Arc<Mutex<monitor::AppState>>,
+    reopen: bool,
+}
+
+impl winit::application::ApplicationHandler<eframe::UserEvent> for TrayWait<'_> {
+    fn resumed(&mut self, _: &winit::event_loop::ActiveEventLoop) {}
+
+    fn window_event(
+        &mut self,
+        _: &winit::event_loop::ActiveEventLoop,
+        _: winit::window::WindowId,
+        _: winit::event::WindowEvent,
+    ) {
+    }
+
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if let Some(reopen) = window_request(self.state) {
+            self.reopen = reopen;
+            event_loop.exit();
+        } else {
+            // Tray and singleton requests arrive from other threads. A bounded
+            // wait checks them without starving Wayland or spinning the CPU.
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(100),
+            ));
+        }
     }
 }
 
@@ -803,7 +854,7 @@ mod tests {
     /// ends the window loop.
     #[test]
     fn a_window_closed_to_the_tray_reopens_only_when_asked() {
-        use super::{monitor::AppState, wait_for_window_request};
+        use super::{monitor::AppState, window_request};
         use std::sync::{Arc, Mutex};
         let state = |closed, wanted, quit| {
             Arc::new(Mutex::new(AppState {
@@ -814,21 +865,117 @@ mod tests {
             }))
         };
         assert!(
-            !wait_for_window_request(&state(false, false, false)),
+            window_request(&state(false, false, false)) == Some(false),
             "closed for good"
         );
         assert!(
-            !wait_for_window_request(&state(true, true, true)),
+            window_request(&state(true, true, true)) == Some(false),
             "Quit wins"
         );
 
         let wanted = state(true, true, false);
-        assert!(wait_for_window_request(&wanted));
+        assert_eq!(window_request(&state(true, false, false)), None);
+        assert_eq!(window_request(&wanted), Some(true));
         let s = wanted.lock().unwrap();
         assert!(
             !s.window_closed && !s.window_wanted,
             "spent on the new window"
         );
+    }
+
+    /// Run under an isolated display, e.g. xvfb-run, never the user's session.
+    #[test]
+    #[ignore = "requires an isolated graphical display"]
+    fn window_tray_window_lifecycle() {
+        use super::{monitor, TrayWait};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+        use winit::platform::run_on_demand::EventLoopExtRunOnDemand;
+        use winit::platform::x11::EventLoopBuilderExtX11;
+
+        struct Window {
+            state: Arc<Mutex<monitor::AppState>>,
+            exits: Arc<AtomicUsize>,
+        }
+        impl eframe::App for Window {
+            fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+                ui.label("Tray lifecycle regression test");
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
+                self.state.lock().unwrap().window_closed = true;
+                self.exits.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        crate::logfile::init_logger();
+        let mut builder = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event();
+        if std::env::var_os("ARGUS_TEST_WAYLAND").is_some() {
+            use winit::platform::wayland::EventLoopBuilderExtWayland;
+            EventLoopBuilderExtWayland::with_any_thread(&mut builder, true);
+            builder.with_wayland();
+        } else {
+            builder.with_x11().with_any_thread(true);
+        }
+        let mut events = builder.build().unwrap();
+        let state = Arc::new(Mutex::new(monitor::AppState::default()));
+        let exits = Arc::new(AtomicUsize::new(0));
+        for iteration in 1..=3 {
+            let app_state = Arc::clone(&state);
+            let app_exits = Arc::clone(&exits);
+            let mut window = eframe::create_native(
+                "Tray lifecycle test",
+                eframe::NativeOptions::default(),
+                Box::new(move |_| {
+                    Ok(Box::new(Window {
+                        state: app_state,
+                        exits: app_exits,
+                    }))
+                }),
+                &events,
+            );
+            events.run_app_on_demand(&mut window).unwrap();
+            drop(window);
+            assert_eq!(exits.load(Ordering::SeqCst), iteration);
+            let request_state = Arc::clone(&state);
+            let requester = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(250));
+                request_state.lock().unwrap().window_wanted = true;
+            });
+            let mut idle = TrayWait {
+                state: &state,
+                reopen: false,
+            };
+            events.run_app_on_demand(&mut idle).unwrap();
+            requester.join().unwrap();
+            assert!(idle.reopen);
+            assert!(!state.lock().unwrap().window_closed);
+        }
+        // Quit while windowless must return without opening another window.
+        state.lock().unwrap().window_closed = true;
+        state.lock().unwrap().quit_requested = true;
+        let mut idle = TrayWait {
+            state: &state,
+            reopen: false,
+        };
+        events.run_app_on_demand(&mut idle).unwrap();
+        assert!(!idle.reopen);
+        assert!(crate::logfile::take_window_error().is_none());
+
+        // eframe returns Ok even if app creation fails with this API. The
+        // diagnostic bridge must retain that failure for main's exit status.
+        let mut failed = eframe::create_native(
+            "Failed window test",
+            eframe::NativeOptions::default(),
+            Box::new(|_| Err(std::io::Error::other("intentional window creation failure").into())),
+            &events,
+        );
+        events.run_app_on_demand(&mut failed).unwrap();
+        drop(failed);
+        assert!(crate::logfile::take_window_error()
+            .unwrap()
+            .contains("intentional window creation failure"));
     }
 
     #[test]

@@ -22,6 +22,58 @@ struct LogFile {
 static PATH: OnceLock<PathBuf> = OnceLock::new();
 static LOG: Mutex<Option<LogFile>> = Mutex::new(None);
 
+// eframe's external-event-loop API reports renderer failures through log
+// records rather than a Result. Retain that error for the window runner.
+static WINDOW_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn take_window_error() -> Option<String> {
+    WINDOW_ERROR.lock().ok()?.take()
+}
+
+struct Logger(env_logger::Logger);
+
+impl log::Log for Logger {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.level() <= log::Level::Info || self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if record.level() == log::Level::Error && record.target() == "eframe::native::run" {
+            if let Ok(mut error) = WINDOW_ERROR.lock() {
+                *error = Some(record.args().to_string());
+            }
+        }
+        if record.level() <= log::Level::Info {
+            let seconds = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            append(&format!(
+                "[unix:{seconds}] [{} {}] {}",
+                record.level(),
+                record.target(),
+                record.args()
+            ));
+        }
+        if self.0.enabled(record.metadata()) {
+            self.0.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
+}
+
+/// Keep the existing RUST_LOG-controlled stderr output, while persisting
+/// diagnostics even when a desktop launcher redirects stderr to /dev/null.
+pub fn init_logger() {
+    let logger = env_logger::Builder::from_default_env().build();
+    let level = logger.filter().max(log::LevelFilter::Info);
+    log::set_boxed_logger(Box::new(Logger(logger))).expect("logger initialized once");
+    log::set_max_level(level);
+}
+
 /// Where the app keeps its log.
 pub fn default_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
@@ -87,6 +139,34 @@ mod tests {
         state.append_log("[Rule:x] Set nice=5 on game(42)".into());
         assert!(PATH.get().is_none(), "a test enabled the real log file");
         assert!(state.log_lines.back().unwrap().ends_with("game(42)"));
+    }
+
+    #[test]
+    fn renderer_errors_survive_disabled_stderr_logging() {
+        use log::Log;
+        let mut builder = env_logger::Builder::new();
+        builder.filter_level(log::LevelFilter::Off);
+        let logger = Logger(builder.build());
+        logger.log(
+            &log::Record::builder()
+                .level(log::Level::Error)
+                .target("eframe::native::run")
+                .args(format_args!("Exiting because of error: test EGL failure"))
+                .build(),
+        );
+        assert_eq!(
+            take_window_error().as_deref(),
+            Some("Exiting because of error: test EGL failure")
+        );
+        assert!(take_window_error().is_none());
+        logger.log(
+            &log::Record::builder()
+                .level(log::Level::Error)
+                .target("unrelated")
+                .args(format_args!("not a window failure"))
+                .build(),
+        );
+        assert!(take_window_error().is_none());
     }
 
     #[test]
