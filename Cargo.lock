@@ -272,7 +272,7 @@ dependencies = [
 
 [[package]]
 name = "argus-lasso"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "argus-ipc",
  "ashpd",

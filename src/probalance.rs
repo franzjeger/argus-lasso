@@ -648,6 +648,23 @@ impl ProBalance {
         system_cpu: Option<f32>,
         protected_pids: &std::collections::HashSet<u32>,
     ) {
+        self.tick_with_unit_lookup(
+            snapshot,
+            tick_seconds,
+            system_cpu,
+            protected_pids,
+            crate::cgroup::unit_for_pid,
+        );
+    }
+
+    fn tick_with_unit_lookup(
+        &mut self,
+        snapshot: &[ProcSnapshot],
+        tick_seconds: f32,
+        system_cpu: Option<f32>,
+        protected_pids: &std::collections::HashSet<u32>,
+        mut unit_of: impl FnMut(u32) -> Option<String>,
+    ) {
         // A long scheduler pause is not evidence of consecutive high samples.
         let system_cpu = if tick_seconds.is_finite() && (0.0..=2.5).contains(&tick_seconds) {
             system_cpu
@@ -710,6 +727,9 @@ impl ProBalance {
         self.cgroup_failed_pids.retain(|p| alive.contains_key(p));
 
         // Unit-level CPUWeight must never penalize a protected neighbor.
+        // Resolve cgroup units lazily: only processes that are already throttled
+        // or currently accumulating high-CPU ticks under system pressure can
+        // trigger a unit throttle or need exemption restore.
         let mut protected = protected_pids.clone();
         protected.extend(
             snapshot
@@ -717,19 +737,32 @@ impl ProBalance {
                 .filter(|p| self.is_exempt(&p.name))
                 .map(|p| p.pid),
         );
-        if self.cfg.method != "nice" || !self.unit_refs.is_empty() {
-            let units: std::collections::HashSet<_> = protected
-                .iter()
-                .filter_map(|p| crate::cgroup::unit_for_pid(*p))
-                .collect();
-            for proc in snapshot {
-                if crate::cgroup::unit_for_pid(proc.pid).is_some_and(|unit| units.contains(&unit)) {
-                    protected.insert(proc.pid);
+        let check_units = self.cfg.method != "nice" || !self.unit_refs.is_empty();
+        let system_under_pressure = system_cpu
+            .filter(|v| v.is_finite() && (0.0..=100.0).contains(v))
+            .is_some_and(|v| v > self.cfg.system_cpu_threshold_percent);
+        let mut protected_units: Option<std::collections::HashSet<String>> = None;
+
+        for proc in snapshot {
+            let mut is_protected = protected.contains(&proc.pid);
+            if !is_protected && check_units {
+                let is_throttled = self
+                    .states
+                    .get(&proc.pid)
+                    .is_some_and(|e| e.state == ProcState::Throttled);
+                let is_candidate =
+                    system_under_pressure && proc.cpu_percent >= self.cfg.process_min_cpu_percent;
+                if is_throttled || is_candidate {
+                    let units = protected_units.get_or_insert_with(|| {
+                        protected.iter().filter_map(|p| unit_of(*p)).collect()
+                    });
+                    if !units.is_empty() && unit_of(proc.pid).is_some_and(|u| units.contains(&u)) {
+                        protected.insert(proc.pid);
+                        is_protected = true;
+                    }
                 }
             }
-        }
-        for proc in snapshot {
-            if protected.contains(&proc.pid) {
+            if is_protected {
                 // A process exempted *after* being throttled must be restored,
                 // not silently abandoned in its throttled state.
                 if let Some(entry) = self.states.remove(&proc.pid) {
@@ -1527,5 +1560,80 @@ mod system_pressure_tests {
         let next = ProBalance::new(ProBalanceConfig::default()).with_journal(Some(path.clone()));
         assert_eq!(next.unit_refs["app-old.scope"].original, original);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn idle_ticks_do_not_query_cgroup_units_for_every_process() {
+        let mut pb = ProBalance::new(ProBalanceConfig {
+            method: "auto".into(),
+            ..Default::default()
+        });
+        let snapshot: Vec<ProcSnapshot> = (1000..1500)
+            .map(|pid| ProcSnapshot {
+                pid,
+                start_ticks: 100,
+                name: format!("worker-{pid}"),
+                cpu_percent: 0.1,
+                nice: 0,
+            })
+            .collect();
+        let protected: std::collections::HashSet<u32> = [1000, 1001].into_iter().collect();
+        let mut lookups = 0usize;
+        pb.tick_with_unit_lookup(&snapshot, 1.0, Some(25.0), &protected, |_pid| {
+            lookups += 1;
+            Some("app-shared.scope".into())
+        });
+        assert_eq!(
+            lookups, 0,
+            "idle ticks must not scan /proc/<pid>/cgroup for non-candidate processes"
+        );
+    }
+
+    #[test]
+    fn lazy_unit_lookup_protects_co_unit_neighbor_under_pressure() {
+        let mut pb = ProBalance::new(ProBalanceConfig {
+            method: "auto".into(),
+            ..Default::default()
+        });
+        let snapshot = vec![
+            ProcSnapshot {
+                pid: 100,
+                start_ticks: 10,
+                name: "game".into(),
+                cpu_percent: 40.0,
+                nice: 0,
+            },
+            ProcSnapshot {
+                pid: 200,
+                start_ticks: 10,
+                name: "helper-in-same-unit".into(),
+                cpu_percent: 30.0,
+                nice: 0,
+            },
+            ProcSnapshot {
+                pid: 300,
+                start_ticks: 10,
+                name: "idle-other".into(),
+                cpu_percent: 0.0,
+                nice: 0,
+            },
+        ];
+        let protected: std::collections::HashSet<u32> = [100].into_iter().collect();
+        let mut queried = Vec::new();
+        pb.tick_with_unit_lookup(&snapshot, 1.0, Some(95.0), &protected, |pid| {
+            queried.push(pid);
+            match pid {
+                100 | 200 => Some("app-game.scope".into()),
+                _ => Some("app-other.scope".into()),
+            }
+        });
+        assert!(
+            !pb.states.contains_key(&200),
+            "neighbor sharing unit with protected PID must be exempted"
+        );
+        assert!(
+            !queried.contains(&300),
+            "idle process below threshold must not be queried even under system pressure"
+        );
     }
 }

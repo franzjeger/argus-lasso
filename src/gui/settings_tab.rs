@@ -18,12 +18,49 @@ pub enum SettingsSection {
     Startup,
 }
 
+/// The subset of [`Config`] owned by the Settings tab.
+///
+/// Storing only these fields makes it impossible at the type level for
+/// [`SettingsTab`] to hold a stale copy of rules, ProBalance, or gaming mode
+/// settings or overwrite them when persisting an edit.
+#[derive(Debug, Clone)]
+pub struct SettingsPageConfig {
+    pub default_affinity: Option<String>,
+    pub monitor: crate::config::MonitorConfig,
+    pub hw_alerts: crate::config::HwAlertConfig,
+    pub notifications_enabled: bool,
+    pub check_updates_on_start: bool,
+    pub close_to_tray: bool,
+}
+
+impl SettingsPageConfig {
+    pub fn from_config(c: &Config) -> Self {
+        Self {
+            default_affinity: c.cpu.default_affinity.clone(),
+            monitor: c.monitor.clone(),
+            hw_alerts: c.hw_alerts.clone(),
+            notifications_enabled: c.ui.notifications_enabled,
+            check_updates_on_start: c.ui.check_updates_on_start,
+            close_to_tray: c.ui.close_to_tray,
+        }
+    }
+
+    pub fn apply_to(self, c: &mut Config) {
+        c.cpu.default_affinity = self.default_affinity;
+        c.monitor = self.monitor;
+        c.hw_alerts = self.hw_alerts;
+        c.ui.notifications_enabled = self.notifications_enabled;
+        c.ui.check_updates_on_start = self.check_updates_on_start;
+        c.ui.close_to_tray = self.close_to_tray;
+    }
+}
+
 pub struct SettingsTab {
     pub section: SettingsSection,
     /// The tray icon registered, so closing the window can leave Argus in it.
     pub tray_available: bool,
-    /// The settings as in effect; every change is stored at once.
-    pub config: Config,
+    /// The settings owned by this page; every change is stored at once.
+    pub settings: SettingsPageConfig,
     pub default_affinity_enabled: bool,
     pub default_affinity_text: String,
     /// Why the typed CPU list was not used.
@@ -55,7 +92,8 @@ pub struct SettingsTab {
 
 impl SettingsTab {
     pub fn new(config: Config) -> Self {
-        let current_affinity = config.cpu.default_affinity.clone().unwrap_or_default();
+        let settings = SettingsPageConfig::from_config(&config);
+        let current_affinity = settings.default_affinity.clone().unwrap_or_default();
         let default_affinity_enabled = !current_affinity.is_empty();
         let autostart_enabled = xdg_entry().is_some_and(|entry| entry.exists());
         // Restore opacity and theme from persisted config.
@@ -70,7 +108,7 @@ impl SettingsTab {
             default_affinity_enabled,
             affinity_error: None,
             cpu_dialog: None,
-            config,
+            settings,
             opacity,
             autostart_enabled,
             autostart_job: Some(spawn_autostart(|| {
@@ -119,14 +157,14 @@ impl SettingsTab {
             }
         };
         self.affinity_error = None;
-        if affinity == self.config.cpu.default_affinity {
+        if affinity == self.settings.default_affinity {
             return false;
         }
         self.status = match &affinity {
             Some(list) => format!("Default affinity → {list}"),
             None => "Default affinity off".into(),
         };
-        self.config.cpu.default_affinity = affinity;
+        self.settings.default_affinity = affinity;
         true
     }
 
@@ -134,18 +172,18 @@ impl SettingsTab {
     /// use it if it is valid, otherwise put back the one in effect and say
     /// so. For when the Processes section is no longer shown. Returns the
     /// settings if they changed.
-    pub fn finish_editing(&mut self) -> Option<Config> {
+    pub fn finish_editing(&mut self) -> Option<SettingsPageConfig> {
         let pending = match self.edited_affinity() {
-            Ok(affinity) => affinity != self.config.cpu.default_affinity,
+            Ok(affinity) => affinity != self.settings.default_affinity,
             Err(_) => true,
         };
         if !pending {
             return None;
         }
         if self.commit_affinity() {
-            return Some(self.config.clone());
+            return Some(self.settings.clone());
         }
-        let kept = self.config.cpu.default_affinity.clone();
+        let kept = self.settings.default_affinity.clone();
         self.status = format!(
             "{} — kept {}",
             self.affinity_error.take().unwrap_or_default(),
@@ -246,7 +284,7 @@ impl SettingsTab {
         ctx: &egui::Context,
         opacity: f32,
         updates: &mut crate::updater::UpdateState,
-    ) -> Option<Config> {
+    ) -> Option<SettingsPageConfig> {
         let mut changed = false;
         if self.section != SettingsSection::Processes {
             changed |= self.finish_editing().is_some();
@@ -376,7 +414,7 @@ impl SettingsTab {
 
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Apply rules every", |ui| {
                             changed |= committed(&ui.add(
-                                theme::number(&mut self.config.monitor.rule_enforce_interval_ms)
+                                theme::number(&mut self.settings.monitor.rule_enforce_interval_ms)
                                     .range(100..=10000)
                                     .suffix(" ms"),
                             ));
@@ -386,10 +424,10 @@ impl SettingsTab {
                             const PICKS: [u64; 4] = [500, 1000, 2000, 5000];
                             let sel = PICKS
                                 .iter()
-                                .position(|ms| *ms == self.config.monitor.display_refresh_interval_ms)
+                                .position(|ms| *ms == self.settings.monitor.display_refresh_interval_ms)
                                 .unwrap_or(usize::MAX);
                             if let Some(i) = theme::segmented(ui, &["0.5 s", "1 s", "2 s", "5 s"], sel) {
-                                self.config.monitor.display_refresh_interval_ms = PICKS[i];
+                                self.settings.monitor.display_refresh_interval_ms = PICKS[i];
                                 changed = true;
                             }
                         });
@@ -528,19 +566,19 @@ impl SettingsTab {
 
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Desktop notifications", |ui| {
                             changed |= ui
-                                .checkbox(&mut self.config.ui.notifications_enabled, "Enabled")
+                                .checkbox(&mut self.settings.notifications_enabled, "Enabled")
                                 .changed();
                         });
 
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Temperature alerts", |ui| {
-                            changed |= ui.checkbox(&mut self.config.hw_alerts.enabled, "Enabled").changed();
-                            let on = self.config.hw_alerts.enabled;
+                            changed |= ui.checkbox(&mut self.settings.hw_alerts.enabled, "Enabled").changed();
+                            let on = self.settings.hw_alerts.enabled;
                             let weak = ui.visuals().weak_text_color();
                             ui.add_enabled_ui(on, |ui| {
                                 ui.label("at");
                                 changed |= committed(&ui.add(
                                     theme::number(
-                                        &mut self.config.hw_alerts.temp_threshold_celsius,
+                                        &mut self.settings.hw_alerts.temp_threshold_celsius,
                                     )
                                     .range(50.0..=110.0)
                                     .speed(1.0)
@@ -549,7 +587,7 @@ impl SettingsTab {
                                 ));
                                 ui.colored_label(weak, "·  at least");
                                 changed |= committed(&ui.add(
-                                    theme::number(&mut self.config.hw_alerts.cooldown_secs)
+                                    theme::number(&mut self.settings.hw_alerts.cooldown_secs)
                                         .range(10..=300)
                                         .speed(5.0)
                                         .suffix(" s"),
@@ -582,7 +620,7 @@ impl SettingsTab {
                                 .add_enabled(
                                     self.tray_available,
                                     egui::Checkbox::new(
-                                        &mut self.config.ui.close_to_tray,
+                                        &mut self.settings.close_to_tray,
                                         "Closing the window keeps Argus-Lasso running in the tray",
                                     ),
                                 )
@@ -684,7 +722,7 @@ impl SettingsTab {
 
                         crate::gui::theme::form_row_w(ui, crate::gui::theme::tokens::FORM_LABEL_W, "Check on startup", |ui| {
                             changed |= ui
-                                .checkbox(&mut self.config.ui.check_updates_on_start, "Enabled")
+                                .checkbox(&mut self.settings.check_updates_on_start, "Enabled")
                                 .changed();
                         });
                     });
@@ -708,7 +746,7 @@ impl SettingsTab {
             }
         }
 
-        changed.then(|| self.config.clone())
+        changed.then(|| self.settings.clone())
     }
 }
 
@@ -1055,7 +1093,7 @@ mod tests {
     }
 
     /// Clicks in the tab, rendered headless; returns what `show` reported.
-    fn click(tab: &mut super::SettingsTab, label: &str) -> Option<crate::config::Config> {
+    fn click(tab: &mut super::SettingsTab, label: &str) -> Option<super::SettingsPageConfig> {
         let ctx = egui::Context::default();
         crate::gui::theme::apply_theme(&ctx, &crate::gui::theme::AppTheme::BreezeDark);
         ctx.enable_accesskit();
@@ -1137,7 +1175,7 @@ mod tests {
             "Closing the window keeps Argus-Lasso running in the tray",
         )
         .expect("the change is reported at once");
-        assert!(reported.ui.close_to_tray);
+        assert!(reported.close_to_tray);
 
         let mut shared = crate::config::Config::default();
         crate::app::take_settings_page_fields(&mut shared, reported);
@@ -1151,17 +1189,17 @@ mod tests {
         tab.default_affinity_text = "abc".into();
         assert!(!tab.commit_affinity());
         assert!(tab.affinity_error.is_some());
-        assert_eq!(tab.config.cpu.default_affinity, None);
+        assert_eq!(tab.settings.default_affinity, None);
 
         tab.default_affinity_text = "0".into();
         assert!(tab.commit_affinity());
-        assert_eq!(tab.config.cpu.default_affinity.as_deref(), Some("0"));
+        assert_eq!(tab.settings.default_affinity.as_deref(), Some("0"));
         assert!(tab.affinity_error.is_none());
         assert!(!tab.commit_affinity(), "nothing new to store");
 
         tab.default_affinity_enabled = false;
         assert!(tab.commit_affinity());
-        assert_eq!(tab.config.cpu.default_affinity, None);
+        assert_eq!(tab.settings.default_affinity, None);
     }
 
     /// A CPU list typed but not entered used to be lost, still showing, when
@@ -1175,7 +1213,7 @@ mod tests {
         tab.default_affinity_enabled = true;
         tab.default_affinity_text = "0".into();
         let stored = tab.finish_editing().expect("a valid list is used");
-        assert_eq!(stored.cpu.default_affinity.as_deref(), Some("0"));
+        assert_eq!(stored.default_affinity.as_deref(), Some("0"));
 
         tab.default_affinity_text = "abc".into();
         assert!(tab.finish_editing().is_none());

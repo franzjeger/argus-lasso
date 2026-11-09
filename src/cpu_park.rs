@@ -200,11 +200,15 @@ fi
 renice -n "$nice_val" -p "$pid" >/dev/null
 # Nice is per thread on Linux: `renice -p` moves only the thread whose TID is
 # given. The main thread above decides success; the rest are best effort,
-# since a thread may exit between the listing and its renice.
+# batched into one `renice` invocation rather than one process per thread.
+tids=()
 for task in "/proc/$pid/task/"*; do
     tid=${task##*/}
-    [ "$tid" = "$pid" ] || renice -n "$nice_val" -p "$tid" >/dev/null 2>&1 || true
+    [ "$tid" = "$pid" ] || tids+=("$tid")
 done
+if [ "${#tids[@]}" -gt 0 ]; then
+    renice -n "$nice_val" -p "${tids[@]}" >/dev/null 2>&1 || true
+fi
 "#;
 
 /// The polkit rule, with `@USER@` for the user who installs the helpers: that
@@ -355,37 +359,75 @@ impl CpuTopology {
 }
 
 // ── Topology cache ────────────────────────────────────────────────────────────
-// Once we detect an asymmetric topology, we preserve it even after Gaming Mode
-// parks one CCD (making sysfs entries for those CPUs unreadable).
+// Physical CPU topology never changes at runtime. Once we detect an asymmetric
+// topology — or a uniform topology while all CPUs are online — we cache it as
+// authoritative so 1 Hz sensor collection never re-walks `/sys/devices/system/cpu`
+// and CPU parking cannot hide an asymmetric CCD.
 
-static TOPO_CACHE: Mutex<Option<CpuTopology>> = Mutex::new(None);
+#[derive(Clone)]
+struct CachedTopology {
+    topo: CpuTopology,
+    /// True when the topology is definitive (asymmetric, or sampled with no
+    /// offline CPUs that could have hidden a second CCD / E-core cluster).
+    authoritative: bool,
+}
+
+static TOPO_CACHE: Mutex<Option<CachedTopology>> = Mutex::new(None);
 
 // ── Detection ─────────────────────────────────────────────────────────────────
 
 /// Auto-detect CPU topology. Tries AMD X3D first, then Intel Hybrid.
-/// Caches asymmetric results so topology survives CPU parking.
+/// Caches authoritative results so topology survives CPU parking and avoids
+/// repeating sysfs directory walks on every sensor tick.
 pub fn detect_topology() -> CpuTopology {
-    if let Some(topo) = detect_amd_x3d() {
-        if topo.has_asymmetry() {
-            *TOPO_CACHE.lock().unwrap() = Some(topo.clone());
-            return topo;
+    let mut cache = TOPO_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    resolve_topology_cached(
+        &mut cache,
+        || get_offline_cpus().is_empty(),
+        detect_amd_x3d,
+        detect_intel_hybrid,
+        present_cpus,
+    )
+}
+
+fn resolve_topology_cached(
+    cache: &mut Option<CachedTopology>,
+    all_online: impl FnOnce() -> bool,
+    probe_x3d: impl FnOnce() -> Option<CpuTopology>,
+    probe_hybrid: impl FnOnce() -> Option<CpuTopology>,
+    present: impl FnOnce() -> HashSet<u32>,
+) -> CpuTopology {
+    if let Some(entry) = cache.as_ref() {
+        if entry.authoritative {
+            return entry.topo.clone();
         }
     }
-    if let Some(topo) = detect_intel_hybrid() {
-        if topo.has_asymmetry() {
-            *TOPO_CACHE.lock().unwrap() = Some(topo.clone());
-            return topo;
+    let every_cpu_online = all_online();
+    if let Some(entry) = cache.as_ref() {
+        if !every_cpu_online {
+            return entry.topo.clone();
         }
     }
-    // If live detection is UNIFORM but we have a cached asymmetric result
-    // (e.g. Gaming Mode already parked one CCD), return the cache.
-    if let Some(cached) = TOPO_CACHE.lock().unwrap().clone() {
-        if cached.has_asymmetry() {
-            return cached;
-        }
+    if let Some(topo) = probe_x3d().filter(CpuTopology::has_asymmetry) {
+        *cache = Some(CachedTopology {
+            topo: topo.clone(),
+            authoritative: true,
+        });
+        return topo;
     }
-    let all = present_cpus();
-    CpuTopology::uniform(all)
+    if let Some(topo) = probe_hybrid().filter(CpuTopology::has_asymmetry) {
+        *cache = Some(CachedTopology {
+            topo: topo.clone(),
+            authoritative: true,
+        });
+        return topo;
+    }
+    let topo = CpuTopology::uniform(present());
+    *cache = Some(CachedTopology {
+        topo: topo.clone(),
+        authoritative: every_cpu_online,
+    });
+    topo
 }
 
 fn present_cpus() -> HashSet<u32> {
@@ -400,7 +442,6 @@ fn present_cpus() -> HashSet<u32> {
 /// Detect AMD X3D: preferred CCD has larger L3 (3D V-Cache).
 fn detect_amd_x3d() -> Option<CpuTopology> {
     let present = present_cpus();
-    let offline = get_offline_cpus();
 
     // Read L3 cache sizes for all present CPUs
     let mut l3: HashMap<u32, u64> = HashMap::new();
@@ -423,40 +464,9 @@ fn detect_amd_x3d() -> Option<CpuTopology> {
         // offline CPUs have no sysfs entry — silently skip
     }
 
-    if l3.is_empty() {
-        return None;
-    }
-
     let sizes: HashSet<u64> = l3.values().copied().collect();
     if sizes.len() <= 1 {
-        // All readable CPUs have the same L3.
-        // Only interpret offline CPUs as "the other CCD is parked" when a
-        // previous detection actually saw an X3D topology — otherwise any
-        // machine with a manually offlined core would be misdetected as X3D.
-        let cached_is_x3d = TOPO_CACHE
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|t| t.kind == TopologyKind::AmdX3D);
-        if !offline.is_empty() && cached_is_x3d {
-            let online_kb = *sizes.iter().next().unwrap();
-            let online_set: HashSet<u32> = l3.keys().copied().collect();
-            return Some(CpuTopology {
-                kind: TopologyKind::AmdX3D,
-                preferred: online_set.clone(),
-                non_preferred: offline.clone(),
-                description: format!(
-                    "AMD X3D detected (other CCD currently parked). \
-                     Preferred (V-Cache, {}MB L3): CPUs {}. Non-preferred (parked): CPUs {}.",
-                    online_kb / 1024,
-                    cpuset_to_cpulist(&online_set),
-                    cpuset_to_cpulist(&offline),
-                ),
-                preferred_label: format!("V-Cache CCD ({} MB L3)", online_kb / 1024),
-                non_preferred_label: "Standard CCD (parked)".into(),
-            });
-        }
-        return None; // genuine uniform L3
+        return None;
     }
 
     let max_kb = *sizes.iter().max().unwrap();
@@ -1394,5 +1404,88 @@ mod tests {
             .output()
             .unwrap();
         assert!(syntax.status.success(), "not valid sh: {syntax:?}\n{cmd}");
+    }
+
+    #[test]
+    fn topology_cache_avoids_redundant_sysfs_walks_and_recovers_after_unpark() {
+        let mut cache = None;
+        let mut probes = 0usize;
+
+        // 1. Uniform CPU with all cores online: probed once, then served from cache.
+        for _ in 0..5 {
+            let topo = resolve_topology_cached(
+                &mut cache,
+                || true,
+                || {
+                    probes += 1;
+                    None
+                },
+                || None,
+                || [0, 1, 2, 3].into_iter().collect(),
+            );
+            assert_eq!(topo.kind, TopologyKind::Uniform);
+        }
+        assert_eq!(
+            probes, 1,
+            "authoritative uniform topology must be probed only once"
+        );
+
+        // 2. Sampled while cores are offline (non-authoritative uniform), then re-probed
+        //    once all cores come back online to discover X3D asymmetry.
+        let mut cache = None;
+        let mut x3d_probes = 0usize;
+        let first = resolve_topology_cached(
+            &mut cache,
+            || false,
+            || {
+                x3d_probes += 1;
+                None
+            },
+            || None,
+            || [0, 1, 2, 3].into_iter().collect(),
+        );
+        assert_eq!(first.kind, TopologyKind::Uniform);
+        assert_eq!(x3d_probes, 1);
+
+        // Still offline: does not re-probe sysfs.
+        let second = resolve_topology_cached(
+            &mut cache,
+            || false,
+            || {
+                x3d_probes += 1;
+                None
+            },
+            || None,
+            || [0, 1, 2, 3].into_iter().collect(),
+        );
+        assert_eq!(second.kind, TopologyKind::Uniform);
+        assert_eq!(x3d_probes, 1);
+
+        // Cores come online: re-probes once, caches asymmetric X3D permanently.
+        let asymmetric = CpuTopology {
+            kind: TopologyKind::AmdX3D,
+            preferred: [0, 1].into_iter().collect(),
+            non_preferred: [2, 3].into_iter().collect(),
+            description: "X3D".into(),
+            preferred_label: "V-Cache".into(),
+            non_preferred_label: "Standard".into(),
+        };
+        for online in [true, false] {
+            let resolved = resolve_topology_cached(
+                &mut cache,
+                || online,
+                || {
+                    x3d_probes += 1;
+                    Some(asymmetric.clone())
+                },
+                || None,
+                || [0, 1, 2, 3].into_iter().collect(),
+            );
+            assert_eq!(resolved.kind, TopologyKind::AmdX3D);
+        }
+        assert_eq!(
+            x3d_probes, 2,
+            "once asymmetric topology is cached, later ticks (even parked) never re-probe"
+        );
     }
 }

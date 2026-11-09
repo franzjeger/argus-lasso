@@ -1,11 +1,16 @@
 # Project status
 
-Reviewed on **2026-10-02**. Release
-[v1.5.0](https://github.com/franzjeger/argus-lasso/releases/tag/v1.5.0) is
-published and is GitHub's latest release: package version `1.5.0`, IPC protocol
-6, tagged on
-[`360910f`](https://github.com/franzjeger/argus-lasso/commit/360910fde5d5425c03521be7724032a552a6895a),
-the merge of [#111](https://github.com/franzjeger/argus-lasso/pull/111).
+Reviewed on **2026-11-09**. Release
+[v1.5.1](https://github.com/franzjeger/argus-lasso/releases/tag/v1.5.1) is the
+current release: package version `1.5.1`, IPC protocol 6.
+
+## Release verification (1.5.1)
+
+Run on 2026-11-09:
+
+- `cargo fmt --all --check` and workspace Clippy (`cargo clippy --release --workspace --all-targets --locked -- -D warnings`) passed with zero warnings.
+- Workspace tests (`cargo test --release --workspace --locked`) passed: **310 tests** (`264` in `argus-lasso`, `22` in `argus-layer`, `19` in `argus-ipc`, `5` in `argus-sensors`).
+- Verified PID validation guards for CLI `kill` and `set-affinity`, lazy ProBalance cgroup unit resolution, cached CPU topology detection, per-stream IPC generation tracking, type-isolated `SettingsPageConfig`, and batched multi-TID `renice` in the polkit helper.
 
 ## Published archives (v1.5.0)
 

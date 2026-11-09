@@ -10,6 +10,49 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-11-09
+
+CLI PID validation hardening, lazy cgroup unit lookups in ProBalance, cached
+CPU topology detection across sensor ticks, per-stream IPC generation tracking,
+type-isolated Settings tab state, and batched thread renicing in the polkit
+helper.
+
+**Upgrading:** from 1.4.0 or 1.5.0, the in-app updater installs this release.
+Restart running games afterwards to load the new layer.
+
+### Changed
+
+- `SettingsTab` now stores a dedicated `SettingsPageConfig` containing only the
+  fields owned by the Settings page instead of a full `Config` clone, making
+  stale-field overwrites of rules, ProBalance, or Gaming Mode impossible at the
+  type level.
+- The privileged `argus-lasso-helper-renice` script batches sibling thread IDs
+  into a single `renice -n <nice> -p <tids...>` invocation instead of spawning
+  one `renice` process per thread.
+
+### Fixed
+
+- `argus-lasso kill <pid>` and `argus-lasso set-affinity <pid> <mask>` now
+  validate target PIDs before converting `u32` to `pid_t`, rejecting `0` (which
+  signals the caller's process group or modifies the caller's own affinity) and
+  values above `i32::MAX` (such as `u32::MAX`, which wrapped to `-1` and
+  signaled every user process), as well as PID 1 and the current process for
+  `kill`.
+
+### Performance
+
+- ProBalance resolves systemd cgroup unit co-membership lazily only for
+  processes that are currently throttled or exceeding the high-CPU candidate
+  threshold under system pressure, eliminating per-tick `/proc/<pid>/cgroup`
+  reads across all processes when idle.
+- `cpu_park::detect_topology()` caches authoritative uniform and asymmetric CPU
+  topologies, avoiding repeated `/sys/devices/system/cpu` directory walks on
+  every 1 Hz hardware sensor tick while still re-probing if cores that were
+  offline at startup later come online.
+- The overlay IPC broadcaster tracks separate `config_gen` and `telemetry_gen`
+  counters per client so 1 Hz telemetry updates no longer re-send the overlay
+  configuration packet (and live UI slider edits no longer re-send telemetry).
+
 ## [1.5.0] — 2026-10-02
 
 Close to tray, a tray icon that waits for the desktop's tray instead of giving
@@ -809,7 +852,8 @@ when the app asks, and the sensor service if you use it
 
 - Virtualized the process table; dropped per-frame clones and sysfs reads.
 
-[Unreleased]: https://github.com/franzjeger/argus-lasso/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/franzjeger/argus-lasso/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/franzjeger/argus-lasso/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/franzjeger/argus-lasso/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/franzjeger/argus-lasso/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/franzjeger/argus-lasso/compare/v1.3.0...v1.3.1

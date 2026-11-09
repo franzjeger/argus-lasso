@@ -304,10 +304,48 @@ mod ipc_server {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
     #[derive(Default)]
-    struct Latest {
+    pub(super) struct Latest {
         config: Option<Vec<u8>>,
         telemetry: Option<Vec<u8>>,
-        generation: u64,
+        config_gen: u64,
+        telemetry_gen: u64,
+    }
+    impl Latest {
+        pub(super) fn record(&mut self, msg: &IpcMessage, packet: Vec<u8>) -> bool {
+            match msg {
+                IpcMessage::Config(_) => {
+                    self.config = Some(packet);
+                    self.config_gen = self.config_gen.wrapping_add(1).max(1);
+                    true
+                }
+                IpcMessage::Telemetry(_) => {
+                    self.telemetry = Some(packet);
+                    self.telemetry_gen = self.telemetry_gen.wrapping_add(1).max(1);
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        pub(super) fn next_packets(
+            &self,
+            sent_config: &mut u64,
+            sent_telemetry: &mut u64,
+        ) -> [Option<Vec<u8>>; 2] {
+            let cfg = (self.config_gen != *sent_config)
+                .then(|| {
+                    *sent_config = self.config_gen;
+                    self.config.clone()
+                })
+                .flatten();
+            let tel = (self.telemetry_gen != *sent_telemetry)
+                .then(|| {
+                    *sent_telemetry = self.telemetry_gen;
+                    self.telemetry.clone()
+                })
+                .flatten();
+            [cfg, tel]
+        }
     }
     pub struct Broadcaster {
         latest: Arc<(Mutex<Latest>, Condvar)>,
@@ -354,6 +392,8 @@ mod ipc_server {
                         std::thread::spawn(move || {
                             let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                             for mut stream in listener.incoming().flatten() {
+                                // Relaxed is sufficient: atomic counter only bounds concurrent
+                                // overlay client threads and carries no dependent memory state.
                                 if count.load(std::sync::atomic::Ordering::Relaxed) >= 16 {
                                     continue;
                                 }
@@ -382,16 +422,23 @@ mod ipc_server {
                                         host_pid: if ok { cred.pid as u32 } else { 0 },
                                     };
                                     if argus_ipc::write_message(&mut stream, &hello).is_ok() {
-                                        let mut generation = u64::MAX;
+                                        let mut sent_config = 0u64;
+                                        let mut sent_telemetry = 0u64;
                                         loop {
                                             let (lock, changed) = &*shared;
-                                            let mut latest = lock.lock().unwrap();
-                                            while latest.generation == generation {
-                                                latest = changed.wait(latest).unwrap();
+                                            let mut latest =
+                                                lock.lock().unwrap_or_else(|e| e.into_inner());
+                                            while latest.config_gen == sent_config
+                                                && latest.telemetry_gen == sent_telemetry
+                                            {
+                                                latest = changed
+                                                    .wait(latest)
+                                                    .unwrap_or_else(|e| e.into_inner());
                                             }
-                                            generation = latest.generation;
-                                            let packets =
-                                                [latest.config.clone(), latest.telemetry.clone()];
+                                            let packets = latest.next_packets(
+                                                &mut sent_config,
+                                                &mut sent_telemetry,
+                                            );
                                             drop(latest);
                                             if packets
                                                 .iter()
@@ -416,14 +463,10 @@ mod ipc_server {
             let Ok(packet) = argus_ipc::encode(msg) else {
                 return;
             };
-            let mut latest = self.latest.0.lock().unwrap();
-            match msg {
-                IpcMessage::Config(_) => latest.config = Some(packet),
-                IpcMessage::Telemetry(_) => latest.telemetry = Some(packet),
-                _ => return,
+            let mut latest = self.latest.0.lock().unwrap_or_else(|e| e.into_inner());
+            if latest.record(msg, packet) {
+                self.latest.1.notify_all();
             }
-            latest.generation = latest.generation.wrapping_add(1);
-            self.latest.1.notify_all();
         }
     }
 }
@@ -2216,5 +2259,39 @@ mod persistence_tests {
             .contains("test failure"));
         persist_config_with(&state, |_| Ok(()));
         assert!(state.lock().unwrap().config_save_error.is_none());
+    }
+
+    #[test]
+    fn ipc_broadcaster_only_sends_changed_packet_stream() {
+        use argus_ipc::IpcMessage;
+        let mut latest = super::ipc_server::Latest::default();
+        let cfg_msg = IpcMessage::Config(Default::default());
+        let tel_msg = IpcMessage::Telemetry(Default::default());
+
+        assert!(latest.record(&cfg_msg, vec![1, 2, 3]));
+        assert!(latest.record(&tel_msg, vec![4, 5, 6]));
+
+        let mut sent_cfg = 0u64;
+        let mut sent_tel = 0u64;
+
+        // First wake-up sends both initial packets.
+        assert_eq!(
+            latest.next_packets(&mut sent_cfg, &mut sent_tel),
+            [Some(vec![1, 2, 3]), Some(vec![4, 5, 6])]
+        );
+
+        // A 1 Hz telemetry update sends only the telemetry packet, not Config again.
+        assert!(latest.record(&tel_msg, vec![7, 8, 9]));
+        assert_eq!(
+            latest.next_packets(&mut sent_cfg, &mut sent_tel),
+            [None, Some(vec![7, 8, 9])]
+        );
+
+        // A UI slider drag sends only Config, not Telemetry again.
+        assert!(latest.record(&cfg_msg, vec![10, 11]));
+        assert_eq!(
+            latest.next_packets(&mut sent_cfg, &mut sent_tel),
+            [Some(vec![10, 11]), None]
+        );
     }
 }

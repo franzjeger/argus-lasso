@@ -16,7 +16,7 @@ use crate::gui::overview_tab::OverviewTab;
 use crate::gui::probalance_tab::ProBalanceTab;
 use crate::gui::process_tab::ProcessTab;
 use crate::gui::rules_tab::RulesTab;
-use crate::gui::settings_tab::SettingsTab;
+use crate::gui::settings_tab::{SettingsPageConfig, SettingsTab};
 use crate::monitor::{AppState, DaemonCmd};
 use crate::rules::RuleEngine;
 use crate::utils;
@@ -116,17 +116,10 @@ fn read_cpu_temp() -> Option<f32> {
 }
 
 /// Put the fields the Settings page owns from `updated` into the shared
-/// configuration. Only these: the page's copy of anything else may be stale,
-/// and storing it would undo a newer change made on another page. A setting
-/// added to the page has to be added here as well, or it is shown as changed
-/// and never stored: Close to tray was, at first.
-pub(crate) fn take_settings_page_fields(c: &mut Config, updated: Config) {
-    c.cpu.default_affinity = updated.cpu.default_affinity;
-    c.monitor = updated.monitor;
-    c.hw_alerts = updated.hw_alerts;
-    c.ui.notifications_enabled = updated.ui.notifications_enabled;
-    c.ui.check_updates_on_start = updated.ui.check_updates_on_start;
-    c.ui.close_to_tray = updated.ui.close_to_tray;
+/// configuration. [`SettingsPageConfig`] holds only those fields, so unrelated
+/// config sections can never become stale or be overwritten from this page.
+pub(crate) fn take_settings_page_fields(c: &mut Config, updated: SettingsPageConfig) {
+    updated.apply_to(c);
 }
 
 /// Whether closing the window keeps Argus running in the tray: only when it
@@ -1435,9 +1428,9 @@ impl ArgusLassoApp {
     }
 
     /// Put a setting changed on the Settings page into effect and save it.
-    fn store_settings(&mut self, updated: Config) {
+    fn store_settings(&mut self, updated: SettingsPageConfig) {
         let affinity_changed = self.state.lock().map_or(true, |s| {
-            s.config.cpu.default_affinity != updated.cpu.default_affinity
+            s.config.cpu.default_affinity != updated.default_affinity
         });
         self.update_config(|c| take_settings_page_fields(c, updated));
         // Only a new default affinity has anything to reapply. Reapplying

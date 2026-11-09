@@ -120,7 +120,30 @@ pub fn for_each_thread(pid: u32, mut f: impl FnMut(u32)) {
     }
 }
 
-// ── sched_setaffinity ────────────────────────────────────────────────────────
+// ── PID validation & sched_setaffinity ───────────────────────────────────────
+
+/// Validate a target PID before converting it to [`nix::unistd::Pid`].
+///
+/// Rejects `0` (which `kill(2)` treats as the caller's process group and
+/// `sched_setaffinity(2)` treats as the calling thread) and values above
+/// `i32::MAX` (which wrap to negative PIDs — `u32::MAX as i32 == -1` would
+/// signal every process owned by the user). When `allow_self` is false,
+/// also rejects PID 1 and the current process.
+pub fn validate_pid(pid: u32, allow_self: bool) -> std::io::Result<nix::unistd::Pid> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid PID {pid}: must be in 1..={}", i32::MAX),
+        ));
+    }
+    if !allow_self && (pid == 1 || pid == std::process::id()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing to signal protected PID {pid}"),
+        ));
+    }
+    Ok(nix::unistd::Pid::from_raw(pid as i32))
+}
 
 /// Apply CPU affinity to a process AND all its threads via sched_setaffinity(2).
 /// Succeeds if at least one thread was set; otherwise the first error.
@@ -130,6 +153,7 @@ pub fn set_affinity(pid: u32, cpulist: &str) -> std::io::Result<()> {
 
 /// Ok(true) if a thread was changed, Ok(false) if none needed changing.
 fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> std::io::Result<bool> {
+    validate_pid(pid, true)?;
     let invalid = |msg: String| {
         log::warn!("set_affinity pid {pid}: {msg}");
         std::io::Error::new(std::io::ErrorKind::InvalidInput, msg)
@@ -142,7 +166,6 @@ fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> std::io::Resul
 
     // Build nix CpuSet
     use nix::sched::{sched_getaffinity, sched_setaffinity, CpuSet};
-    use nix::unistd::Pid;
 
     let mut cpu_set = CpuSet::new();
     for cpu in &cpuset {
@@ -157,14 +180,15 @@ fn apply_affinity(pid: u32, cpulist: &str, only_changed: bool) -> std::io::Resul
     let mut first_err = None;
     // Affinity belongs to each thread, not to the process as a whole.
     for_each_thread(pid, |tid| {
+        let Ok(target_tid) = validate_pid(tid, true) else {
+            return;
+        };
         if let Some(reported) = &reported {
-            if sched_getaffinity(Pid::from_raw(tid as i32))
-                .is_ok_and(|current| current == *reported)
-            {
+            if sched_getaffinity(target_tid).is_ok_and(|current| current == *reported) {
                 return;
             }
         }
-        match sched_setaffinity(Pid::from_raw(tid as i32), &cpu_set) {
+        match sched_setaffinity(target_tid, &cpu_set) {
             Ok(_) => any_ok = true,
             Err(e) => {
                 log::debug!("sched_setaffinity tid={tid}: {e}");
@@ -197,12 +221,13 @@ fn reported_mask(cpus: &HashSet<u32>) -> CpuSet {
 /// Whether the main thread's affinity is `cpulist`, as far as the kernel shows.
 pub fn affinity_matches(pid: u32, cpulist: &str) -> bool {
     use nix::sched::sched_getaffinity;
-    use nix::unistd::Pid;
+    let Ok(target_pid) = validate_pid(pid, true) else {
+        return false;
+    };
     let Ok(cpus) = cpulist_to_set(cpulist) else {
         return false;
     };
-    sched_getaffinity(Pid::from_raw(pid as i32))
-        .is_ok_and(|current| current == reported_mask(&cpus))
+    sched_getaffinity(target_pid).is_ok_and(|current| current == reported_mask(&cpus))
 }
 
 /// The main thread's affinity, to put back later. A process allowed every
@@ -231,8 +256,10 @@ pub fn set_affinity_if_changed(pid: u32, cpulist: &str) -> bool {
 /// Read current affinity of the main thread as a cpulist string.
 pub fn get_affinity_str(pid: u32) -> String {
     use nix::sched::sched_getaffinity;
-    use nix::unistd::Pid;
-    match sched_getaffinity(Pid::from_raw(pid as i32)) {
+    let Ok(target_pid) = validate_pid(pid, true) else {
+        return String::new();
+    };
+    match sched_getaffinity(target_pid) {
         Ok(cpu_set) => {
             let mut cpus = HashSet::new();
             for i in 0..CpuSet::count() {
@@ -1233,5 +1260,38 @@ mod tests {
         assert_eq!(v["processes"][0]["name"], "bash");
         assert_eq!(v["processes"][0]["affinity"], "0-3");
         assert_eq!(v["processes"][0]["ionice"], "best-effort:4");
+    }
+
+    #[test]
+    fn validate_pid_rejects_zero_overflow_and_protected_targets() {
+        assert_eq!(
+            validate_pid(0, true).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            validate_pid(i32::MAX as u32 + 1, true).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            validate_pid(u32::MAX, false).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            validate_pid(1, false).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            validate_pid(std::process::id(), false).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(validate_pid(std::process::id(), true).is_ok());
+        assert_eq!(
+            set_affinity(0, "0").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            set_affinity(u32::MAX, "0").unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
     }
 }

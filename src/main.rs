@@ -327,15 +327,8 @@ fn main() {
                 return;
             }
             Cmd::Kill { pid, force } => {
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-                let sig = if force {
-                    Signal::SIGKILL
-                } else {
-                    Signal::SIGTERM
-                };
-                match signal::kill(Pid::from_raw(pid as i32), sig) {
-                    Ok(_) => println!("{}illed PID {pid}", if force { "Force k" } else { "K" }),
+                match kill_cli_pid(pid, force) {
+                    Ok(()) => println!("{}illed PID {pid}", if force { "Force k" } else { "K" }),
                     Err(e) => {
                         eprintln!("Kill failed: {e}");
                         std::process::exit(1);
@@ -819,9 +812,34 @@ fn spawn_stop_signal_handler(
     }
 }
 
+fn kill_cli_pid(pid: u32, force: bool) -> std::io::Result<()> {
+    use nix::sys::signal::{self, Signal};
+    let target = utils::validate_pid(pid, false)?;
+    let sig = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+    signal::kill(target, sig).map_err(std::io::Error::from)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::lock_instance_in;
+    use super::{kill_cli_pid, lock_instance_in};
+
+    #[test]
+    fn cli_kill_refuses_zero_overflow_init_and_self() {
+        for bad_pid in [0, i32::MAX as u32 + 1, u32::MAX, 1, std::process::id()] {
+            assert!(
+                kill_cli_pid(bad_pid, false).is_err(),
+                "expected refusal for PID {bad_pid}"
+            );
+            assert!(
+                kill_cli_pid(bad_pid, true).is_err(),
+                "expected refusal for force-kill PID {bad_pid}"
+            );
+        }
+    }
 
     /// The desktop's tray can start after Argus, or go away with a panel
     /// restart. The icon used to give up for the session; now it waits, and
