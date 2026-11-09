@@ -1332,26 +1332,23 @@ fn parse_launch_command(command: &str) -> Result<Vec<String>, String> {
 mod launcher_tests {
     use super::{is_game_process, parse_launch_command, LaunchedGame};
 
-    /// Runs `sleep` under `name`, which becomes its process name; killed and
-    /// reaped when dropped.
+    /// Runs a shell process renamed to `name` via `/proc/self/comm`; killed and
+    /// reaped when dropped. Symlinking `/usr/bin/sleep` fails on Ubuntu 26.04+
+    /// where uutils coreutils rejects symlinked names outside its tool list.
     struct Named(std::process::Child);
 
     impl Named {
-        fn spawn(dir: &std::path::Path, name: &str) -> Self {
-            use std::os::unix::process::CommandExt;
-            let link = dir.join(name);
-            let _ = std::fs::remove_file(&link);
-            std::os::unix::fs::symlink("/usr/bin/sleep", &link).unwrap();
-            // argv[0] stays "sleep" for a sleep that picks its tool by name.
-            let child = std::process::Command::new(&link)
-                .arg0("sleep")
-                .arg("30")
+        fn spawn(name: &str) -> Self {
+            let child = std::process::Command::new("sh")
+                .args([
+                    "-c",
+                    "printf '%s' \"$1\" > /proc/self/comm; read -r _",
+                    "sh",
+                    name,
+                ])
+                .stdin(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            // spawn() returns once the child's memory is replaced, which the
-            // kernel does before it renames the process: until then /proc
-            // still shows the parent's name. It failed on a busy aarch64 CI
-            // runner that way.
             let comm = format!("/proc/{}/comm", child.id());
             let renamed = (0..400).any(|_| {
                 std::fs::read_to_string(&comm).is_ok_and(|c| c.trim() == name) || {
@@ -1381,15 +1378,13 @@ mod launcher_tests {
     /// depended on the unspecified order of /proc.
     #[test]
     fn the_earliest_started_game_process_is_taken() {
-        let dir = std::env::temp_dir().join(format!("argus-latch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
         let name = format!("aglatch{}", std::process::id() % 10_000_000);
-        let first = Named::spawn(&dir, &name);
+        let first = Named::spawn(&name);
         // Start times are counted in 10 ms clock ticks.
-        while Named::spawn(&dir, "aglatchprobe").start() <= first.start() {
+        while Named::spawn("aglatchprobe").start() <= first.start() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let second = Named::spawn(&dir, &name);
+        let second = Named::spawn(&name);
         assert!(second.start() > first.start());
 
         assert_eq!(LaunchedGame::find(&name, 0).unwrap().pid, first.0.id());
@@ -1400,7 +1395,6 @@ mod launcher_tests {
             "one started before the launch is not the game"
         );
         drop((first, second));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// An exited process nobody has reaped keeps its /proc entry, and was

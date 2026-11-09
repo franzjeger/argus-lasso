@@ -632,9 +632,40 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Wayland compositors map a surface as soon as eframe swaps its first
+    // frame and ignore ViewportBuilder::with_visible(false). Starting in
+    // TrayWait when --minimized has a tray icon avoids creating the surface
+    // until the user asks for the window (#130).
+    if start_closed_to_tray(
+        args.minimized,
+        _tray_handle.is_some(),
+        args.ui_tour.is_some(),
+    ) {
+        if let Ok(mut s) = state.lock() {
+            s.window_closed = true;
+        }
+    }
     let mut visible = !args.minimized;
     let updates_carry = app::UpdatesCarry::default();
     loop {
+        if state.lock().is_ok_and(|s| s.window_closed) {
+            log::info!("Waiting in tray until window is requested");
+            let mut tray_wait = TrayWait {
+                state: &state,
+                reopen: false,
+            };
+            if let Err(error) = event_loop.run_app_on_demand(&mut tray_wait) {
+                log::error!("Display connection failed while in tray: {error}");
+                monitor::shutdown_and_wait(&state, &cmd_tx);
+                monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2));
+                std::process::exit(1);
+            }
+            if !tray_wait.reopen {
+                break;
+            }
+            log::info!("Reopening window from tray");
+            visible = true;
+        }
         let state_gui = Arc::clone(&state);
         let re_gui = Arc::clone(&rule_engine);
         let cfg_gui = state
@@ -684,22 +715,6 @@ fn main() {
         {
             break;
         }
-        log::info!("Window closed; processing display events while waiting in tray");
-        let mut tray_wait = TrayWait {
-            state: &state,
-            reopen: false,
-        };
-        if let Err(error) = event_loop.run_app_on_demand(&mut tray_wait) {
-            log::error!("Display connection failed while in tray: {error}");
-            monitor::shutdown_and_wait(&state, &cmd_tx);
-            monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2));
-            std::process::exit(1);
-        }
-        if !tray_wait.reopen {
-            break;
-        }
-        log::info!("Reopening window from tray");
-        visible = true;
     }
 
     // The window closed for good. Its on_exit asked the daemon to restore
@@ -712,6 +727,12 @@ fn main() {
     if !monitor::join_daemon(daemon_handle, std::time::Duration::from_secs(2)) {
         log::warn!("daemon thread did not finish within 2s of exit; it may be stuck mid-restore");
     }
+}
+
+/// Start in TrayWait without creating an eframe surface when `--minimized` is
+/// passed and the tray service is running (#130).
+fn start_closed_to_tray(minimized: bool, tray_started: bool, is_ui_tour: bool) -> bool {
+    minimized && tray_started && !is_ui_tour
 }
 
 /// None keeps dispatching display events; Some decides whether to reopen.
@@ -872,8 +893,12 @@ mod tests {
     /// ends the window loop.
     #[test]
     fn a_window_closed_to_the_tray_reopens_only_when_asked() {
-        use super::{monitor::AppState, window_request};
+        use super::{monitor::AppState, start_closed_to_tray, window_request};
         use std::sync::{Arc, Mutex};
+        assert!(start_closed_to_tray(true, true, false));
+        assert!(!start_closed_to_tray(false, true, false));
+        assert!(!start_closed_to_tray(true, false, false));
+        assert!(!start_closed_to_tray(true, true, true));
         let state = |closed, wanted, quit| {
             Arc::new(Mutex::new(AppState {
                 window_closed: closed,

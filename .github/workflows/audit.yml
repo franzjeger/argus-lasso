@@ -38,4 +38,9 @@ jobs:
           # mean no title text on GNOME (wayland-csd-adwaita-notitle) or
           # freetype/fontconfig (crossfont). Remove once winit 0.31 or ab_glyph
           # moves to a maintained parser such as skrifa (#33).
-          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195,RUSTSEC-2026-0192
+          # RUSTSEC-2026-0370/0371/0372: zvariant, zbus_names, and
+          # zvariant_derive were folded into zbus 6.0 and marked unmaintained as
+          # standalone crates; no vulnerability is known. All paths come from
+          # zbus 5 via eframe/accesskit_unix, ashpd, ksni, and notify-rust.
+          # Remove once those upstream crates migrate to zbus 6.
+          ignore: RUSTSEC-2026-0194,RUSTSEC-2026-0195,RUSTSEC-2026-0192,RUSTSEC-2026-0370,RUSTSEC-2026-0371,RUSTSEC-2026-0372

@@ -11,7 +11,7 @@ use std::fs;
 use std::process::Command;
 use std::sync::Mutex;
 
-use crate::utils::{cpuset_to_cpulist, get_offline_cpus, read_cpulist_file};
+use crate::utils::{cpulist_to_set, cpuset_to_cpulist, get_offline_cpus, read_cpulist_file};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -439,63 +439,151 @@ fn present_cpus() -> HashSet<u32> {
     })
 }
 
-/// Detect AMD X3D: preferred CCD has larger L3 (3D V-Cache).
+fn parse_cache_size_kb(raw: &str) -> Option<u64> {
+    if let Some(s) = raw.strip_suffix('K') {
+        s.parse().ok()
+    } else if let Some(s) = raw.strip_suffix('M') {
+        s.parse::<u64>().ok().map(|mb| mb * 1024)
+    } else {
+        raw.parse().ok()
+    }
+}
+
+/// Detect AMD X3D / multi-CCD L3 topology:
+/// 1. Asymmetric L3 cache sizes (e.g. 9950X3D / 7950X3D: 96 MB vs 32 MB L3).
+/// 2. Multiple L3 cache domains with equal L3 size per CCD (e.g. 9950X3D2 with
+///    dual 96 MB V-Cache CCDs, or 9950X / 7950X with dual 32 MB CCDs), where
+///    `/sys/devices/system/cpu/cpu{N}/cache/index3/shared_cpu_list` partitions
+///    present CPUs into separate CCDs (#129).
 fn detect_amd_x3d() -> Option<CpuTopology> {
     let present = present_cpus();
 
-    // Read L3 cache sizes for all present CPUs
     let mut l3: HashMap<u32, u64> = HashMap::new();
-    for cpu in &present {
+    let mut domains: Vec<HashSet<u32>> = Vec::new();
+    let mut cppc: HashMap<u32, u64> = HashMap::new();
+
+    for &cpu in &present {
         let path = format!("/sys/devices/system/cpu/cpu{cpu}/cache/index3/size");
         if let Ok(raw) = fs::read_to_string(&path) {
-            let raw = raw.trim();
             // One unparsable size file must skip that CPU, not abort the whole
             // detection (a `?` here degraded real X3D machines to Uniform).
-            let kb: Option<u64> = if let Some(s) = raw.strip_suffix('K') {
-                s.parse().ok()
-            } else if let Some(s) = raw.strip_suffix('M') {
-                s.parse::<u64>().ok().map(|mb| mb * 1024)
-            } else {
-                raw.parse().ok()
-            };
-            let Some(kb) = kb else { continue };
-            l3.insert(*cpu, kb);
+            if let Some(kb) = parse_cache_size_kb(raw.trim()) {
+                l3.insert(cpu, kb);
+            }
         }
-        // offline CPUs have no sysfs entry — silently skip
+        let shared_path = format!("/sys/devices/system/cpu/cpu{cpu}/cache/index3/shared_cpu_list");
+        if let Ok(raw) = fs::read_to_string(&shared_path) {
+            if let Ok(set) = cpulist_to_set(raw.trim()) {
+                if !set.is_empty() && !domains.iter().any(|d| d == &set) {
+                    domains.push(set);
+                }
+            }
+        }
+        let cppc_path = format!("/sys/devices/system/cpu/cpu{cpu}/acpi_cppc/highest_perf");
+        if let Ok(raw) = fs::read_to_string(&cppc_path) {
+            if let Ok(v) = raw.trim().parse::<u64>() {
+                cppc.insert(cpu, v);
+            }
+        }
     }
 
+    classify_l3_topology(&l3, &domains, &cppc)
+}
+
+fn classify_l3_topology(
+    l3: &HashMap<u32, u64>,
+    domains: &[HashSet<u32>],
+    cppc: &HashMap<u32, u64>,
+) -> Option<CpuTopology> {
     let sizes: HashSet<u64> = l3.values().copied().collect();
-    if sizes.len() <= 1 {
-        return None;
+    if sizes.len() > 1 {
+        let max_kb = *sizes.iter().max()?;
+        let min_kb = *sizes.iter().min()?;
+        let preferred: HashSet<u32> = l3
+            .iter()
+            .filter(|(_, &s)| s == max_kb)
+            .map(|(&c, _)| c)
+            .collect();
+        let non_preferred: HashSet<u32> = l3
+            .iter()
+            .filter(|(_, &s)| s == min_kb)
+            .map(|(&c, _)| c)
+            .collect();
+
+        return Some(CpuTopology {
+            kind: TopologyKind::AmdX3D,
+            preferred: preferred.clone(),
+            non_preferred: non_preferred.clone(),
+            description: format!(
+                "AMD X3D detected. Preferred (V-Cache, {}MB L3): CPUs {}. Non-preferred ({}MB L3): CPUs {}.",
+                max_kb / 1024,
+                cpuset_to_cpulist(&preferred),
+                min_kb / 1024,
+                cpuset_to_cpulist(&non_preferred),
+            ),
+            preferred_label: format!("V-Cache CCD ({} MB L3)", max_kb / 1024),
+            non_preferred_label: format!("Standard CCD ({} MB L3)", min_kb / 1024),
+        });
     }
 
-    let max_kb = *sizes.iter().max().unwrap();
-    let min_kb = *sizes.iter().min().unwrap();
-    let preferred: HashSet<u32> = l3
-        .iter()
-        .filter(|(_, &s)| s == max_kb)
-        .map(|(&c, _)| c)
-        .collect();
-    let non_preferred: HashSet<u32> = l3
-        .iter()
-        .filter(|(_, &s)| s == min_kb)
-        .map(|(&c, _)| c)
-        .collect();
+    // Equal L3 size across multiple separate L3 cache domains (e.g. Ryzen 9
+    // 9950X3D2 with dual 96 MB V-Cache CCDs, or dual-CCD 9950X / 7950X).
+    if sizes.len() == 1 && domains.len() >= 2 {
+        let kb = *sizes.iter().next()?;
+        let mb = kb / 1024;
+        let mut sorted: Vec<HashSet<u32>> = domains.to_vec();
+        sorted.sort_by_key(|d| d.iter().copied().min().unwrap_or(u32::MAX));
 
-    Some(CpuTopology {
-        kind: TopologyKind::AmdX3D,
-        preferred: preferred.clone(),
-        non_preferred: non_preferred.clone(),
-        description: format!(
-            "AMD X3D detected. Preferred (V-Cache, {}MB L3): CPUs {}. Non-preferred ({}MB L3): CPUs {}.",
-            max_kb / 1024,
-            cpuset_to_cpulist(&preferred),
-            min_kb / 1024,
-            cpuset_to_cpulist(&non_preferred),
-        ),
-        preferred_label: format!("V-Cache CCD ({} MB L3)", max_kb / 1024),
-        non_preferred_label: format!("Standard CCD ({} MB L3)", min_kb / 1024),
-    })
+        // Prefer the CCD with the highest CPPC performance rating when the
+        // firmware ranks one die higher; otherwise default to CCD 0.
+        let pref_idx = sorted
+            .iter()
+            .enumerate()
+            .max_by_key(|(idx, d)| {
+                let peak = d
+                    .iter()
+                    .filter_map(|cpu| cppc.get(cpu).copied())
+                    .max()
+                    .unwrap_or(0);
+                // Tie-break toward lower CCD index (Reverse(idx)).
+                (peak, std::cmp::Reverse(*idx))
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+
+        let preferred = sorted[pref_idx].clone();
+        let non_preferred: HashSet<u32> = sorted
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| idx != pref_idx)
+            .flat_map(|(_, d)| d.iter().copied())
+            .collect();
+
+        if preferred.is_empty() || non_preferred.is_empty() {
+            return None;
+        }
+
+        let other_label = if sorted.len() == 2 {
+            format!("CCD {} ({mb} MB L3)", 1 - pref_idx)
+        } else {
+            format!("Other CCDs ({mb} MB L3)")
+        };
+
+        return Some(CpuTopology {
+            kind: TopologyKind::AmdX3D,
+            preferred: preferred.clone(),
+            non_preferred: non_preferred.clone(),
+            description: format!(
+                "Multi-CCD L3 topology detected ({mb}MB L3 per CCD). CCD {pref_idx}: CPUs {}. {other_label}: CPUs {}.",
+                cpuset_to_cpulist(&preferred),
+                cpuset_to_cpulist(&non_preferred),
+            ),
+            preferred_label: format!("CCD {pref_idx} ({mb} MB L3)"),
+            non_preferred_label: other_label,
+        });
+    }
+
+    None
 }
 
 /// Detect Intel Hybrid: P-cores vs E-cores.
@@ -1487,5 +1575,35 @@ mod tests {
             x3d_probes, 2,
             "once asymmetric topology is cached, later ticks (even parked) never re-probe"
         );
+    }
+
+    #[test]
+    fn dual_vcache_and_multi_ccd_topologies_partition_by_l3_domain() {
+        let ccd0: HashSet<u32> = (0..8).chain(16..24).collect();
+        let ccd1: HashSet<u32> = (8..16).chain(24..32).collect();
+        let l3_96mb: HashMap<u32, u64> = (0..32).map(|cpu| (cpu, 98_304)).collect();
+
+        // Single L3 domain (e.g. 9800X3D): no CCD split.
+        let single_domain = vec![(0..16).collect::<HashSet<u32>>()];
+        assert!(classify_l3_topology(&l3_96mb, &single_domain, &HashMap::new()).is_none());
+
+        // Dual V-Cache CCDs (9950X3D2) with equal CPPC: defaults to CCD 0 preferred, CCD 1 secondary.
+        let domains = vec![ccd1.clone(), ccd0.clone()];
+        let topo = classify_l3_topology(&l3_96mb, &domains, &HashMap::new()).unwrap();
+        assert_eq!(topo.kind, TopologyKind::AmdX3D);
+        assert_eq!(topo.preferred, ccd0);
+        assert_eq!(topo.non_preferred, ccd1);
+        assert_eq!(topo.preferred_label, "CCD 0 (96 MB L3)");
+        assert_eq!(topo.non_preferred_label, "CCD 1 (96 MB L3)");
+
+        // When firmware ranks CCD 1 higher via CPPC highest_perf, CCD 1 becomes preferred.
+        let mut cppc = HashMap::new();
+        cppc.insert(0, 196);
+        cppc.insert(8, 236);
+        let ranked = classify_l3_topology(&l3_96mb, &domains, &cppc).unwrap();
+        assert_eq!(ranked.preferred, ccd1);
+        assert_eq!(ranked.non_preferred, ccd0);
+        assert_eq!(ranked.preferred_label, "CCD 1 (96 MB L3)");
+        assert_eq!(ranked.non_preferred_label, "CCD 0 (96 MB L3)");
     }
 }

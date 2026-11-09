@@ -117,10 +117,11 @@ impl AffinityPicker {
                 let has_smt = !self.smt_siblings.is_empty();
                 ui.add_enabled_ui(has_smt, |ui| {
                     if ui.button("No SMT").clicked() {
-                        for (i, cb) in self.checkboxes.iter_mut().enumerate() {
-                            *cb = !self.smt_siblings.contains(&(i as u32))
-                                && !self.offline.contains(&(i as u32));
-                        }
+                        strip_smt_selection(
+                            &mut self.checkboxes,
+                            &self.smt_siblings,
+                            &self.offline,
+                        );
                     }
                 });
             });
@@ -137,10 +138,11 @@ impl AffinityPicker {
                 let has_smt = !self.smt_siblings.is_empty();
                 ui.add_enabled_ui(has_smt, |ui| {
                     if ui.button("No SMT").clicked() {
-                        for (i, cb) in self.checkboxes.iter_mut().enumerate() {
-                            *cb = !self.smt_siblings.contains(&(i as u32))
-                                && !self.offline.contains(&(i as u32));
-                        }
+                        strip_smt_selection(
+                            &mut self.checkboxes,
+                            &self.smt_siblings,
+                            &self.offline,
+                        );
                     }
                 });
                 if ui.button("None").clicked() {
@@ -490,6 +492,12 @@ impl AffinityDialog {
                                     }
                                 }
                             }
+                            let has_smt = !smt_siblings.is_empty();
+                            ui.add_enabled_ui(has_smt, |ui| {
+                                if ui.button("No SMT").clicked() {
+                                    strip_smt_selection(checkboxes, smt_siblings, offline);
+                                }
+                            });
                         });
 
                         ui.separator();
@@ -1734,9 +1742,35 @@ impl LutrisGamePickerDialog {
     }
 }
 
+/// Unchecks SMT siblings in the current selection when at least one physical
+/// core is checked (so clicking a CCD button followed by "No SMT" keeps only
+/// that CCD's physical cores), or selects all online physical cores when no
+/// physical core is currently checked.
+fn strip_smt_selection(
+    checkboxes: &mut [bool],
+    smt_siblings: &HashSet<u32>,
+    offline: &HashSet<u32>,
+) {
+    let has_checked_phys = checkboxes
+        .iter()
+        .enumerate()
+        .any(|(i, &cb)| cb && !smt_siblings.contains(&(i as u32)));
+    for (i, cb) in checkboxes.iter_mut().enumerate() {
+        let cpu = i as u32;
+        if has_checked_phys {
+            if smt_siblings.contains(&cpu) {
+                *cb = false;
+            }
+        } else {
+            *cb = !smt_siblings.contains(&cpu) && !offline.contains(&cpu);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{editor_title, AffinityDialog};
+    use super::{editor_title, strip_smt_selection, AffinityDialog};
+    use std::collections::HashSet;
 
     /// A rule from a template has a name but is not saved yet; its editor
     /// was titled "Edit Rule".
@@ -1756,5 +1790,21 @@ mod tests {
         let other = AffinityDialog::new("", "firefox", 4243u32);
         assert_ne!(default.viewport, process.viewport);
         assert_ne!(process.viewport, other.viewport);
+    }
+
+    #[test]
+    fn no_smt_preserves_selected_ccd_or_selects_online_physical_cores() {
+        let smt: HashSet<u32> = [2, 3].into_iter().collect();
+        let offline: HashSet<u32> = [1].into_iter().collect();
+
+        // CCD 1 selected (core 1 + HT sibling 3): No SMT leaves only physical core 1.
+        let mut ccd1 = vec![false, true, false, true];
+        strip_smt_selection(&mut ccd1, &smt, &offline);
+        assert_eq!(ccd1, vec![false, true, false, false]);
+
+        // Empty selection: No SMT selects all online physical cores (0, skipping offline 1).
+        let mut empty = vec![false, false, false, false];
+        strip_smt_selection(&mut empty, &smt, &offline);
+        assert_eq!(empty, vec![true, false, false, false]);
     }
 }
