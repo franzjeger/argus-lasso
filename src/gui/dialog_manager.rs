@@ -247,7 +247,7 @@ impl DialogManager {
                     Vec::new()
                 };
                 if let Ok(mut s) = state.lock() {
-                    s.config.rules = rules_cfg;
+                    s.config_mut().rules = rules_cfg;
                     s.append_log(format!(
                         "[Rule] Created rule for '{}' from manual change",
                         offer.proc_name

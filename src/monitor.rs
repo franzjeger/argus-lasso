@@ -137,13 +137,15 @@ pub struct AppState {
     /// Rolling totals across all NICs: (rx MiB/s, tx MiB/s), 120 samples
     pub net_io_history: std::collections::VecDeque<(f32, f32)>,
     /// Throttled PID set from ProBalance
-    pub throttled_pids: HashSet<u32>,
+    pub throttled_pids: Arc<HashSet<u32>>,
     /// Detailed throttle info for ProBalance tab live view
     pub throttle_infos: Vec<crate::probalance::ThrottleInfo>,
     /// Log lines ring buffer (max 2000)
     pub log_lines: std::collections::VecDeque<String>,
     /// Current config (read by GUI for settings display)
-    pub config: Config,
+    /// Shared, not copied: the GUI takes a reference every frame. Writers
+    /// go through `Arc::make_mut`.
+    pub config: Arc<Config>,
     pub config_save_error: Option<String>,
     pub operation_error: Option<String>,
     pub quit_requested: bool,
@@ -158,7 +160,7 @@ pub struct AppState {
     /// System-wide average CPU % (used by tray tooltip)
     pub cpu_avg: f32,
     /// Per-PID CPU usage history (last 30 samples)
-    pub proc_cpu_history: HashMap<u32, std::collections::VecDeque<f32>>,
+    pub proc_cpu_history: Arc<HashMap<u32, std::collections::VecDeque<f32>>>,
     /// CPU model string from /proc/cpuinfo
     pub cpu_model: String,
     /// Set by the daemon once a Shutdown command has finished restoring state
@@ -172,7 +174,7 @@ pub struct AppState {
     pub window_wanted: bool,
     /// Notable events (throttles, alerts, gaming mode, kills) for the
     /// status-bar notification center — small ring buffer, newest last.
-    pub notable_events: std::collections::VecDeque<String>,
+    pub notable_events: Arc<std::collections::VecDeque<String>>,
 }
 
 /// Single writer: callers send SaveConfig instead of serializing stale copies.
@@ -226,6 +228,12 @@ pub fn read_cpu_model() -> String {
 pub const KILL_TAG: &str = "[Kill]";
 
 impl AppState {
+    /// The configuration, for writing. Copies it first only while a GUI
+    /// frame still holds the previous one.
+    pub fn config_mut(&mut self) -> &mut Config {
+        Arc::make_mut(&mut self.config)
+    }
+
     pub fn append_log(&mut self, msg: String) {
         let ts = chrono_ts();
         let line = format!("[{ts}] {msg}");
@@ -243,9 +251,10 @@ impl AppState {
             "[Power]",
         ];
         if NOTABLE.iter().any(|m| msg.contains(m)) {
-            self.notable_events.push_back(line.clone());
-            while self.notable_events.len() > 50 {
-                self.notable_events.pop_front();
+            let events = Arc::make_mut(&mut self.notable_events);
+            events.push_back(line.clone());
+            while events.len() > 50 {
+                events.pop_front();
             }
         }
         self.log_lines.push_back(line);
@@ -924,7 +933,7 @@ impl Daemon {
         // user's just-edited rule definitions on the next config save.
         let shown = overlay.show_overlay;
         if let Ok(mut s) = self.state.lock() {
-            s.config.gaming_mode.overlay.show_overlay = shown;
+            s.config_mut().gaming_mode.overlay.show_overlay = shown;
         }
         persist_config(&self.state);
         (self.log)(format!("Overlay visibility toggled to {shown}"));
@@ -950,7 +959,7 @@ impl Daemon {
                     return std::ops::ControlFlow::Continue(());
                 };
                 self.probalance.update_config(cfg.probalance.clone());
-                let before = std::mem::replace(&mut self.config, cfg);
+                let before = std::mem::replace(&mut self.config, Config::clone(&cfg));
                 self.ipc.broadcast(&argus_ipc::IpcMessage::Config(
                     self.config.gaming_mode.overlay.clone(),
                 ));
@@ -1403,7 +1412,7 @@ impl Daemon {
             s.snapshot = std::sync::Arc::new(self.raw_snapshot.clone());
             s.cpu_percents = self.cpu_percents.clone();
             s.cpu_generation = s.cpu_generation.wrapping_add(1);
-            s.throttled_pids = throttled;
+            s.throttled_pids = Arc::new(throttled);
             s.throttle_infos = throttle_infos;
             s.cpu_avg = self.avg;
             push_capped(&mut s.cpu_history, self.avg, 120);
@@ -1414,15 +1423,15 @@ impl Daemon {
             s.hw_monitor = self.hw_collector.data.clone();
             // Update per-PID CPU history
             let current_pids: HashSet<u32> = self.raw_snapshot.iter().map(|p| p.pid).collect();
+            // Copies only if a frame is still holding the previous map.
+            let history = Arc::make_mut(&mut s.proc_cpu_history);
             for p in &self.raw_snapshot {
-                let hist = s
-                    .proc_cpu_history
+                let hist = history
                     .entry(p.pid)
                     .or_insert_with(|| std::collections::VecDeque::with_capacity(30));
                 push_capped(hist, p.cpu_percent, 30);
             }
-            s.proc_cpu_history
-                .retain(|pid, _| current_pids.contains(pid));
+            history.retain(|pid, _| current_pids.contains(pid));
         }
         self.last_snapshot = now;
     }
@@ -2350,8 +2359,8 @@ mod persistence_tests {
         let state = Arc::new(Mutex::new(AppState::default()));
         {
             let mut s = state.lock().unwrap();
-            s.config.ui.theme = "AdwaitaLight".into();
-            s.config.gaming_mode.overlay.show_overlay = false;
+            s.config_mut().ui.theme = "AdwaitaLight".into();
+            s.config_mut().gaming_mode.overlay.show_overlay = false;
         }
         persist_config_with(&state, |cfg| {
             assert_eq!(cfg.ui.theme, "AdwaitaLight");

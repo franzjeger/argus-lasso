@@ -506,7 +506,7 @@ fn main() {
     let state = Arc::new(Mutex::new(monitor::AppState::default()));
     {
         if let Ok(mut s) = state.lock() {
-            s.config = cfg.clone();
+            s.config = std::sync::Arc::new(cfg.clone());
             s.cpu_model = monitor::read_cpu_model();
             if let Some(notice) = load_notice {
                 s.append_log(notice.clone());
@@ -670,7 +670,7 @@ fn main() {
         let re_gui = Arc::clone(&rule_engine);
         let cfg_gui = state
             .lock()
-            .map(|s| s.config.clone())
+            .map(|s| config::Config::clone(&s.config))
             .unwrap_or_else(|_| cfg.clone());
         let cmd_tx_gui = cmd_tx.clone();
         let tour_dir = args.ui_tour.clone();

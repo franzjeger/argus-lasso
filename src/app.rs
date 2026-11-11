@@ -274,7 +274,7 @@ impl ArgusLassoApp {
 
         // Sync state config
         if let Ok(mut s) = state.lock() {
-            s.config = config.clone();
+            s.config = Arc::new(config.clone());
         }
 
         let last_saved_opacity = saved_opacity;
@@ -342,7 +342,7 @@ impl ArgusLassoApp {
     /// what keeps concurrent edits of other fields from being overwritten.
     fn update_config(&self, change: impl FnOnce(&mut Config)) {
         if let Ok(mut s) = self.state.lock() {
-            change(&mut s.config);
+            change(s.config_mut());
         }
         self.send(DaemonCmd::ConfigChanged);
     }
@@ -629,19 +629,19 @@ struct FrameData {
     snapshot: Arc<Vec<crate::monitor::ProcInfo>>,
     cpu_pcts: Vec<f32>,
     cpu_gen: u64,
-    throttled_pids: std::collections::HashSet<u32>,
+    throttled_pids: Arc<std::collections::HashSet<u32>>,
     suspended_pids: std::collections::HashSet<u32>,
     throttle_infos: Vec<crate::probalance::ThrottleInfo>,
     log_lines: std::collections::VecDeque<String>,
-    config: Config,
+    config: Arc<Config>,
     gaming_active: bool,
     gaming_changes: u64,
     hw_monitor: crate::hw_monitor::HwMonitorData,
-    proc_cpu_history: std::collections::HashMap<u32, std::collections::VecDeque<f32>>,
+    proc_cpu_history: Arc<std::collections::HashMap<u32, std::collections::VecDeque<f32>>>,
     cpu_history: std::collections::VecDeque<f32>,
     disk_io_history: std::collections::VecDeque<(f32, f32)>,
     net_io_history: std::collections::VecDeque<(f32, f32)>,
-    notable_events: std::collections::VecDeque<String>,
+    notable_events: Arc<std::collections::VecDeque<String>>,
     cpu_avg: f32,
 }
 
@@ -1312,7 +1312,7 @@ impl ArgusLassoApp {
                 if self.hw_monitor_tab.cols_dirty {
                     let widths = self.hw_monitor_tab.col_widths.to_vec();
                     if let Ok(mut s) = self.state.lock() {
-                        s.config.ui.hw_mon_col_widths = widths;
+                        s.config_mut().ui.hw_mon_col_widths = widths;
                     }
                     self.pending_config_save.dirty = true;
                 }
@@ -1370,7 +1370,7 @@ impl ArgusLassoApp {
         // (the pending save is flushed independently of the active tab).
         if self.process_tab.cols_dirty {
             if let Ok(mut s) = self.state.lock() {
-                s.config.ui.col_widths = self.process_tab.col_widths.clone();
+                s.config_mut().ui.col_widths = self.process_tab.col_widths.clone();
             }
             self.pending_config_save.dirty = true;
         }
@@ -1380,7 +1380,7 @@ impl ArgusLassoApp {
             let mut hidden: Vec<String> = self.process_tab.hidden_cols.iter().cloned().collect();
             hidden.sort();
             if let Ok(mut s) = self.state.lock() {
-                s.config.ui.hidden_columns = hidden;
+                s.config_mut().ui.hidden_columns = hidden;
             }
             self.save_config();
         }
@@ -1604,7 +1604,7 @@ mod close_to_tray_tests {
     #[test]
     fn the_window_closes_to_the_tray_only_when_it_can_come_back() {
         let mut state = AppState::default();
-        state.config.ui.close_to_tray = true;
+        state.config_mut().ui.close_to_tray = true;
         state.tray_available = true;
         assert!(closes_to_tray(&state));
 
@@ -1616,7 +1616,7 @@ mod close_to_tray_tests {
         assert!(!closes_to_tray(&state), "no tray icon to come back through");
         state.tray_available = true;
 
-        state.config.ui.close_to_tray = false;
+        state.config_mut().ui.close_to_tray = false;
         assert!(!closes_to_tray(&state), "off by default");
     }
 
