@@ -9,11 +9,7 @@ use std::process::Command;
 // ── Backend detection ─────────────────────────────────────────────────────────
 
 fn which(program: &str) -> bool {
-    Command::new("which")
-        .arg(program)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::utils::find_in_path(program).is_some()
 }
 
 enum Backend {

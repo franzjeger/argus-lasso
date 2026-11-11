@@ -140,6 +140,8 @@ pub struct ArgusLassoApp {
     process_tab: ProcessTab,
     rules_tab: RulesTab,
     probalance_tab: ProBalanceTab,
+    /// `AppState::rules_epoch` as of the last frame.
+    seen_rules_epoch: u64,
     /// In-app update check / self-install.
     updates: crate::updater::UpdateState,
     gaming_mode_tab: GamingModeTab,
@@ -274,7 +276,7 @@ impl ArgusLassoApp {
 
         // Sync state config
         if let Ok(mut s) = state.lock() {
-            s.config = config.clone();
+            s.config = Arc::new(config.clone());
         }
 
         let last_saved_opacity = saved_opacity;
@@ -290,6 +292,7 @@ impl ArgusLassoApp {
             process_tab: ProcessTab::new(&config.ui.col_widths, &config.ui.hidden_columns),
             rules_tab: RulesTab::new(),
             probalance_tab,
+            seen_rules_epoch: 0,
             updates,
             gaming_mode_tab,
             hw_monitor_tab: HwMonitorTab::new_with_widths(&config.ui.hw_mon_col_widths),
@@ -342,7 +345,7 @@ impl ArgusLassoApp {
     /// what keeps concurrent edits of other fields from being overwritten.
     fn update_config(&self, change: impl FnOnce(&mut Config)) {
         if let Ok(mut s) = self.state.lock() {
-            change(&mut s.config);
+            change(s.config_mut());
         }
         self.send(DaemonCmd::ConfigChanged);
     }
@@ -524,6 +527,13 @@ impl eframe::App for ArgusLassoApp {
             return;
         };
         frame.suspended_pids = self.pending_stops.stopped_pids(&frame.snapshot);
+        // Changes made from the command line while these pages hold their
+        // own drafts.
+        if std::mem::replace(&mut self.seen_rules_epoch, frame.rules_epoch) != frame.rules_epoch {
+            self.rules_tab.rules_replaced_externally();
+        }
+        self.probalance_tab
+            .follow_enabled(frame.config.probalance.enabled);
         let FrameData {
             ref snapshot,
             ref cpu_pcts,
@@ -629,20 +639,22 @@ struct FrameData {
     snapshot: Arc<Vec<crate::monitor::ProcInfo>>,
     cpu_pcts: Vec<f32>,
     cpu_gen: u64,
-    throttled_pids: std::collections::HashSet<u32>,
+    throttled_pids: Arc<std::collections::HashSet<u32>>,
     suspended_pids: std::collections::HashSet<u32>,
     throttle_infos: Vec<crate::probalance::ThrottleInfo>,
+    throttle_history: Vec<crate::probalance::ThrottleTally>,
     log_lines: std::collections::VecDeque<String>,
-    config: Config,
+    config: Arc<Config>,
     gaming_active: bool,
     gaming_changes: u64,
     hw_monitor: crate::hw_monitor::HwMonitorData,
-    proc_cpu_history: std::collections::HashMap<u32, std::collections::VecDeque<f32>>,
+    proc_cpu_history: Arc<std::collections::HashMap<u32, std::collections::VecDeque<f32>>>,
     cpu_history: std::collections::VecDeque<f32>,
     disk_io_history: std::collections::VecDeque<(f32, f32)>,
     net_io_history: std::collections::VecDeque<(f32, f32)>,
-    notable_events: std::collections::VecDeque<String>,
+    notable_events: Arc<std::collections::VecDeque<String>>,
     cpu_avg: f32,
+    rules_epoch: u64,
 }
 
 impl Tab {
@@ -763,6 +775,11 @@ impl ArgusLassoApp {
             } else {
                 Default::default()
             },
+            throttle_history: if on_pb_tab {
+                s.throttle_history.clone()
+            } else {
+                Default::default()
+            },
             log_lines: if on_log_tab {
                 s.log_lines.clone()
             } else {
@@ -798,6 +815,7 @@ impl ArgusLassoApp {
             },
             notable_events: s.notable_events.clone(),
             cpu_avg: s.cpu_avg,
+            rules_epoch: s.rules_epoch,
         })
     }
 
@@ -1266,6 +1284,7 @@ impl ArgusLassoApp {
         let FrameData {
             ref snapshot,
             ref throttle_infos,
+            ref throttle_history,
             ref hw_monitor,
             ref cpu_history,
             ref disk_io_history,
@@ -1278,13 +1297,15 @@ impl ArgusLassoApp {
             Tab::Overview => {
                 self.overview_tab.show(
                     ui,
-                    cpu_history,
-                    cpu_avg,
-                    snapshot,
-                    disk_io_history,
-                    net_io_history,
-                    self.cpu_temp,
-                    self.throttled_count,
+                    &crate::gui::overview_tab::OverviewData {
+                        cpu_history,
+                        cpu_avg,
+                        snapshot,
+                        disk_io_history,
+                        net_io_history,
+                        cpu_temp: self.cpu_temp,
+                        throttled_count: self.throttled_count,
+                    },
                 );
             }
 
@@ -1293,10 +1314,13 @@ impl ArgusLassoApp {
             Tab::Rules => self.show_rules_tab(ui, ctx, frame),
 
             Tab::ProBalance => {
-                if let Some(pb_cfg) =
-                    self.probalance_tab
-                        .show(ui, snapshot, throttle_infos, cpu_avg)
-                {
+                if let Some(pb_cfg) = self.probalance_tab.show(
+                    ui,
+                    snapshot,
+                    throttle_infos,
+                    throttle_history,
+                    cpu_avg,
+                ) {
                     self.update_config(|c| c.probalance = pb_cfg);
                     self.save_config();
                 }
@@ -1312,7 +1336,7 @@ impl ArgusLassoApp {
                 if self.hw_monitor_tab.cols_dirty {
                     let widths = self.hw_monitor_tab.col_widths.to_vec();
                     if let Ok(mut s) = self.state.lock() {
-                        s.config.ui.hw_mon_col_widths = widths;
+                        s.config_mut().ui.hw_mon_col_widths = widths;
                     }
                     self.pending_config_save.dirty = true;
                 }
@@ -1350,19 +1374,17 @@ impl ArgusLassoApp {
             gaming_active,
             proc_cpu_history,
         );
-        let mut trigger_rule = None;
-        crate::gui::action_handler::ActionHandler::handle(
-            action,
+        let rule = crate::gui::action_handler::ActionContext {
             snapshot,
-            &self.state,
-            &mut self.pending_kill,
-            &mut self.pending_stops,
-            &mut self.dialog_manager,
-            &mut self.detail_window,
-            &notify_error,
-            &mut trigger_rule,
-        );
-        if let Some(rule) = trigger_rule {
+            state: &self.state,
+            pending_kill: &mut self.pending_kill,
+            pending_stops: &mut self.pending_stops,
+            dialog_manager: &mut self.dialog_manager,
+            detail_window: &mut self.detail_window,
+            notify_error: &notify_error,
+        }
+        .handle(action);
+        if let Some(rule) = rule {
             self.rules_tab.open_add_dialog(Some(rule));
             self.active_tab = Tab::Rules;
         }
@@ -1370,7 +1392,7 @@ impl ArgusLassoApp {
         // (the pending save is flushed independently of the active tab).
         if self.process_tab.cols_dirty {
             if let Ok(mut s) = self.state.lock() {
-                s.config.ui.col_widths = self.process_tab.col_widths.clone();
+                s.config_mut().ui.col_widths = self.process_tab.col_widths.clone();
             }
             self.pending_config_save.dirty = true;
         }
@@ -1380,7 +1402,7 @@ impl ArgusLassoApp {
             let mut hidden: Vec<String> = self.process_tab.hidden_cols.iter().cloned().collect();
             hidden.sort();
             if let Ok(mut s) = self.state.lock() {
-                s.config.ui.hidden_columns = hidden;
+                s.config_mut().ui.hidden_columns = hidden;
             }
             self.save_config();
         }
@@ -1392,21 +1414,18 @@ impl ArgusLassoApp {
             ref config,
             ..
         } = *frame;
-        let mut rules_changed = false;
-        let mut profiles_changed = false;
         let mut rule_profiles = config.rule_profiles.clone();
-        // Process names for the rule dialog's live match count.
-        self.rules_tab.show(
+        let changed = self.rules_tab.show(
             ui,
             ctx,
-            &self.rule_engine,
-            &mut rules_changed,
-            self.opacity,
-            snapshot,
-            &mut rule_profiles,
-            &mut profiles_changed,
+            crate::gui::rules_tab::RulesPage {
+                rule_engine: &self.rule_engine,
+                snapshot,
+                rule_profiles: &mut rule_profiles,
+                opacity: self.opacity,
+            },
         );
-        if rules_changed {
+        if changed.rules {
             // Never nest the engine lock inside the state lock —
             // the daemon nests them the other way around.
             let rules_cfg = self
@@ -1421,7 +1440,7 @@ impl ArgusLassoApp {
             self.send(DaemonCmd::ReapplyDefaults);
             self.save_config();
         }
-        if profiles_changed {
+        if changed.profiles {
             self.update_config(|c| c.rule_profiles = rule_profiles);
             self.save_config();
         }
@@ -1604,7 +1623,7 @@ mod close_to_tray_tests {
     #[test]
     fn the_window_closes_to_the_tray_only_when_it_can_come_back() {
         let mut state = AppState::default();
-        state.config.ui.close_to_tray = true;
+        state.config_mut().ui.close_to_tray = true;
         state.tray_available = true;
         assert!(closes_to_tray(&state));
 
@@ -1616,7 +1635,7 @@ mod close_to_tray_tests {
         assert!(!closes_to_tray(&state), "no tray icon to come back through");
         state.tray_available = true;
 
-        state.config.ui.close_to_tray = false;
+        state.config_mut().ui.close_to_tray = false;
         assert!(!closes_to_tray(&state), "off by default");
     }
 

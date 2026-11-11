@@ -23,6 +23,16 @@ impl ProBalanceTab {
         }
     }
 
+    /// The switch was flipped somewhere else (`argus-lasso probalance on|off`):
+    /// show it, and keep the rest of an unapplied draft as it is. Without
+    /// this the next Apply would silently flip it back.
+    pub fn follow_enabled(&mut self, enabled: bool) {
+        if self.saved.enabled != enabled {
+            self.saved.enabled = enabled;
+            self.cfg.enabled = enabled;
+        }
+    }
+
     /// Plain-language summary of the thresholds, for the status card.
     fn summary(&self) -> String {
         format!(
@@ -40,6 +50,7 @@ impl ProBalanceTab {
         ui: &mut Ui,
         snapshot: &[crate::monitor::ProcInfo],
         throttle_infos: &[crate::probalance::ThrottleInfo],
+        history: &[crate::probalance::ThrottleTally],
         system_cpu: f32,
     ) -> Option<ProBalanceConfig> {
         use crate::gui::theme::{self as th, tokens};
@@ -317,6 +328,7 @@ impl ProBalanceTab {
                 }
             });
 
+            history_card(ui, history);
         });
 
         // ── Apply bar ─────────────────────────────────────────────────────
@@ -345,6 +357,55 @@ impl ProBalanceTab {
         }
         switched.then(|| self.saved.clone())
     }
+}
+
+/// How many programs the history card lists.
+const HISTORY_ROWS: usize = 8;
+
+/// What has been throttled since the app started. Absent until something
+/// has: an empty table says nothing the status card does not.
+fn history_card(ui: &mut Ui, history: &[crate::probalance::ThrottleTally]) {
+    use crate::gui::theme::{self as th, tokens};
+    if history.iter().all(|tally| tally.throttles == 0) {
+        return;
+    }
+    ui.add_space(tokens::SPACE_M);
+    th::card_hinted(
+        ui,
+        "Throttled since Argus started",
+        "Most often first. Time is summed over every process of that name.",
+        |ui| {
+            egui::Grid::new("pb_history_rows")
+                .num_columns(3)
+                .min_row_height(tokens::ROW_H_DENSE)
+                .spacing([tokens::SPACE_M, 2.0])
+                .show(ui, |ui| {
+                    for h in ["NAME", "TIMES", "TIME THROTTLED"] {
+                        ui.label(th::header_text(ui, h, false));
+                    }
+                    ui.end_row();
+                    for tally in history.iter().take(HISTORY_ROWS) {
+                        ui.label(&tally.name);
+                        ui.label(
+                            RichText::new(tally.throttles.to_string())
+                                .font(th::num_font(tokens::FONT_BODY)),
+                        );
+                        ui.label(
+                            RichText::new(crate::probalance::human_duration(tally.seconds))
+                                .font(th::num_font(tokens::FONT_BODY)),
+                        );
+                        ui.end_row();
+                    }
+                });
+            if let Some(more) = history.len().checked_sub(HISTORY_ROWS).filter(|n| *n > 0) {
+                ui.label(
+                    RichText::new(format!("…and {more} more"))
+                        .size(tokens::FONT_HELP)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
+        },
+    );
 }
 
 /// Left-aligned form label in a fixed-width grid cell.
@@ -448,7 +509,7 @@ mod tests {
             };
             ctx.test_frame(input, |root| {
                 egui::CentralPanel::default().show(root, |ui| {
-                    if let Some(cfg) = tab.show(ui, &[], &[], 0.0) {
+                    if let Some(cfg) = tab.show(ui, &[], &[], &[], 0.0) {
                         reported = Some(cfg);
                     }
                 });

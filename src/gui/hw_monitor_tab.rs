@@ -548,3 +548,45 @@ fn draw_sparkline(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn values_are_formatted_to_the_precision_their_unit_reads_at() {
+        assert_eq!(fmt_val(61.25, "°C"), "61.2 °C");
+        assert_eq!(fmt_val(1249.6, "RPM"), "1250 RPM");
+        assert_eq!(fmt_val(1.2346, "V"), "1.235 V");
+        assert_eq!(fmt_val(4801.4, "MHz"), "4801 MHz");
+        assert_eq!(fmt_val(12.5, "%"), "12.5%");
+        assert_eq!(fmt_val(0.126, ""), "0.13");
+        assert_eq!(fmt_val(2.5, "A"), "2.50 A");
+        // A sensor that read nonsense shows as absent, not as "NaN °C".
+        assert_eq!(fmt_val(f32::NAN, "°C"), "—");
+        assert_eq!(fmt_val(f32::INFINITY, "W"), "—");
+    }
+
+    #[test]
+    fn temperatures_map_onto_the_load_ramp_and_stay_inside_it() {
+        assert_eq!(temp_pct(40.0), 0.0);
+        assert_eq!(temp_pct(70.0), 50.0);
+        assert_eq!(temp_pct(100.0), 100.0);
+        assert_eq!(temp_pct(-20.0), 0.0);
+        assert_eq!(temp_pct(140.0), 100.0);
+    }
+
+    #[test]
+    fn a_clock_is_idle_near_the_bottom_of_the_range_it_has_shown() {
+        let clock = |value, min, max| {
+            let mut sensor = crate::hw_monitor::Sensor::default();
+            (sensor.value, sensor.min, sensor.max) = (value, min, max);
+            sensor
+        };
+        assert!(is_idle_clock(&clock(800.0, 800.0, 5000.0)));
+        assert!(is_idle_clock(&clock(1800.0, 800.0, 5000.0)));
+        assert!(!is_idle_clock(&clock(1900.0, 800.0, 5000.0)));
+        // No range seen yet: nothing to be at the bottom of.
+        assert!(!is_idle_clock(&clock(3000.0, 3000.0, 3000.0)));
+    }
+}

@@ -253,3 +253,43 @@ impl LogTab {
         (clear, save)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_timestamp_is_split_off_only_when_it_is_one() {
+        assert_eq!(
+            split_time("[12:34:56] [Rule: x] applied"),
+            ("12:34:56", "[Rule: x] applied")
+        );
+        // A tag in the same place is not a time, and stays in the message.
+        assert_eq!(split_time("[Manual]  done"), ("", "[Manual]  done"));
+        assert_eq!(split_time("[12-34-56] x"), ("", "[12-34-56] x"));
+        assert_eq!(split_time("[12:34:5x] x"), ("", "[12:34:5x] x"));
+        assert_eq!(split_time("[unterminated"), ("", "[unterminated"));
+        assert_eq!(split_time(""), ("", ""));
+    }
+
+    #[test]
+    fn lines_are_categorised_by_tag_and_a_failure_outranks_its_tag() {
+        let category = |line| categorize(line).map(Category::label);
+        assert_eq!(category("[Gaming Mode] ACTIVE"), Some("Gaming"));
+        assert_eq!(category("[Park] CPU 8 offline"), Some("Gaming"));
+        assert_eq!(category("[Rule: browsers] nice 5"), Some("Rules"));
+        assert_eq!(category("[Default] affinity 0-7"), Some("Rules"));
+        assert_eq!(category("[Manual] nice of firefox set"), Some("Manual"));
+        assert_eq!(category("[HW Alert] CPU 95 °C"), Some("HW"));
+        assert_eq!(category("[Rule: browsers] nice FAILED"), Some("Errors"));
+        assert_eq!(category("[Gaming Mode] Parking failed"), Some("Errors"));
+        assert_eq!(category("Config updated"), None);
+    }
+
+    #[test]
+    fn every_category_has_its_own_chip() {
+        let labels: std::collections::HashSet<_> =
+            Category::ALL.iter().map(|c| c.label()).collect();
+        assert_eq!(labels.len(), Category::ALL.len());
+    }
+}

@@ -137,13 +137,17 @@ pub struct AppState {
     /// Rolling totals across all NICs: (rx MiB/s, tx MiB/s), 120 samples
     pub net_io_history: std::collections::VecDeque<(f32, f32)>,
     /// Throttled PID set from ProBalance
-    pub throttled_pids: HashSet<u32>,
+    pub throttled_pids: Arc<HashSet<u32>>,
     /// Detailed throttle info for ProBalance tab live view
     pub throttle_infos: Vec<crate::probalance::ThrottleInfo>,
+    /// What ProBalance has throttled since the app started, most often first.
+    pub throttle_history: Vec<crate::probalance::ThrottleTally>,
     /// Log lines ring buffer (max 2000)
     pub log_lines: std::collections::VecDeque<String>,
     /// Current config (read by GUI for settings display)
-    pub config: Config,
+    /// Shared, not copied: the GUI takes a reference every frame. Writers
+    /// go through `Arc::make_mut`.
+    pub config: Arc<Config>,
     pub config_save_error: Option<String>,
     pub operation_error: Option<String>,
     pub quit_requested: bool,
@@ -158,7 +162,7 @@ pub struct AppState {
     /// System-wide average CPU % (used by tray tooltip)
     pub cpu_avg: f32,
     /// Per-PID CPU usage history (last 30 samples)
-    pub proc_cpu_history: HashMap<u32, std::collections::VecDeque<f32>>,
+    pub proc_cpu_history: Arc<HashMap<u32, std::collections::VecDeque<f32>>>,
     /// CPU model string from /proc/cpuinfo
     pub cpu_model: String,
     /// Set by the daemon once a Shutdown command has finished restoring state
@@ -172,7 +176,11 @@ pub struct AppState {
     pub window_wanted: bool,
     /// Notable events (throttles, alerts, gaming mode, kills) for the
     /// status-bar notification center — small ring buffer, newest last.
-    pub notable_events: std::collections::VecDeque<String>,
+    pub notable_events: Arc<std::collections::VecDeque<String>>,
+    /// Incremented when the monitor thread replaces the whole rule list (a
+    /// profile loaded from the command line), so the Rules page can drop an
+    /// editor that is open on a rule that no longer exists.
+    pub rules_epoch: u64,
 }
 
 /// Single writer: callers send SaveConfig instead of serializing stale copies.
@@ -226,6 +234,12 @@ pub fn read_cpu_model() -> String {
 pub const KILL_TAG: &str = "[Kill]";
 
 impl AppState {
+    /// The configuration, for writing. Copies it first only while a GUI
+    /// frame still holds the previous one.
+    pub fn config_mut(&mut self) -> &mut Config {
+        Arc::make_mut(&mut self.config)
+    }
+
     pub fn append_log(&mut self, msg: String) {
         let ts = chrono_ts();
         let line = format!("[{ts}] {msg}");
@@ -243,9 +257,10 @@ impl AppState {
             "[Power]",
         ];
         if NOTABLE.iter().any(|m| msg.contains(m)) {
-            self.notable_events.push_back(line.clone());
-            while self.notable_events.len() > 50 {
-                self.notable_events.pop_front();
+            let events = Arc::make_mut(&mut self.notable_events);
+            events.push_back(line.clone());
+            while events.len() > 50 {
+                events.pop_front();
             }
         }
         self.log_lines.push_back(line);
@@ -349,10 +364,15 @@ mod ipc_server {
     }
     pub struct Broadcaster {
         latest: Arc<(Mutex<Latest>, Condvar)>,
+        /// Overlay clients connected right now, across every socket. A
+        /// client that went away is only noticed on the next failed write,
+        /// so this can lag by one telemetry frame.
+        clients: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl Broadcaster {
         pub fn start() -> Self {
             let latest = Arc::new((Mutex::new(Latest::default()), Condvar::new()));
+            let clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             for path in argus_ipc::socket_paths() {
                 let shared = latest.clone();
                 if let Some(parent) = path.parent() {
@@ -389,8 +409,8 @@ mod ipc_server {
                             argus_ipc::PROTOCOL_VERSION,
                             path.display()
                         );
+                        let count = clients.clone();
                         std::thread::spawn(move || {
-                            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                             for mut stream in listener.incoming().flatten() {
                                 // Relaxed is sufficient: atomic counter only bounds concurrent
                                 // overlay client threads and carries no dependent memory state.
@@ -457,7 +477,12 @@ mod ipc_server {
                     Err(e) => log::error!("Overlay socket {}: {e}", path.display()),
                 }
             }
-            Self { latest }
+            Self { latest, clients }
+        }
+        /// Whether any game is showing the overlay, i.e. whether telemetry
+        /// has a reader.
+        pub fn has_clients(&self) -> bool {
+            self.clients.load(std::sync::atomic::Ordering::Relaxed) > 0
         }
         pub fn broadcast(&self, msg: &IpcMessage) {
             let Ok(packet) = argus_ipc::encode(msg) else {
@@ -710,6 +735,8 @@ struct Daemon {
     last_snapshot: Instant,
     last_sensors: Instant,
     last_io_sample: Instant,
+    /// When the ProBalance history was last summarised in the log.
+    last_history_note: Instant,
     toggle_dir: std::path::PathBuf,
 }
 
@@ -774,6 +801,7 @@ impl Daemon {
             last_snapshot: now,
             last_sensors: now - Duration::from_secs(1),
             last_io_sample: now,
+            last_history_note: now,
             toggle_dir: crate::config::config_dir(),
         }
     }
@@ -794,7 +822,13 @@ impl Daemon {
                 Duration::from_millis(self.config.monitor.display_refresh_interval_ms);
             let enforce_due =
                 self.enforcing() && now.duration_since(self.last_enforce) >= enforce_interval;
-            let display_due = now.duration_since(self.last_snapshot) >= display_interval;
+            // With the window closed to the tray nobody reads the published
+            // snapshot, so the display pass (per-process affinity, I/O
+            // priority and disk rates, plus the copy handed to the GUI) is
+            // skipped until a window is back. `last_snapshot` then lies in
+            // the past, so the first pass after reopening publishes at once.
+            let watched = self.window_open();
+            let display_due = watched && now.duration_since(self.last_snapshot) >= display_interval;
             let probalance_due = now.duration_since(self.last_pb) >= Duration::from_secs(1);
 
             if enforce_due || display_due || probalance_due {
@@ -805,20 +839,70 @@ impl Daemon {
             }
             if probalance_due {
                 self.tick_probalance(now);
+                // Once a day of uptime, what the throttling has amounted to.
+                if now.duration_since(self.last_history_note) >= Duration::from_secs(24 * 3600) {
+                    self.last_history_note = now;
+                    if let Some(summary) =
+                        crate::probalance::history_summary(&self.probalance.history())
+                    {
+                        (self.log)(summary);
+                    }
+                }
             }
             if now.duration_since(self.last_sensors) >= Duration::from_secs(1) {
-                self.update_sensors(now);
+                if self.sensors_wanted(watched) {
+                    self.update_sensors(now);
+                } else {
+                    self.last_sensors = now;
+                }
             }
             if display_due {
                 self.publish(now);
+            } else if !watched && probalance_due {
+                // The tray tooltip still shows the load.
+                if let Ok(mut s) = self.state.lock() {
+                    s.cpu_avg = self.avg;
+                }
             }
 
-            // Sleep no longer than the enforcement interval so a sub-500ms
-            // rule_enforce_interval_ms is honoured instead of silently ignored.
-            let tick =
-                enforce_interval.clamp(Duration::from_millis(50), Duration::from_millis(500));
-            std::thread::sleep(tick);
+            // Sleep until the next pass is due rather than on a fixed tick,
+            // but wake at once for a command. Capped at 500 ms so a window
+            // reopened from the tray, or a toggle file, is picked up
+            // promptly; floored at 50 ms as before.
+            let mut wait = Duration::from_secs(1).saturating_sub(self.last_pb.elapsed());
+            wait = wait.min(Duration::from_secs(1).saturating_sub(self.last_sensors.elapsed()));
+            if self.enforcing() {
+                wait = wait.min(enforce_interval.saturating_sub(self.last_enforce.elapsed()));
+            }
+            if watched {
+                wait = wait.min(display_interval.saturating_sub(self.last_snapshot.elapsed()));
+            }
+            let wait = wait.clamp(Duration::from_millis(50), Duration::from_millis(500));
+            match cmd_rx.recv_timeout(wait) {
+                Ok(cmd) => {
+                    if self.handle(cmd).is_break() {
+                        return;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                // Every sender is gone: nothing can ask for a shutdown any
+                // more, so keep the old pacing instead of spinning.
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => std::thread::sleep(wait),
+            }
         }
+    }
+
+    /// A window is showing the published data. False while closed to the
+    /// tray; a poisoned lock counts as watched, the safe side.
+    fn window_open(&self) -> bool {
+        self.state.lock().map_or(true, |s| !s.window_closed)
+    }
+
+    /// Sensor readings have three readers: the window, an overlay in a game,
+    /// and the temperature alerts. With none of them there is no reason to
+    /// walk hwmon and NVML every second.
+    fn sensors_wanted(&self, watched: bool) -> bool {
+        watched || self.ipc.has_clients() || self.config.hw_alerts.enabled
     }
 
     /// With no enabled rules, no default affinity and no change left to put
@@ -847,6 +931,77 @@ impl Daemon {
             self.show_window_pending = false;
         }
         self.poll_overlay_toggle();
+        for control in crate::overlay_toggle::drain_control(&self.toggle_dir) {
+            self.apply_control(control);
+        }
+    }
+
+    /// Carry out a request made with `argus-lasso gaming|probalance|profile`.
+    fn apply_control(&mut self, control: crate::overlay_toggle::Control) {
+        use crate::overlay_toggle::Control;
+        match control {
+            Control::Gaming(on) => {
+                if self.gaming.active == on {
+                    (self.log)(format!("[CLI] Gaming Mode is already {}.", on_off(on)));
+                    return;
+                }
+                (self.log)(format!("[CLI] Gaming Mode {} requested.", on_off(on)));
+                // What the tray's checkbox asks for.
+                let _ = self.handle(DaemonCmd::SetGamingMode {
+                    active: on,
+                    elevate_nice: true,
+                    parking: Parking::NonPreferred,
+                });
+                if on {
+                    self.reapply_rules();
+                }
+            }
+            Control::ProBalance(on) => {
+                if let Ok(mut s) = self.state.lock() {
+                    s.config_mut().probalance.enabled = on;
+                }
+                (self.log)(format!("[CLI] ProBalance {} requested.", on_off(on)));
+                // Logs the change and hands it to the throttler.
+                let _ = self.handle(DaemonCmd::ConfigChanged);
+                persist_config(&self.state);
+            }
+            Control::Profile(name) => self.load_rule_profile(&name),
+        }
+    }
+
+    fn load_rule_profile(&mut self, name: &str) {
+        let profile = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|s| s.config.rule_profiles.get(name).cloned());
+        let Some(profile) = profile else {
+            (self.log)(format!("[CLI] There is no rule profile named '{name}'."));
+            return;
+        };
+        // The engine lock is never taken inside the state lock here; the
+        // snapshot pass nests them the other way around.
+        let rules = match self.rule_engine.lock() {
+            Ok(mut engine) => {
+                engine.clear_rules();
+                for rule in &profile {
+                    engine.add_rule(crate::rules::Rule::from_config(rule));
+                }
+                engine.to_config_list()
+            }
+            Err(_) => return,
+        };
+        let count = rules.len();
+        if let Ok(mut s) = self.state.lock() {
+            s.config_mut().rules = rules;
+            s.rules_epoch += 1;
+        }
+        let _ = self.handle(DaemonCmd::ConfigChanged);
+        self.reapply_rules();
+        persist_config(&self.state);
+        (self.log)(format!(
+            "[CLI] Loaded rule profile '{name}' ({count} rules)."
+        ));
     }
 
     fn poll_overlay_toggle(&mut self) {
@@ -867,7 +1022,7 @@ impl Daemon {
         // user's just-edited rule definitions on the next config save.
         let shown = overlay.show_overlay;
         if let Ok(mut s) = self.state.lock() {
-            s.config.gaming_mode.overlay.show_overlay = shown;
+            s.config_mut().gaming_mode.overlay.show_overlay = shown;
         }
         persist_config(&self.state);
         (self.log)(format!("Overlay visibility toggled to {shown}"));
@@ -893,7 +1048,7 @@ impl Daemon {
                     return std::ops::ControlFlow::Continue(());
                 };
                 self.probalance.update_config(cfg.probalance.clone());
-                let before = std::mem::replace(&mut self.config, cfg);
+                let before = std::mem::replace(&mut self.config, Config::clone(&cfg));
                 self.ipc.broadcast(&argus_ipc::IpcMessage::Config(
                     self.config.gaming_mode.overlay.clone(),
                 ));
@@ -951,6 +1106,9 @@ impl Daemon {
 
     fn shutdown(&mut self) {
         (self.log)("[Shutdown] Restoring system state…".into());
+        if let Some(summary) = crate::probalance::history_summary(&self.probalance.history()) {
+            (self.log)(summary);
+        }
         // Parked CPUs first: they matter to the whole system, and the rest
         // (a pkexec per gaming nice, systemctl per throttled unit) can take
         // long enough for the exit to cut it off.
@@ -1346,8 +1504,9 @@ impl Daemon {
             s.snapshot = std::sync::Arc::new(self.raw_snapshot.clone());
             s.cpu_percents = self.cpu_percents.clone();
             s.cpu_generation = s.cpu_generation.wrapping_add(1);
-            s.throttled_pids = throttled;
+            s.throttled_pids = Arc::new(throttled);
             s.throttle_infos = throttle_infos;
+            s.throttle_history = self.probalance.history();
             s.cpu_avg = self.avg;
             push_capped(&mut s.cpu_history, self.avg, 120);
             // Aggregate disk/net totals for the Overview graphs
@@ -1357,15 +1516,15 @@ impl Daemon {
             s.hw_monitor = self.hw_collector.data.clone();
             // Update per-PID CPU history
             let current_pids: HashSet<u32> = self.raw_snapshot.iter().map(|p| p.pid).collect();
+            // Copies only if a frame is still holding the previous map.
+            let history = Arc::make_mut(&mut s.proc_cpu_history);
             for p in &self.raw_snapshot {
-                let hist = s
-                    .proc_cpu_history
+                let hist = history
                     .entry(p.pid)
                     .or_insert_with(|| std::collections::VecDeque::with_capacity(30));
                 push_capped(hist, p.cpu_percent, 30);
             }
-            s.proc_cpu_history
-                .retain(|pid, _| current_pids.contains(pid));
+            history.retain(|pid, _| current_pids.contains(pid));
         }
         self.last_snapshot = now;
     }
@@ -1557,11 +1716,48 @@ impl ProcMeta {
 #[derive(Default)]
 pub struct SnapshotCaches {
     meta: HashMap<u32, ProcMeta>,
-    /// pid → (affinity, ionice) — display-only, so refreshed on the display
-    /// cadence rather than the much shorter enforce cadence.
-    display: HashMap<u32, (std::sync::Arc<str>, std::sync::Arc<str>)>,
+    /// pid → affinity and I/O priority — display-only, so refreshed on the
+    /// display cadence rather than the much shorter enforce cadence.
+    display: HashMap<u32, DisplayFields>,
     /// pid → (read_bytes, write_bytes) at the last I/O sample.
     io: HashMap<u32, (u64, u64)>,
+}
+
+/// The display strings of one process with the raw values they were made
+/// from. Almost no process changes its affinity or I/O priority between two
+/// passes, so the strings are only rebuilt when the raw value differs.
+struct DisplayFields {
+    mask: Option<nix::sched::CpuSet>,
+    ionice_raw: Option<(i32, i32)>,
+    affinity: std::sync::Arc<str>,
+    ionice: std::sync::Arc<str>,
+}
+
+impl DisplayFields {
+    fn sample(pid: u32, previous: Option<&DisplayFields>) -> Self {
+        let mask = utils::get_affinity_mask(pid);
+        let ionice_raw = utils::get_ionice_raw(pid);
+        let affinity = match previous {
+            Some(p) if p.mask == mask => p.affinity.clone(),
+            _ => mask
+                .map(|m| utils::affinity_mask_to_cpulist(&m))
+                .unwrap_or_default()
+                .into(),
+        };
+        let ionice = match previous {
+            Some(p) if p.ionice_raw == ionice_raw => p.ionice.clone(),
+            _ => ionice_raw
+                .map(|(class, level)| format!("{class}/{level}"))
+                .unwrap_or_default()
+                .into(),
+        };
+        Self {
+            mask,
+            ionice_raw,
+            affinity,
+            ionice,
+        }
+    }
 }
 
 impl SnapshotCaches {
@@ -1643,16 +1839,17 @@ fn collect_snapshot(
         let nice = stat.nice;
 
         let (affinity, ionice, disk_read_bps, disk_write_bps) = if detail {
-            let affinity: std::sync::Arc<str> = utils::get_affinity_str(pid).into();
-            let ionice: std::sync::Arc<str> = read_ionice(pid).into();
+            // A reused pid starts from scratch: the old process's strings
+            // are not this one's.
+            let previous = caches.display.get(&pid).filter(|_| same_process);
+            let fields = DisplayFields::sample(pid, previous);
             let (r, w) = read_proc_io(pid, &mut caches.io, io_elapsed);
-            caches
-                .display
-                .insert(pid, (affinity.clone(), ionice.clone()));
-            (affinity, ionice, r, w)
+            let shown = (fields.affinity.clone(), fields.ionice.clone());
+            caches.display.insert(pid, fields);
+            (shown.0, shown.1, r, w)
         } else {
             match caches.display.get(&pid) {
-                Some((a, i)) => (a.clone(), i.clone(), 0, 0),
+                Some(f) => (f.affinity.clone(), f.ionice.clone(), 0, 0),
                 None => ("".into(), "".into(), 0, 0),
             }
         };
@@ -1818,10 +2015,11 @@ fn read_percpu_stats() -> Vec<(u32, [u64; 10])> {
     result
 }
 
-fn read_ionice(pid: u32) -> String {
-    match utils::get_ionice_raw(pid) {
-        Some((class, level)) => format!("{class}/{level}"),
-        None => String::new(),
+fn on_off(on: bool) -> &'static str {
+    if on {
+        "on"
+    } else {
+        "off"
     }
 }
 
@@ -1829,7 +2027,6 @@ fn read_ionice(pid: u32) -> String {
 /// slider sends an update on every frame it is dragged, and each one used
 /// to log a line.
 fn config_change_notes(before: &Config, after: &Config) -> Vec<String> {
-    let on_off = |on: bool| if on { "on" } else { "off" };
     let mut notes = Vec::new();
     if before.probalance.enabled != after.probalance.enabled {
         notes.push(format!(
@@ -2004,6 +2201,29 @@ fn check_hw_alerts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unchanged affinity and I/O priority hand back the same strings
+    /// instead of formatting new ones for every process on every pass.
+    #[test]
+    fn display_fields_are_reused_while_the_raw_values_stand() {
+        let pid = std::process::id();
+        let first = DisplayFields::sample(pid, None);
+        assert!(!first.affinity.is_empty());
+        let second = DisplayFields::sample(pid, Some(&first));
+        assert!(std::sync::Arc::ptr_eq(&first.affinity, &second.affinity));
+        assert!(std::sync::Arc::ptr_eq(&first.ionice, &second.ionice));
+
+        // A different raw value is formatted afresh.
+        let stale = DisplayFields {
+            mask: None,
+            ionice_raw: Some((9, 9)),
+            affinity: "".into(),
+            ionice: "9/9".into(),
+        };
+        let fresh = DisplayFields::sample(pid, Some(&stale));
+        assert_eq!(fresh.affinity, first.affinity);
+        assert_eq!(fresh.ionice, first.ionice);
+    }
 
     fn proc_with_cmdline(cmd: &str) -> ProcInfo {
         ProcInfo {
@@ -2239,8 +2459,8 @@ mod persistence_tests {
         let state = Arc::new(Mutex::new(AppState::default()));
         {
             let mut s = state.lock().unwrap();
-            s.config.ui.theme = "AdwaitaLight".into();
-            s.config.gaming_mode.overlay.show_overlay = false;
+            s.config_mut().ui.theme = "AdwaitaLight".into();
+            s.config_mut().gaming_mode.overlay.show_overlay = false;
         }
         persist_config_with(&state, |cfg| {
             assert_eq!(cfg.ui.theme, "AdwaitaLight");

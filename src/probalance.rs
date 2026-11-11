@@ -118,6 +118,64 @@ pub struct ThrottleInfo {
     pub unit: Option<String>,
 }
 
+/// What ProBalance has done to the processes of one name since the app
+/// started.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrottleTally {
+    pub name: String,
+    /// How many times a process of this name was throttled.
+    pub throttles: u32,
+    /// Process-seconds spent throttled.
+    pub seconds: f32,
+}
+
+/// Names the history keeps. A build or a fuzzer can spawn thousands of
+/// differently named processes; past this, new names go uncounted rather
+/// than the history growing with them.
+const HISTORY_NAMES: usize = 256;
+
+/// One log line saying what ProBalance has throttled, most often first; None
+/// when it has throttled nothing.
+pub fn history_summary(tallies: &[ThrottleTally]) -> Option<String> {
+    const SHOWN: usize = 5;
+    let total: u32 = tallies.iter().map(|t| t.throttles).sum();
+    if total == 0 {
+        return None;
+    }
+    let listed: Vec<String> = tallies
+        .iter()
+        .take(SHOWN)
+        .map(|t| {
+            format!(
+                "{} ×{} ({})",
+                t.name,
+                t.throttles,
+                human_duration(t.seconds)
+            )
+        })
+        .collect();
+    let more = match tallies.len().saturating_sub(SHOWN) {
+        0 => String::new(),
+        n => format!(", and {n} more"),
+    };
+    Some(format!(
+        "[ProBalance] Since start: {total} throttles across {} programs — {}{more}",
+        tallies.len(),
+        listed.join(", ")
+    ))
+}
+
+/// "40 s", "12 min", "3.5 h": as precise as a summary needs.
+pub fn human_duration(seconds: f32) -> String {
+    if seconds < 90.0 {
+        format!("{seconds:.0} s")
+    } else if seconds < 5400.0 {
+        format!("{:.0} min", seconds / 60.0)
+    } else {
+        format!("{:.1} h", seconds / 3600.0)
+    }
+}
+
 // ── A snapshot of one process (what ProBalance needs) ────────────────────────
 
 #[derive(Debug, Clone)]
@@ -245,6 +303,9 @@ pub struct ProBalance {
     /// Nice throttles an earlier run left in the journal, put back on the
     /// first tick.
     left_nices: Vec<NiceThrottle>,
+    /// Process name → (times throttled, process-seconds throttled), since
+    /// the app started.
+    history: HashMap<String, (u32, f32)>,
     log_callback: Option<Box<dyn Fn(String) + Send>>,
 }
 
@@ -267,8 +328,41 @@ impl ProBalance {
             journal: None,
             journal_written: None,
             left_nices: Vec::new(),
+            history: HashMap::new(),
             log_callback: None,
         }
+    }
+
+    /// The history entry for `name`, unless the history is full and the name
+    /// is new.
+    fn tally(&mut self, name: &str) -> Option<&mut (u32, f32)> {
+        if !self.history.contains_key(name) {
+            if self.history.len() >= HISTORY_NAMES {
+                return None;
+            }
+            self.history.insert(name.to_owned(), (0, 0.0));
+        }
+        self.history.get_mut(name)
+    }
+
+    /// What has been throttled since the app started: most often first.
+    pub fn history(&self) -> Vec<ThrottleTally> {
+        let mut tallies: Vec<ThrottleTally> = self
+            .history
+            .iter()
+            .map(|(name, &(throttles, seconds))| ThrottleTally {
+                name: name.clone(),
+                throttles,
+                seconds,
+            })
+            .collect();
+        tallies.sort_by(|a, b| {
+            b.throttles
+                .cmp(&a.throttles)
+                .then(b.seconds.total_cmp(&a.seconds))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        tallies
     }
 
     /// Record unit throttles in `path` as they are made, and take over the
@@ -795,6 +889,11 @@ impl ProBalance {
                 Decision::None => {}
                 Decision::Throttle { new_nice } => {
                     let applied = self.apply_throttle(proc, new_nice, &mut pending_logs);
+                    if applied.is_some() {
+                        if let Some(tally) = self.tally(&proc.name) {
+                            tally.0 += 1;
+                        }
+                    }
                     if let Some(entry) = self.states.get_mut(&proc.pid) {
                         finalize_throttle(entry, new_nice, applied.is_some());
                         entry.applied = applied;
@@ -814,6 +913,17 @@ impl ProBalance {
                         finalize_restore(entry, original_nice);
                         entry.applied = None;
                     }
+                }
+            }
+            // Counted after the decision, so the tick that restores a process
+            // is not counted as throttled and the one that throttles it is.
+            let throttled = self
+                .states
+                .get(&proc.pid)
+                .is_some_and(|e| e.state == ProcState::Throttled);
+            if throttled {
+                if let Some(tally) = self.tally(&proc.name) {
+                    tally.1 += tick_seconds;
                 }
             }
         }
@@ -1103,6 +1213,84 @@ mod tests {
         // PID disappears from snapshot → state entry should be cleaned up.
         pb.tick(&[], 1.0, Some(10.0), &Default::default());
         assert_eq!(pb.tracked_pid_count(), 0);
+    }
+
+    /// The history counts the seconds a process stays throttled, under its
+    /// name, and lists the most often throttled first.
+    #[test]
+    fn the_history_counts_throttled_time_per_name() {
+        let cfg = ProBalanceConfig {
+            enabled: true,
+            ..ProBalanceConfig::default()
+        };
+        let pressure = Some(cfg.system_cpu_threshold_percent + 1.0);
+        let busy = cfg.process_min_cpu_percent + 50.0;
+        let mut pb = ProBalance::new(cfg);
+        let proc = |pid, name: &str| ProcSnapshot {
+            pid,
+            name: name.into(),
+            cpu_percent: busy,
+            nice: 5,
+            start_ticks: 7,
+        };
+        for pid in [4242, 4243] {
+            let mut entry = ProcEntry::new(0);
+            entry.start_ticks = 7;
+            entry.state = ProcState::Throttled;
+            entry.throttle_nice = Some(5);
+            entry.applied = Some(Applied::Nice(None));
+            pb.states.insert(pid, entry);
+        }
+        pb.history.insert("encoder".into(), (3, 0.0));
+        pb.history.insert("indexer".into(), (1, 0.0));
+        let snapshot = [proc(4242, "encoder"), proc(4243, "indexer")];
+        for _ in 0..4 {
+            pb.tick_with_unit_lookup(&snapshot, 0.5, pressure, &Default::default(), |_| None);
+        }
+        // Still busy under pressure: neither was restored.
+        assert_eq!(pb.throttled_pids().len(), 2);
+        let tally = |name: &str, throttles, seconds| ThrottleTally {
+            name: name.into(),
+            throttles,
+            seconds,
+        };
+        assert_eq!(
+            pb.history(),
+            [tally("encoder", 3, 2.0), tally("indexer", 1, 2.0)]
+        );
+    }
+
+    #[test]
+    fn the_history_stops_taking_new_names_when_full() {
+        let mut pb = ProBalance::new(ProBalanceConfig::default());
+        for n in 0..HISTORY_NAMES {
+            pb.tally(&format!("job-{n}")).unwrap().0 += 1;
+        }
+        assert!(pb.tally("one-more").is_none());
+        // A name already there is still counted.
+        pb.tally("job-0").unwrap().0 += 1;
+        assert_eq!(pb.history().len(), HISTORY_NAMES);
+        assert_eq!(pb.history()[0].name, "job-0");
+    }
+
+    #[test]
+    fn the_history_summary_names_the_most_throttled_and_counts_the_rest() {
+        assert_eq!(history_summary(&[]), None);
+        let tallies: Vec<ThrottleTally> = (1..=7u32)
+            .rev()
+            .map(|n| ThrottleTally {
+                name: format!("job-{n}"),
+                throttles: n,
+                seconds: 60.0 * n as f32,
+            })
+            .collect();
+        assert_eq!(
+            history_summary(&tallies).unwrap(),
+            "[ProBalance] Since start: 28 throttles across 7 programs — job-7 ×7 (7 min), \
+             job-6 ×6 (6 min), job-5 ×5 (5 min), job-4 ×4 (4 min), job-3 ×3 (3 min), and 2 more"
+        );
+        assert_eq!(human_duration(40.0), "40 s");
+        assert_eq!(human_duration(7200.0), "2.0 h");
     }
 
     // ── State-machine kernel tests (drive decide() directly) ────────────────

@@ -28,6 +28,23 @@ enum FileDialogResult {
     ImportDone(Result<Vec<crate::config::RuleConfig>, String>),
 }
 
+/// What the Rules page works on for one frame.
+pub struct RulesPage<'a> {
+    pub rule_engine: &'a Arc<Mutex<RuleEngine>>,
+    /// The running processes, for the live effects and the editor's match
+    /// count.
+    pub snapshot: &'a [crate::monitor::ProcInfo],
+    pub rule_profiles: &'a mut std::collections::HashMap<String, Vec<crate::config::RuleConfig>>,
+    pub opacity: f32,
+}
+
+/// What a frame of the Rules page changed, for the caller to apply and save.
+#[derive(Default)]
+pub struct RulesChanged {
+    pub rules: bool,
+    pub profiles: bool,
+}
+
 pub struct RulesTab {
     pub selected_rule_id: Option<String>,
     pub edit_dialog: Option<RuleEditDialog>,
@@ -122,6 +139,17 @@ impl RulesTab {
         }
     }
 
+    /// Every rule was replaced by a profile loaded from the command line.
+    pub fn rules_replaced_externally(&mut self) {
+        self.selected_rule_id = None;
+        self.pending_delete = None;
+        self.status = if self.close_editor_if(|_| true) {
+            "The rules were replaced from the command line; the rule editor was closed because the rule it was editing is gone.".into()
+        } else {
+            "The rules were replaced from the command line.".into()
+        };
+    }
+
     /// Close the editor if it is editing a saved rule that `gone` says no
     /// longer exists as it was: saving it would bring the old rule back.
     fn close_editor_if(&mut self, gone: impl Fn(&str) -> bool) -> bool {
@@ -135,22 +163,96 @@ impl RulesTab {
         stale
     }
 
-    /// Sets `on_rules_changed` or `on_profiles_changed` when the rules or the
-    /// saved profiles changed and need saving.
-    #[allow(clippy::too_many_arguments)]
+    /// One frame of the Rules page. Reports whether the rules or the saved
+    /// profiles changed and need applying and saving.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
+        page: RulesPage<'_>,
+    ) -> RulesChanged {
+        let RulesPage {
+            rule_engine,
+            snapshot,
+            rule_profiles,
+            opacity,
+        } = page;
+        let mut changed = RulesChanged::default();
+        self.drain_file_results(rule_engine, &mut changed.rules);
+
+        let rules: Vec<Rule> = rule_engine
+            .lock()
+            .map(|re| re.get_rules().to_vec())
+            .unwrap_or_default();
+
+        let selected_id = self.selected_rule_id.clone();
+
+        // ── Toolbar ────────────────────────────────────────────────────────
+        self.toolbar(
+            ui,
+            rule_engine,
+            rule_profiles,
+            &mut changed.profiles,
+            &rules,
+        );
+        let show_all = self.effects_preview(ui, snapshot, &rules);
+        if !self.status.is_empty() {
+            ui.label(
+                RichText::new(&self.status)
+                    .size(tokens::FONT_HELP)
+                    .color(ui.visuals().weak_text_color()),
+            );
+        }
+
+        ui.add_space(tokens::SPACE_XS);
+
+        // ── Empty state with a call to action ──────────────────────────────
+        // Mockup 4a: icon, title, one paragraph capped at ~420px, and two
+        // actions — centred in the panel's remaining height rather than
+        // stacked under the toolbar with dead space below.
+        let clicks = if rules.is_empty() {
+            self.empty_state(ui);
+            RowClicks::default()
+        } else {
+            rule_table(ui, &rules, selected_id.as_deref())
+        };
+
+        // "Show all rules" clears the selection; a click in the table sets it.
+        self.selected_rule_id = clicks.select.or(if show_all { None } else { selected_id });
+        if let Some(rule) = clicks.edit {
+            self.open_editor(rule, true);
+        }
+        if std::mem::take(&mut self.focus_editor) {
+            ctx.send_viewport_cmd_to(RuleEditDialog::viewport_id(), egui::ViewportCommand::Focus);
+        }
+        if let Some(id) = clicks.delete {
+            self.selected_rule_id = Some(id.clone());
+            self.pending_delete = Some(id);
+        }
+        if let Some(id) = clicks.toggle {
+            if let Ok(mut re) = rule_engine.lock() {
+                if let Some(r) = re.get_rules_mut().iter_mut().find(|r| r.rule_id == id) {
+                    r.enabled = !r.enabled;
+                    changed.rules = true;
+                    // Saving the open editor must not undo the switch.
+                    if let Some(dlg) = self.edit_dialog.as_mut().filter(|d| d.rule.rule_id == id) {
+                        dlg.rule.enabled = r.enabled;
+                    }
+                }
+            }
+        }
+
+        self.confirm_dialogs(ctx, rule_engine, &rules, rule_profiles, &mut changed);
+        self.editor_dialogs(ctx, rule_engine, snapshot, opacity, &mut changed.rules);
+        changed
+    }
+
+    /// Take in what the background import and export dialogs finished with.
+    fn drain_file_results(
+        &mut self,
         rule_engine: &Arc<Mutex<RuleEngine>>,
         on_rules_changed: &mut bool,
-        opacity: f32,
-        snapshot: &[crate::monitor::ProcInfo],
-        rule_profiles: &mut std::collections::HashMap<String, Vec<crate::config::RuleConfig>>,
-        on_profiles_changed: &mut bool,
     ) {
-        let proc_names: Vec<String> = snapshot.iter().map(|p| p.name.to_string()).collect();
-        // ── Drain background file-dialog results ───────────────────────────
         while let Ok(result) = self.file_rx.try_recv() {
             match result {
                 FileDialogResult::ExportDone(msg) => {
@@ -172,21 +274,17 @@ impl RulesTab {
                 }
             }
         }
+    }
 
-        let rules: Vec<Rule> = rule_engine
-            .lock()
-            .map(|re| re.get_rules().to_vec())
-            .unwrap_or_default();
-
-        let selected_id = self.selected_rule_id.clone();
-        let mut new_sel: Option<String> = selected_id.clone();
-        let mut open_edit: Option<Rule> = None;
-        let mut delete_rule_id: Option<String> = None;
-        let mut toggle_rule_id: Option<String> = None;
-
-        // ── Toolbar ────────────────────────────────────────────────────────
-        self.toolbar(ui, rule_engine, rule_profiles, on_profiles_changed, &rules);
-
+    /// What the rules ask of the processes running now. Returns whether
+    /// "Show all rules" was clicked.
+    fn effects_preview(
+        &self,
+        ui: &mut egui::Ui,
+        snapshot: &[crate::monitor::ProcInfo],
+        rules: &[Rule],
+    ) -> bool {
+        let mut show_all = false;
         egui::CollapsingHeader::new("Live rule effects").show(ui, |ui| {
             theme::help_text(ui, "Rules run from top to bottom. The last matching rule that sets a field supplies its requested value. Actual values can differ because of permissions, manual overrides or ProBalance.");
             egui::ScrollArea::vertical().id_salt("rule_effects").max_height(230.0).show(ui, |ui| {
@@ -195,7 +293,7 @@ impl RulesTab {
                     ui.end_row();
                     let mut count = 0;
                     for process in snapshot {
-                        let effect = crate::rules::preview_effect(&rules, &process.name);
+                        let effect = crate::rules::preview_effect(rules, &process.name);
                         if effect.matches.is_empty() { continue; }
                         if self.selected_rule_id.as_ref().is_some_and(|id| !effect.matches.iter().any(|r| &r.rule_id == id)) { continue; }
                         count += 1;
@@ -213,303 +311,100 @@ impl RulesTab {
                     if count == 0 { ui.label("No running processes match the selected rules."); ui.end_row(); }
                 });
             });
-            if self.selected_rule_id.is_some() && ui.small_button("Show all rules").clicked() { new_sel = None; }
+            if self.selected_rule_id.is_some() && ui.small_button("Show all rules").clicked() { show_all = true; }
         });
-        if !self.status.is_empty() {
+        show_all
+    }
+
+    /// Mockup 4a: icon, title, one paragraph capped at ~420px, and two
+    /// actions — centred in the panel's remaining height rather than stacked
+    /// under the toolbar with dead space below.
+    fn empty_state(&mut self, ui: &mut egui::Ui) {
+        let s = theme::sem(ui);
+        const BODY_W: f32 = 420.0;
+        // Centre vertically in what is left of the panel. The block is
+        // roughly 150px tall; half the slack above it puts it on the
+        // optical centre without measuring twice.
+        let slack = (ui.available_height() - 150.0).max(0.0);
+        ui.add_space(slack * 0.5);
+        ui.vertical_centered(|ui| {
             ui.label(
-                RichText::new(&self.status)
-                    .size(tokens::FONT_HELP)
-                    .color(ui.visuals().weak_text_color()),
+                RichText::new("☰")
+                    .size(30.0)
+                    .color(ui.visuals().weak_text_color().gamma_multiply(0.6)),
             );
-        }
-
-        ui.add_space(tokens::SPACE_XS);
-
-        // ── Empty state with a call to action ──────────────────────────────
-        // Mockup 4a: icon, title, one paragraph capped at ~420px, and two
-        // actions — centred in the panel's remaining height rather than
-        // stacked under the toolbar with dead space below.
-        if rules.is_empty() {
-            let s = theme::sem(ui);
-            const BODY_W: f32 = 420.0;
-            // Centre vertically in what is left of the panel. The block is
-            // roughly 150px tall; half the slack above it puts it on the
-            // optical centre without measuring twice.
-            let slack = (ui.available_height() - 150.0).max(0.0);
-            ui.add_space(slack * 0.5);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    RichText::new("☰")
-                        .size(30.0)
-                        .color(ui.visuals().weak_text_color().gamma_multiply(0.6)),
-                );
-                ui.add_space(tokens::SPACE_XS);
-                ui.label(theme::bold(ui, "No rules yet", tokens::FONT_HEADING));
-                ui.add_space(tokens::SPACE_XS);
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new(BODY_W, 0.0),
-                    egui::Layout::top_down(egui::Align::Center),
-                    |ui| {
-                        ui.label(
-                            RichText::new(
-                                "Rules set affinity, nice and I/O priority automatically on \
-                                 processes matching a pattern. Right-click a process in the \
-                                 Processes tab and choose \"Add rule\", or start from a template.",
-                            )
-                            .size(tokens::FONT_HELP)
-                            .color(ui.visuals().weak_text_color()),
-                        );
-                    },
-                );
-                ui.add_space(tokens::SPACE_M);
-                // vertical_centered centres each child *allocation*, so the
-                // row has to be allocated at exactly its own width. A plain
-                // horizontal row — or a Frame wrapping one — takes the full
-                // width and lands hard left, and a guessed fixed width leaves
-                // slack that shows up as an offset. So measure the two labels.
-                const NEW: &str = "+ New rule";
-                const BROWSE: &str = "Browse templates";
-                let row_w = {
-                    let text_w = |t: &str| {
-                        let font = if t == NEW {
-                            theme::bold_font(tokens::FONT_BODY)
-                        } else {
-                            egui::TextStyle::Button.resolve(ui.style())
-                        };
-                        ui.painter()
-                            .layout_no_wrap(t.to_owned(), font.clone(), egui::Color32::WHITE)
-                            .size()
-                            .x
-                    };
-                    let pad = ui.spacing().button_padding.x * 2.0;
-                    text_w(NEW) + text_w(BROWSE) + pad * 2.0 + ui.spacing().item_spacing.x
-                };
-                ui.allocate_ui_with_layout(
-                    egui::Vec2::new(row_w, 0.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        let btn = egui::Button::new(
-                            RichText::new(NEW)
-                                .color(s.on_accent)
-                                .font(theme::bold_font(tokens::FONT_BODY)),
+            ui.add_space(tokens::SPACE_XS);
+            ui.label(theme::bold(ui, "No rules yet", tokens::FONT_HEADING));
+            ui.add_space(tokens::SPACE_XS);
+            ui.allocate_ui_with_layout(
+                egui::Vec2::new(BODY_W, 0.0),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Rules set affinity, nice and I/O priority automatically on \
+                             processes matching a pattern. Right-click a process in the \
+                             Processes tab and choose \"Add rule\", or start from a template.",
                         )
-                        .fill(s.accent);
-                        if ui.add(btn).clicked() {
-                            self.open_add_dialog(None);
-                        }
-                        if ui.button(BROWSE).clicked() {
-                            self.presets_dialog = Some(RulePresetsDialog::new());
-                        }
-                    },
-                );
-            });
-        } else {
-            // ── Rule table ─────────────────────────────────────────────────
-            let border_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
-            let text_color = ui.visuals().text_color();
-            let dim_color = ui.visuals().weak_text_color();
-
-            // Column widths proportional to available width. id_salt includes
-            // avail_w so egui_extras re-initialises columns on window resize.
-            let avail_w = ui.available_width() - 2.0;
-            let table_left = ui.min_rect().left();
-            let table_right = table_left + avail_w;
-            let col_pattern = (avail_w * 0.13).clamp(40.0, 200.0);
-            let col_match = (avail_w * 0.08).clamp(40.0, 120.0);
-            let col_aff = (avail_w * 0.11).clamp(40.0, 160.0);
-            let col_nice = (avail_w * 0.05).clamp(30.0, 70.0);
-            let col_io = (avail_w * 0.08).clamp(40.0, 120.0);
-
-            egui::Frame::new()
-                .stroke(egui::Stroke::new(1.0_f32, border_color))
-                .inner_margin(egui::Margin::same(1))
-                .show(ui, |ui| {
-                    TableBuilder::new(ui)
-                        .id_salt(avail_w as i32) // reset stored widths when window resizes
-                        .striped(true)
-                        .resizable(true)
-                        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                        .column(Column::exact(38.0))
-                        .column(Column::remainder())
-                        .column(Column::initial(col_pattern).clip(true))
-                        .column(Column::initial(col_match).clip(true))
-                        .column(Column::initial(col_aff).clip(true))
-                        .column(Column::initial(col_nice).clip(true))
-                        .column(Column::initial(col_io).clip(true))
-                        .column(Column::exact(96.0))
-                        .min_scrolled_height(120.0)
-                        .header(24.0, |mut hdr| {
-                            for label in [
-                                "ON", "NAME", "PATTERN", "MATCH", "AFFINITY", "NICE", "I/O", "",
-                            ] {
-                                hdr.col(|ui| {
-                                    ui.label(theme::header_text(ui, label, false));
-                                });
-                            }
-                        })
-                        .body(|mut body| {
-                            for rule in &rules {
-                                let rule_id = rule.rule_id.clone();
-                                let is_sel = selected_id.as_deref() == Some(&rule.rule_id);
-                                let row_color = if rule.enabled { text_color } else { dim_color };
-                                let mut row_hovered = false;
-
-                                body.row(tokens::ROW_H, |mut row| {
-                                    row.set_selected(is_sel);
-
-                                    let (_, r0) = row.col(|ui| {
-                                        // Hover is measured on the full row band so the
-                                        // action buttons don't flicker when aimed at.
-                                        let band = ui.max_rect();
-                                        row_hovered = ui
-                                            .ctx()
-                                            .pointer_latest_pos()
-                                            .map(|p| {
-                                                p.y >= band.top()
-                                                    && p.y <= band.bottom()
-                                                    && p.x >= table_left
-                                                    && p.x <= table_right
-                                            })
-                                            .unwrap_or(false);
-                                        let mut on = rule.enabled;
-                                        if theme::toggle(ui, &mut on, "Rule enabled") {
-                                            toggle_rule_id = Some(rule_id.clone());
-                                        }
-                                    });
-                                    let (_, r1) = row.col(|ui| {
-                                        ui.label(RichText::new(&rule.name).color(row_color));
-                                    });
-                                    let (_, r2) = row.col(|ui| {
-                                        match rule.pattern_error() {
-                                            None => {
-                                                ui.label(RichText::new(&rule.pattern).color(row_color));
-                                            }
-                                            Some(e) => {
-                                                let warn = theme::sem(ui).warning;
-                                                ui.label(RichText::new(format!("⚠ {}", rule.pattern)).color(warn))
-                                                    .on_hover_text(format!(
-                                                        "Not a valid regular expression, so this rule matches nothing: {e}"
-                                                    ));
-                                            }
-                                        }
-                                    });
-                                    let (_, r3) = row.col(|ui| {
-                                        theme::badge_outline(ui, rule.match_type.as_str());
-                                    });
-                                    let (_, r4) = row.col(|ui| {
-                                        ui.label(
-                                            RichText::new(rule.affinity.as_deref().unwrap_or("—"))
-                                                .color(row_color),
-                                        );
-                                    });
-                                    // §2: numeric cell — monospace, right-aligned.
-                                    let (_, r5) = row.col(|ui| {
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                let txt = rule
-                                                    .nice
-                                                    .map(|n| n.to_string())
-                                                    .unwrap_or_else(|| "—".into());
-                                                ui.label(
-                                                    RichText::new(txt)
-                                                        .font(theme::num_font(tokens::FONT_BODY))
-                                                        .color(row_color),
-                                                );
-                                            },
-                                        );
-                                    });
-                                    let (_, r6) = row.col(|ui| {
-                                        // What is enforced: a level without a class is not.
-                                        let txt = match rule.ionice_class.map(|c| {
-                                            crate::rules::ionice_target(c, rule.ionice_level)
-                                        }) {
-                                            Some((c @ (1 | 2), l)) => format!("cls {c} · {l}"),
-                                            Some((c, _)) => format!("cls {c}"),
-                                            None => "—".into(),
-                                        };
-                                        ui.label(
-                                            RichText::new(txt)
-                                                .font(theme::num_font(tokens::FONT_SMALL))
-                                                .color(row_color),
-                                        );
-                                    });
-                                    // Row-level actions: only on hover/selection.
-                                    let (_, r7) = row.col(|ui| {
-                                        if row_hovered || is_sel {
-                                            ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
-                                            if ui
-                                                .small_button("Edit")
-                                                .on_hover_text("Edit rule")
-                                                .clicked()
-                                            {
-                                                new_sel = Some(rule_id.clone());
-                                                open_edit = Some(rule.clone());
-                                            }
-                                            if ui
-                                                .small_button("Delete")
-                                                .on_hover_text("Delete rule")
-                                                .clicked()
-                                            {
-                                                delete_rule_id = Some(rule_id.clone());
-                                            }
-                                        }
-                                    });
-
-                                    let clicked = r0.clicked()
-                                        || r1.clicked()
-                                        || r2.clicked()
-                                        || r3.clicked()
-                                        || r4.clicked()
-                                        || r5.clicked()
-                                        || r6.clicked()
-                                        || r7.clicked();
-                                    let doubled = r0.double_clicked()
-                                        || r1.double_clicked()
-                                        || r2.double_clicked()
-                                        || r3.double_clicked()
-                                        || r4.double_clicked()
-                                        || r5.double_clicked()
-                                        || r6.double_clicked()
-                                        || r7.double_clicked();
-
-                                    if doubled {
-                                        new_sel = Some(rule_id.clone());
-                                        open_edit = Some(rule.clone());
-                                    } else if clicked {
-                                        new_sel = Some(rule_id.clone());
-                                    }
-                                });
-                            }
-                        });
-                });
-        }
-
-        self.selected_rule_id = new_sel;
-        if let Some(rule) = open_edit {
-            self.open_editor(rule, true);
-        }
-        if std::mem::take(&mut self.focus_editor) {
-            ctx.send_viewport_cmd_to(RuleEditDialog::viewport_id(), egui::ViewportCommand::Focus);
-        }
-        if let Some(id) = delete_rule_id {
-            self.selected_rule_id = Some(id.clone());
-            self.pending_delete = Some(id);
-        }
-        if let Some(id) = toggle_rule_id {
-            if let Ok(mut re) = rule_engine.lock() {
-                if let Some(r) = re.get_rules_mut().iter_mut().find(|r| r.rule_id == id) {
-                    r.enabled = !r.enabled;
-                    *on_rules_changed = true;
-                    // Saving the open editor must not undo the switch.
-                    if let Some(dlg) = self.edit_dialog.as_mut().filter(|d| d.rule.rule_id == id) {
-                        dlg.rule.enabled = r.enabled;
+                        .size(tokens::FONT_HELP)
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                },
+            );
+            ui.add_space(tokens::SPACE_M);
+            // vertical_centered centres each child *allocation*, so the
+            // row has to be allocated at exactly its own width. A plain
+            // horizontal row — or a Frame wrapping one — takes the full
+            // width and lands hard left, and a guessed fixed width leaves
+            // slack that shows up as an offset. So measure the two labels.
+            const NEW: &str = "+ New rule";
+            const BROWSE: &str = "Browse templates";
+            let row_w = {
+                let text_w = |t: &str| {
+                    let font = if t == NEW {
+                        theme::bold_font(tokens::FONT_BODY)
+                    } else {
+                        egui::TextStyle::Button.resolve(ui.style())
+                    };
+                    ui.painter()
+                        .layout_no_wrap(t.to_owned(), font.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x
+                };
+                let pad = ui.spacing().button_padding.x * 2.0;
+                text_w(NEW) + text_w(BROWSE) + pad * 2.0 + ui.spacing().item_spacing.x
+            };
+            ui.allocate_ui_with_layout(
+                egui::Vec2::new(row_w, 0.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    let btn = egui::Button::new(
+                        RichText::new(NEW)
+                            .color(s.on_accent)
+                            .font(theme::bold_font(tokens::FONT_BODY)),
+                    )
+                    .fill(s.accent);
+                    if ui.add(btn).clicked() {
+                        self.open_add_dialog(None);
                     }
-                }
-            }
-        }
+                    if ui.button(BROWSE).clicked() {
+                        self.presets_dialog = Some(RulePresetsDialog::new());
+                    }
+                },
+            );
+        });
+    }
 
-        // ── Confirm dialogs ────────────────────────────────────────────────
+    /// The windows that ask before a rule or a profile is deleted, or a
+    /// profile replaces the rules.
+    fn confirm_dialogs(
+        &mut self,
+        ctx: &egui::Context,
+        rule_engine: &Arc<Mutex<RuleEngine>>,
+        rules: &[Rule],
+        rule_profiles: &mut std::collections::HashMap<String, Vec<crate::config::RuleConfig>>,
+        changed: &mut RulesChanged,
+    ) {
         if let Some(id) = self.pending_delete.clone() {
             let rule_name = rules
                 .iter()
@@ -537,7 +432,7 @@ impl RulesTab {
             if confirmed {
                 if let Ok(mut re) = rule_engine.lock() {
                     re.remove_rule(&id);
-                    *on_rules_changed = true;
+                    changed.rules = true;
                     if self.selected_rule_id.as_ref() == Some(&id) {
                         self.selected_rule_id = None;
                     }
@@ -578,7 +473,7 @@ impl RulesTab {
                             re.add_rule(crate::rules::Rule::from_config(cfg));
                         }
                     }
-                    *on_rules_changed = true;
+                    changed.rules = true;
                     self.status = if self.close_editor_if(|_| true) {
                         format!("Loaded profile '{profile}' and closed the rule editor: the rule it was editing was replaced.")
                     } else {
@@ -615,16 +510,29 @@ impl RulesTab {
             if confirmed {
                 rule_profiles.remove(&self.selected_profile);
                 self.selected_profile.clear();
-                *on_profiles_changed = true;
+                changed.profiles = true;
                 self.status = "Profile deleted.".into();
                 self.confirm_delete_profile = false;
             } else if cancelled {
                 self.confirm_delete_profile = false;
             }
         }
+    }
 
-        // ── Dialogs ────────────────────────────────────────────────────────
+    /// The rule editor and the template picker, and what they were closed
+    /// with.
+    fn editor_dialogs(
+        &mut self,
+        ctx: &egui::Context,
+        rule_engine: &Arc<Mutex<RuleEngine>>,
+        snapshot: &[crate::monitor::ProcInfo],
+        opacity: f32,
+        on_rules_changed: &mut bool,
+    ) {
         if let Some(ref mut dlg) = self.edit_dialog {
+            // Process names for the editor's live match count: only
+            // gathered while there is an editor to show them.
+            let proc_names: Vec<String> = snapshot.iter().map(|p| p.name.to_string()).collect();
             if let Some(result) = dlg.show(ctx, opacity, &proc_names) {
                 let existing = dlg.existing;
                 self.edit_dialog = None;
@@ -865,6 +773,199 @@ impl RulesTab {
     }
 }
 
+/// What was clicked in the rule table this frame.
+#[derive(Default)]
+struct RowClicks {
+    select: Option<String>,
+    edit: Option<Rule>,
+    delete: Option<String>,
+    toggle: Option<String>,
+}
+
+/// The rule table: one row per rule, in the order they apply.
+fn rule_table(ui: &mut egui::Ui, rules: &[Rule], selected_id: Option<&str>) -> RowClicks {
+    let mut clicks = RowClicks::default();
+    let border_color = ui.visuals().widgets.noninteractive.bg_stroke.color;
+    let text_color = ui.visuals().text_color();
+    let dim_color = ui.visuals().weak_text_color();
+
+    // Column widths proportional to available width. id_salt includes
+    // avail_w so egui_extras re-initialises columns on window resize.
+    let avail_w = ui.available_width() - 2.0;
+    let table_left = ui.min_rect().left();
+    let table_right = table_left + avail_w;
+    let col_pattern = (avail_w * 0.13).clamp(40.0, 200.0);
+    let col_match = (avail_w * 0.08).clamp(40.0, 120.0);
+    let col_aff = (avail_w * 0.11).clamp(40.0, 160.0);
+    let col_nice = (avail_w * 0.05).clamp(30.0, 70.0);
+    let col_io = (avail_w * 0.08).clamp(40.0, 120.0);
+
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0_f32, border_color))
+        .inner_margin(egui::Margin::same(1))
+        .show(ui, |ui| {
+            TableBuilder::new(ui)
+                .id_salt(avail_w as i32) // reset stored widths when window resizes
+                .striped(true)
+                .resizable(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .column(Column::exact(38.0))
+                .column(Column::remainder())
+                .column(Column::initial(col_pattern).clip(true))
+                .column(Column::initial(col_match).clip(true))
+                .column(Column::initial(col_aff).clip(true))
+                .column(Column::initial(col_nice).clip(true))
+                .column(Column::initial(col_io).clip(true))
+                .column(Column::exact(96.0))
+                .min_scrolled_height(120.0)
+                .header(24.0, |mut hdr| {
+                    for label in [
+                        "ON", "NAME", "PATTERN", "MATCH", "AFFINITY", "NICE", "I/O", "",
+                    ] {
+                        hdr.col(|ui| {
+                            ui.label(theme::header_text(ui, label, false));
+                        });
+                    }
+                })
+                .body(|mut body| {
+                    for rule in rules {
+                        let rule_id = rule.rule_id.clone();
+                        let is_sel = selected_id == Some(rule.rule_id.as_str());
+                        let row_color = if rule.enabled { text_color } else { dim_color };
+                        let mut row_hovered = false;
+
+                        body.row(tokens::ROW_H, |mut row| {
+                            row.set_selected(is_sel);
+
+                            let (_, r0) = row.col(|ui| {
+                                // Hover is measured on the full row band so the
+                                // action buttons don't flicker when aimed at.
+                                let band = ui.max_rect();
+                                row_hovered = ui
+                                    .ctx()
+                                    .pointer_latest_pos()
+                                    .map(|p| {
+                                        p.y >= band.top()
+                                            && p.y <= band.bottom()
+                                            && p.x >= table_left
+                                            && p.x <= table_right
+                                    })
+                                    .unwrap_or(false);
+                                let mut on = rule.enabled;
+                                if theme::toggle(ui, &mut on, "Rule enabled") {
+                                    clicks.toggle = Some(rule_id.clone());
+                                }
+                            });
+                            let (_, r1) = row.col(|ui| {
+                                ui.label(RichText::new(&rule.name).color(row_color));
+                            });
+                            let (_, r2) = row.col(|ui| {
+                                match rule.pattern_error() {
+                                    None => {
+                                        ui.label(RichText::new(&rule.pattern).color(row_color));
+                                    }
+                                    Some(e) => {
+                                        let warn = theme::sem(ui).warning;
+                                        ui.label(RichText::new(format!("⚠ {}", rule.pattern)).color(warn))
+                                            .on_hover_text(format!(
+                                                "Not a valid regular expression, so this rule matches nothing: {e}"
+                                            ));
+                                    }
+                                }
+                            });
+                            let (_, r3) = row.col(|ui| {
+                                theme::badge_outline(ui, rule.match_type.as_str());
+                            });
+                            let (_, r4) = row.col(|ui| {
+                                ui.label(
+                                    RichText::new(rule.affinity.as_deref().unwrap_or("—"))
+                                        .color(row_color),
+                                );
+                            });
+                            // §2: numeric cell — monospace, right-aligned.
+                            let (_, r5) = row.col(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        let txt = rule
+                                            .nice
+                                            .map(|n| n.to_string())
+                                            .unwrap_or_else(|| "—".into());
+                                        ui.label(
+                                            RichText::new(txt)
+                                                .font(theme::num_font(tokens::FONT_BODY))
+                                                .color(row_color),
+                                        );
+                                    },
+                                );
+                            });
+                            let (_, r6) = row.col(|ui| {
+                                // What is enforced: a level without a class is not.
+                                let txt = match rule.ionice_class.map(|c| {
+                                    crate::rules::ionice_target(c, rule.ionice_level)
+                                }) {
+                                    Some((c @ (1 | 2), l)) => format!("cls {c} · {l}"),
+                                    Some((c, _)) => format!("cls {c}"),
+                                    None => "—".into(),
+                                };
+                                ui.label(
+                                    RichText::new(txt)
+                                        .font(theme::num_font(tokens::FONT_SMALL))
+                                        .color(row_color),
+                                );
+                            });
+                            // Row-level actions: only on hover/selection.
+                            let (_, r7) = row.col(|ui| {
+                                if row_hovered || is_sel {
+                                    ui.spacing_mut().item_spacing.x = tokens::SPACE_XS;
+                                    if ui
+                                        .small_button("Edit")
+                                        .on_hover_text("Edit rule")
+                                        .clicked()
+                                    {
+                                        clicks.select = Some(rule_id.clone());
+                                        clicks.edit = Some(rule.clone());
+                                    }
+                                    if ui
+                                        .small_button("Delete")
+                                        .on_hover_text("Delete rule")
+                                        .clicked()
+                                    {
+                                        clicks.delete = Some(rule_id.clone());
+                                    }
+                                }
+                            });
+
+                            let clicked = r0.clicked()
+                                || r1.clicked()
+                                || r2.clicked()
+                                || r3.clicked()
+                                || r4.clicked()
+                                || r5.clicked()
+                                || r6.clicked()
+                                || r7.clicked();
+                            let doubled = r0.double_clicked()
+                                || r1.double_clicked()
+                                || r2.double_clicked()
+                                || r3.double_clicked()
+                                || r4.double_clicked()
+                                || r5.double_clicked()
+                                || r6.double_clicked()
+                                || r7.double_clicked();
+
+                            if doubled {
+                                clicks.select = Some(rule_id.clone());
+                                clicks.edit = Some(rule.clone());
+                            } else if clicked {
+                                clicks.select = Some(rule_id.clone());
+                            }
+                        });
+                    }
+                });
+        });
+    clicks
+}
+
 /// The status line after an import.
 fn import_summary(imported: usize, skipped: &[String]) -> String {
     let rules = |n: usize| if n == 1 { "rule" } else { "rules" };
@@ -927,16 +1028,18 @@ mod tests {
             self.ctx.test_frame(input, |root| {
                 egui::CentralPanel::default().show(root, |ui| {
                     let ctx = ui.ctx().clone();
-                    tab.show(
+                    let reported = tab.show(
                         ui,
                         &ctx,
-                        engine,
-                        &mut changed,
-                        1.0,
-                        &[],
-                        profiles,
-                        &mut profiles_changed,
+                        RulesPage {
+                            rule_engine: engine,
+                            snapshot: &[],
+                            rule_profiles: profiles,
+                            opacity: 1.0,
+                        },
                     );
+                    changed |= reported.rules;
+                    profiles_changed |= reported.profiles;
                 });
             })
         }

@@ -417,189 +417,217 @@ fn collect_all(
 
 // ── hwmon: per-category collectors ───────────────────────────────────────────
 
-fn collect_all_hwmon(topo: &crate::cpu_park::CpuTopology) -> Vec<GroupReading> {
-    let core_id_map = build_core_id_to_cpu_map();
+/// How long a discovered hwmon layout is trusted. A device that appears
+/// later (a USB sensor, a driver loaded after start) shows up within this
+/// time; one that disappears is noticed at once, because its read fails.
+const HWMON_REDISCOVER: std::time::Duration = std::time::Duration::from_secs(30);
 
-    let mut groups = collect_hwmon_where(
-        |_| true,
-        |path, hw_name| {
-            // Dynamic categorization based on known driver prefixes or path content
-            if hw_name == "k10temp" || hw_name == "zenpower" || hw_name == "coretemp" {
-                let label = match hw_name {
-                    "k10temp" => "AMD CPU [k10temp]",
-                    "zenpower" => "AMD CPU [zenpower]",
-                    _ => "Intel CPU [coretemp]",
-                };
-                return ("CPU", label.to_string());
-            }
+/// One `*_input` file, kept open: the value is re-read with `pread`, so a
+/// reading costs one syscall instead of open + read + close plus the
+/// label file beside it.
+struct HwmonChannel {
+    input: std::fs::File,
+    label: &'static str,
+    unit: &'static str,
+    /// Raw sysfs integer per display unit (1000 millidegrees per °C, …).
+    divisor: f32,
+}
 
-            if hw_name == "spd5118" || hw_name == "ee1004" {
-                return ("Memory", dimm_slot_name(path));
-            }
+struct HwmonDevice {
+    category: &'static str,
+    name: String,
+    channels: Vec<HwmonChannel>,
+    /// amdgpu exposes load and VRAM beside, not in, its hwmon directory.
+    amdgpu_device: Option<std::path::PathBuf>,
+}
 
-            if hw_name == "nvme" {
-                let model = read_trimmed(&path.join("device/model"))
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_else(|| "NVMe".into());
-                return ("Storage", model);
-            }
-
-            if hw_name.starts_with("amdgpu") || hw_name.starts_with("nouveau") {
-                return ("GPU", format!("{} GPU", hw_name));
-            }
-
-            if hw_name.starts_with("r8")
-                || hw_name.starts_with("atlantic")
-                || hw_name.starts_with("igb")
-                || hw_name.starts_with("ixgbe")
-                || hw_name.starts_with("e1000")
-            {
-                let iface = nic_interface_name(path).unwrap_or_else(|| hw_name.to_string());
-                return ("Network", format!("NIC [{iface}]"));
-            }
-
-            // Generic fallback for unknown hardware (motherboard sensors like nct6775, etc.)
-            ("System", format!("Sensor [{}]", hw_name))
-        },
-    );
-
-    // Remap CPU core labels like the original did
-    for (cat, _name, sensors) in &mut groups {
-        if *cat == "CPU" {
-            for (label, _unit, _value) in sensors.iter_mut() {
-                if let Some(core_id) = label
-                    .strip_prefix("Core ")
-                    .and_then(|s| s.parse::<u32>().ok())
-                {
-                    if let Some(&cpu_num) = core_id_map.get(&core_id) {
-                        let kind = core_kind_suffix(topo, cpu_num);
-                        *label = intern(format!("CPU {cpu_num}{kind}"));
-                    }
-                }
-            }
-        }
+impl HwmonChannel {
+    fn read(&self) -> Option<f32> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = [0u8; 32];
+        let n = self.input.read_at(&mut buf, 0).ok()?;
+        let raw: u64 = std::str::from_utf8(&buf[..n]).ok()?.trim().parse().ok()?;
+        Some(raw as f32 / self.divisor)
     }
+}
 
+fn collect_all_hwmon(topo: &crate::cpu_park::CpuTopology) -> Vec<GroupReading> {
+    use std::sync::Mutex;
+    static LAYOUT: Mutex<Option<(Instant, Vec<HwmonDevice>)>> = Mutex::new(None);
+    let mut layout = LAYOUT.lock().unwrap_or_else(|e| e.into_inner());
+    if layout
+        .as_ref()
+        .is_none_or(|(at, _)| at.elapsed() >= HWMON_REDISCOVER)
+    {
+        *layout = Some((
+            Instant::now(),
+            discover_hwmon(Path::new("/sys/class/hwmon"), topo),
+        ));
+    }
+    let (groups, complete) = read_hwmon(&layout.as_ref().expect("set above").1);
+    if !complete {
+        // A device went away (or its driver reloaded): look again next time
+        // instead of reporting a hole for the rest of the interval.
+        *layout = None;
+    }
     groups
 }
 
-fn collect_hwmon_where<F, G>(filter: F, namer: G) -> Vec<GroupReading>
-where
-    F: Fn(&str) -> bool,
-    G: Fn(&Path, &str) -> (&'static str, String),
-{
-    let mut groups: Vec<GroupReading> = Vec::new();
+/// Read every channel of a discovered layout. The flag is false when a
+/// channel that was readable at discovery no longer is.
+fn read_hwmon(devices: &[HwmonDevice]) -> (Vec<GroupReading>, bool) {
+    let mut complete = true;
+    let mut groups = Vec::new();
+    for device in devices {
+        let mut sensors: Vec<Reading> = Vec::with_capacity(device.channels.len());
+        for channel in &device.channels {
+            match channel.read() {
+                Some(value) => sensors.push((channel.label, channel.unit, value)),
+                None => complete = false,
+            }
+        }
+        if let Some(dir) = &device.amdgpu_device {
+            sensors.extend(amdgpu_device_readings(dir));
+        }
+        if !sensors.is_empty() {
+            groups.push((device.category, device.name.clone(), sensors));
+        }
+    }
+    (groups, complete)
+}
 
-    let hwmon_dir = Path::new("/sys/class/hwmon");
+fn hwmon_group_name(path: &Path, hw_name: &str) -> (&'static str, String) {
+    // Dynamic categorization based on known driver prefixes or path content
+    if hw_name == "k10temp" || hw_name == "zenpower" || hw_name == "coretemp" {
+        let label = match hw_name {
+            "k10temp" => "AMD CPU [k10temp]",
+            "zenpower" => "AMD CPU [zenpower]",
+            _ => "Intel CPU [coretemp]",
+        };
+        return ("CPU", label.to_string());
+    }
+
+    if hw_name == "spd5118" || hw_name == "ee1004" {
+        return ("Memory", dimm_slot_name(path));
+    }
+
+    if hw_name == "nvme" {
+        let model = read_trimmed(&path.join("device/model"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "NVMe".into());
+        return ("Storage", model);
+    }
+
+    if hw_name.starts_with("amdgpu") || hw_name.starts_with("nouveau") {
+        return ("GPU", format!("{} GPU", hw_name));
+    }
+
+    if hw_name.starts_with("r8")
+        || hw_name.starts_with("atlantic")
+        || hw_name.starts_with("igb")
+        || hw_name.starts_with("ixgbe")
+        || hw_name.starts_with("e1000")
+    {
+        let iface = nic_interface_name(path).unwrap_or_else(|| hw_name.to_string());
+        return ("Network", format!("NIC [{iface}]"));
+    }
+
+    // Generic fallback for unknown hardware (motherboard sensors like nct6775, etc.)
+    ("System", format!("Sensor [{}]", hw_name))
+}
+
+/// Walk `hwmon_dir` once: which devices exist, which channels each has and
+/// what they are called. Labels, device names and the core-to-CPU mapping
+/// do not change while a device is present, so none of it is re-read per
+/// sample.
+fn discover_hwmon(hwmon_dir: &Path, topo: &crate::cpu_park::CpuTopology) -> Vec<HwmonDevice> {
+    let core_id_map = build_core_id_to_cpu_map();
+    let mut devices = Vec::new();
     let mut entries: Vec<_> = match std::fs::read_dir(hwmon_dir) {
         Ok(e) => e.flatten().collect(),
-        Err(_) => return groups,
+        Err(_) => return devices,
     };
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
         let path = entry.path();
-        let hw_name = match read_trimmed(&path.join("name")) {
-            Some(n) => n,
-            None => continue,
-        };
-        if !filter(&hw_name) {
+        let Some(hw_name) = read_trimmed(&path.join("name")) else {
             continue;
-        }
-
-        let mut sensors: Vec<Reading> = Vec::new();
+        };
+        let (category, name) = hwmon_group_name(&path, &hw_name);
+        let mut channels = Vec::new();
+        let mut add = |prefix: &str, i: u32, fallback: &str, unit: &'static str, divisor: f32| {
+            let input = path.join(format!("{prefix}{i}_input"));
+            // Only channels that answer now are kept, as before: some
+            // drivers list inputs that always fail (an unplugged fan header).
+            if read_u64(&input).is_none() {
+                return;
+            }
+            let Ok(file) = std::fs::File::open(&input) else {
+                return;
+            };
+            let mut label = read_trimmed(&path.join(format!("{prefix}{i}_label")))
+                .unwrap_or_else(|| format!("{fallback} {i}"));
+            if category == "CPU" {
+                if let Some(cpu_num) = label
+                    .strip_prefix("Core ")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .and_then(|core| core_id_map.get(&core).copied())
+                {
+                    label = format!("CPU {cpu_num}{}", core_kind_suffix(topo, cpu_num));
+                }
+            }
+            channels.push(HwmonChannel {
+                input: file,
+                label: intern(label),
+                unit,
+                divisor,
+            });
+        };
 
         // Temperature – discover indices dynamically (coretemp on Arrow Lake
         // uses non-contiguous indices up to temp46+).
-        {
-            let mut temp_ids: Vec<u32> = Vec::new();
-            if let Ok(dir) = std::fs::read_dir(&path) {
-                for de in dir.flatten() {
-                    let fname = de.file_name();
-                    let s = fname.to_string_lossy();
-                    if let Some(rest) = s.strip_prefix("temp") {
-                        if let Some(num_s) = rest.strip_suffix("_input") {
-                            if let Ok(n) = num_s.parse::<u32>() {
-                                temp_ids.push(n);
-                            }
-                        }
-                    }
-                }
-            }
-            temp_ids.sort_unstable();
-            for i in temp_ids {
-                let input = path.join(format!("temp{i}_input"));
-                if let Some(val) = read_millidegrees(&input) {
-                    let lbl_file = path.join(format!("temp{i}_label"));
-                    let lbl = read_trimmed(&lbl_file).unwrap_or_else(|| format!("Temp {i}"));
-                    sensors.push((intern(lbl), "°C", val));
-                }
-            }
+        let mut temp_ids: Vec<u32> = std::fs::read_dir(&path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|de| {
+                de.file_name()
+                    .to_string_lossy()
+                    .strip_prefix("temp")?
+                    .strip_suffix("_input")?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        temp_ids.sort_unstable();
+        for i in temp_ids {
+            add("temp", i, "Temp", "°C", 1000.0);
+        }
+        for i in 1..=8 {
+            add("fan", i, "Fan", "RPM", 1.0);
+        }
+        for i in 1..=8 {
+            add("power", i, "Power", "W", 1_000_000.0); // µW
+        }
+        for i in 0..=16 {
+            add("in", i, "In", "V", 1000.0); // mV
+        }
+        for i in 1..=4 {
+            add("freq", i, "Freq", "MHz", 1_000_000.0); // Hz; amdgpu etc.
         }
 
-        // Fan
-        for i in 1..=8u32 {
-            let input = path.join(format!("fan{i}_input"));
-            if !input.exists() {
-                continue;
-            }
-            if let Some(rpm) = read_u64(&input) {
-                let lbl_file = path.join(format!("fan{i}_label"));
-                let lbl = read_trimmed(&lbl_file).unwrap_or_else(|| format!("Fan {i}"));
-                sensors.push((intern(lbl), "RPM", rpm as f32));
-            }
-        }
-
-        // Power (µW → W)
-        for i in 1..=8u32 {
-            let input = path.join(format!("power{i}_input"));
-            if !input.exists() {
-                continue;
-            }
-            if let Some(uw) = read_u64(&input) {
-                let lbl_file = path.join(format!("power{i}_label"));
-                let lbl = read_trimmed(&lbl_file).unwrap_or_else(|| format!("Power {i}"));
-                sensors.push((intern(lbl), "W", uw as f32 / 1_000_000.0));
-            }
-        }
-
-        // Voltage (mV → V)
-        for i in 0..=16u32 {
-            let input = path.join(format!("in{i}_input"));
-            if !input.exists() {
-                continue;
-            }
-            if let Some(mv) = read_u64(&input) {
-                let lbl_file = path.join(format!("in{i}_label"));
-                let lbl = read_trimmed(&lbl_file).unwrap_or_else(|| format!("In {i}"));
-                sensors.push((intern(lbl), "V", mv as f32 / 1000.0));
-            }
-        }
-
-        // Frequency (Hz → MHz; amdgpu etc.)
-        for i in 1..=4u32 {
-            let input = path.join(format!("freq{i}_input"));
-            if !input.exists() {
-                continue;
-            }
-            if let Some(hz) = read_u64(&input) {
-                let lbl_file = path.join(format!("freq{i}_label"));
-                let lbl = read_trimmed(&lbl_file).unwrap_or_else(|| format!("Freq {i}"));
-                sensors.push((intern(lbl), "MHz", hz as f32 / 1_000_000.0));
-            }
-        }
-
-        if hw_name == "amdgpu" {
-            sensors.extend(amdgpu_device_readings(&path.join("device")));
-        }
-
-        if !sensors.is_empty() {
-            let (cat, name) = namer(&path, &hw_name);
-            groups.push((cat, name, sensors));
+        let amdgpu_device = (hw_name == "amdgpu").then(|| path.join("device"));
+        if !channels.is_empty() || amdgpu_device.is_some() {
+            devices.push(HwmonDevice {
+                category,
+                name,
+                channels,
+                amdgpu_device,
+            });
         }
     }
-
-    groups
+    devices
 }
 
 /// Load and video memory of an amdgpu device, which its hwmon directory does
@@ -1143,10 +1171,6 @@ fn read_u64(path: &Path) -> Option<u64> {
     read_trimmed(path)?.parse().ok()
 }
 
-fn read_millidegrees(path: &Path) -> Option<f32> {
-    read_u64(path).map(|v| v as f32 / 1000.0)
-}
-
 /// Determine NIC interface name from hwmon device symlink.
 /// e.g., hwmon device → PCI device → net/ethX
 fn nic_interface_name(hwmon_path: &Path) -> Option<String> {
@@ -1375,6 +1399,53 @@ mod tests {
     }
 
     use super::*;
+
+    /// The layout is discovered once and then only the values are re-read:
+    /// a changed value shows without rediscovery, and a device that goes
+    /// away is reported so the caller looks again.
+    #[test]
+    fn hwmon_layout_is_read_without_rediscovery_and_notices_removal() {
+        let root = std::env::temp_dir().join(format!(
+            "argus-hwmon-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dev = root.join("hwmon0");
+        std::fs::create_dir_all(&dev).unwrap();
+        std::fs::write(dev.join("name"), "nct6775\n").unwrap();
+        std::fs::write(dev.join("temp1_input"), "41500\n").unwrap();
+        std::fs::write(dev.join("temp1_label"), "SYSTIN\n").unwrap();
+        std::fs::write(dev.join("fan2_input"), "900\n").unwrap();
+        // Listed but unreadable as a number: left out, as before.
+        std::fs::write(dev.join("fan3_input"), "\n").unwrap();
+
+        let topo = crate::cpu_park::detect_topology();
+        let layout = discover_hwmon(&root, &topo);
+        let (groups, complete) = read_hwmon(&layout);
+        assert!(complete);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, "System");
+        assert_eq!(
+            groups[0].2,
+            vec![("SYSTIN", "°C", 41.5), ("Fan 2", "RPM", 900.0)]
+        );
+
+        // Same open files, new value.
+        std::fs::write(dev.join("temp1_input"), "50000\n").unwrap();
+        let (groups, complete) = read_hwmon(&layout);
+        assert!(complete);
+        assert_eq!(groups[0].2[0], ("SYSTIN", "°C", 50.0));
+
+        // A channel that stops answering asks for rediscovery.
+        std::fs::write(dev.join("fan2_input"), "gone\n").unwrap();
+        let (groups, complete) = read_hwmon(&layout);
+        assert!(!complete);
+        assert_eq!(groups[0].2.len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn failed_provider_init_is_throttled_but_can_recover() {
