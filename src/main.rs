@@ -162,6 +162,51 @@ impl ksni::Tray for ArgusLassoTray {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Switch {
+    On,
+    Off,
+}
+
+/// Hand a command to the running instance. It only makes sense for one that
+/// is running now: a request left on disk would otherwise take effect at
+/// some later start, long after it was asked for.
+fn send_control(control: &overlay_toggle::Control) -> Result<(), String> {
+    match acquire_single_instance_lock() {
+        Ok(None) => {}
+        Ok(Some(_)) => return Err("Argus-Lasso is not running.".into()),
+        Err(e) => {
+            return Err(format!(
+                "Could not tell whether Argus-Lasso is running: {e}"
+            ))
+        }
+    }
+    overlay_toggle::request_control(&config::config_dir(), control)
+        .map_err(|e| format!("Could not reach the running instance: {e}"))
+}
+
+/// The rule profile `wanted` names, or why there is none.
+fn pick_rule_profile(saved: &[String], wanted: &str) -> Result<String, String> {
+    if saved.iter().any(|name| name == wanted) {
+        return Ok(wanted.to_owned());
+    }
+    // Typing the exact capitals of a name made in the GUI is a nuisance.
+    let mut loose = saved
+        .iter()
+        .filter(|name| name.eq_ignore_ascii_case(wanted));
+    match (loose.next(), loose.next()) {
+        (Some(name), None) => Ok(name.clone()),
+        (Some(_), Some(_)) => Err(format!(
+            "More than one rule profile matches '{wanted}' apart from capitals; give the exact name."
+        )),
+        _ if saved.is_empty() => Err("No rule profiles are saved yet.".into()),
+        _ => Err(format!(
+            "No rule profile named '{wanted}'. Saved profiles: {}",
+            saved.join(", ")
+        )),
+    }
+}
+
 #[derive(clap::Subcommand, Debug)]
 enum Cmd {
     /// Report the app identity for matched app/layer packaging.
@@ -190,6 +235,13 @@ enum Cmd {
     },
     /// Toggle the visibility of the overlay HUD
     ToggleOverlay,
+    /// Turn Gaming Mode on or off in the running instance
+    Gaming { state: Switch },
+    /// Turn ProBalance on or off in the running instance
+    Probalance { state: Switch },
+    /// Replace the active rules with a saved rule profile in the running
+    /// instance. Without a name, list the saved profiles.
+    Profile { name: Option<String> },
     /// Install or update the CPU control helpers (parking, power profile,
     /// renice). pkexec asks for authentication: in a dialog on the desktop,
     /// or in this terminal over SSH.
@@ -239,6 +291,30 @@ struct Args {
 /// config and race to write `config.toml`, so one instance silently reverts
 /// the other's changes (e.g. a deleted rule reappears). The returned lock is
 /// held for the process lifetime; `Ok(None)` means another instance owns it.
+impl Switch {
+    fn word(self) -> &'static str {
+        match self {
+            Switch::On => "on",
+            Switch::Off => "off",
+        }
+    }
+}
+
+/// Finish a one-shot command: the message on stdout, or the error on stderr
+/// with a failing exit status.
+fn exit_with(outcome: Result<String, String>) -> ! {
+    match outcome {
+        Ok(message) => {
+            println!("{message}");
+            std::process::exit(0)
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(1)
+        }
+    }
+}
+
 fn acquire_single_instance_lock() -> std::io::Result<Option<nix::fcntl::Flock<std::fs::File>>> {
     // Both candidates are private to this user. A fixed name in the shared
     // temp directory could be created first by another user, and every
@@ -396,6 +472,38 @@ fn main() {
                 println!("Overlay toggle requested.");
                 return;
             }
+            Cmd::Gaming { state } => {
+                let on = state == Switch::On;
+                exit_with(
+                    send_control(&overlay_toggle::Control::Gaming(on))
+                        .map(|()| format!("Gaming Mode {} requested.", state.word())),
+                );
+            }
+            Cmd::Probalance { state } => {
+                let on = state == Switch::On;
+                exit_with(
+                    send_control(&overlay_toggle::Control::ProBalance(on))
+                        .map(|()| format!("ProBalance {} requested.", state.word())),
+                );
+            }
+            Cmd::Profile { name } => {
+                let mut saved: Vec<String> =
+                    config::load(false).0.rule_profiles.into_keys().collect();
+                saved.sort();
+                let Some(name) = name else {
+                    if saved.is_empty() {
+                        println!("No rule profiles are saved yet.");
+                    }
+                    for name in saved {
+                        println!("{name}");
+                    }
+                    return;
+                };
+                exit_with(pick_rule_profile(&saved, &name).and_then(|name| {
+                    send_control(&overlay_toggle::Control::Profile(name.clone()))
+                        .map(|()| format!("Rule profile '{name}' requested."))
+                }));
+            }
             Cmd::InstallHelpers => {
                 let (installed, message) = cpu_park::install_helper_via_pkexec();
                 println!("{message}");
@@ -423,6 +531,9 @@ fn main() {
                 // a --minimized start must not come up showing because of
                 // an old launch.
                 overlay_toggle::drain_show_window(&config::config_dir());
+                // Nor is a command: Gaming Mode asked of an instance that
+                // has since exited must not switch on at the next login.
+                overlay_toggle::drain_control(&config::config_dir());
                 Some(lock)
             }
             Ok(None) => {
@@ -846,6 +957,25 @@ fn kill_cli_pid(pid: u32, force: bool) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rule_profile_is_picked_by_exact_name_then_by_name_apart_from_capitals() {
+        let saved = ["Work".to_string(), "work".to_string(), "Gaming".to_string()];
+        assert_eq!(super::pick_rule_profile(&saved, "work").unwrap(), "work");
+        assert_eq!(
+            super::pick_rule_profile(&saved, "gaming").unwrap(),
+            "Gaming"
+        );
+        assert!(super::pick_rule_profile(&saved, "WORK")
+            .unwrap_err()
+            .contains("More than one"));
+        assert!(super::pick_rule_profile(&saved, "idle")
+            .unwrap_err()
+            .contains("Saved profiles: Work, work, Gaming"));
+        assert!(super::pick_rule_profile(&[], "idle")
+            .unwrap_err()
+            .contains("No rule profiles"));
+    }
+
     use super::{kill_cli_pid, lock_instance_in};
 
     #[test]

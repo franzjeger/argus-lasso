@@ -140,6 +140,8 @@ pub struct ArgusLassoApp {
     process_tab: ProcessTab,
     rules_tab: RulesTab,
     probalance_tab: ProBalanceTab,
+    /// `AppState::rules_epoch` as of the last frame.
+    seen_rules_epoch: u64,
     /// In-app update check / self-install.
     updates: crate::updater::UpdateState,
     gaming_mode_tab: GamingModeTab,
@@ -290,6 +292,7 @@ impl ArgusLassoApp {
             process_tab: ProcessTab::new(&config.ui.col_widths, &config.ui.hidden_columns),
             rules_tab: RulesTab::new(),
             probalance_tab,
+            seen_rules_epoch: 0,
             updates,
             gaming_mode_tab,
             hw_monitor_tab: HwMonitorTab::new_with_widths(&config.ui.hw_mon_col_widths),
@@ -524,6 +527,13 @@ impl eframe::App for ArgusLassoApp {
             return;
         };
         frame.suspended_pids = self.pending_stops.stopped_pids(&frame.snapshot);
+        // Changes made from the command line while these pages hold their
+        // own drafts.
+        if std::mem::replace(&mut self.seen_rules_epoch, frame.rules_epoch) != frame.rules_epoch {
+            self.rules_tab.rules_replaced_externally();
+        }
+        self.probalance_tab
+            .follow_enabled(frame.config.probalance.enabled);
         let FrameData {
             ref snapshot,
             ref cpu_pcts,
@@ -643,6 +653,7 @@ struct FrameData {
     net_io_history: std::collections::VecDeque<(f32, f32)>,
     notable_events: Arc<std::collections::VecDeque<String>>,
     cpu_avg: f32,
+    rules_epoch: u64,
 }
 
 impl Tab {
@@ -798,6 +809,7 @@ impl ArgusLassoApp {
             },
             notable_events: s.notable_events.clone(),
             cpu_avg: s.cpu_avg,
+            rules_epoch: s.rules_epoch,
         })
     }
 

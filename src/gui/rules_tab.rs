@@ -122,6 +122,17 @@ impl RulesTab {
         }
     }
 
+    /// Every rule was replaced by a profile loaded from the command line.
+    pub fn rules_replaced_externally(&mut self) {
+        self.selected_rule_id = None;
+        self.pending_delete = None;
+        self.status = if self.close_editor_if(|_| true) {
+            "The rules were replaced from the command line; the rule editor was closed because the rule it was editing is gone.".into()
+        } else {
+            "The rules were replaced from the command line.".into()
+        };
+    }
+
     /// Close the editor if it is editing a saved rule that `gone` says no
     /// longer exists as it was: saving it would bring the old rule back.
     fn close_editor_if(&mut self, gone: impl Fn(&str) -> bool) -> bool {

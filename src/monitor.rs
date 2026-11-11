@@ -175,6 +175,10 @@ pub struct AppState {
     /// Notable events (throttles, alerts, gaming mode, kills) for the
     /// status-bar notification center — small ring buffer, newest last.
     pub notable_events: Arc<std::collections::VecDeque<String>>,
+    /// Incremented when the monitor thread replaces the whole rule list (a
+    /// profile loaded from the command line), so the Rules page can drop an
+    /// editor that is open on a rule that no longer exists.
+    pub rules_epoch: u64,
 }
 
 /// Single writer: callers send SaveConfig instead of serializing stale copies.
@@ -913,6 +917,77 @@ impl Daemon {
             self.show_window_pending = false;
         }
         self.poll_overlay_toggle();
+        for control in crate::overlay_toggle::drain_control(&self.toggle_dir) {
+            self.apply_control(control);
+        }
+    }
+
+    /// Carry out a request made with `argus-lasso gaming|probalance|profile`.
+    fn apply_control(&mut self, control: crate::overlay_toggle::Control) {
+        use crate::overlay_toggle::Control;
+        match control {
+            Control::Gaming(on) => {
+                if self.gaming.active == on {
+                    (self.log)(format!("[CLI] Gaming Mode is already {}.", on_off(on)));
+                    return;
+                }
+                (self.log)(format!("[CLI] Gaming Mode {} requested.", on_off(on)));
+                // What the tray's checkbox asks for.
+                let _ = self.handle(DaemonCmd::SetGamingMode {
+                    active: on,
+                    elevate_nice: true,
+                    parking: Parking::NonPreferred,
+                });
+                if on {
+                    self.reapply_rules();
+                }
+            }
+            Control::ProBalance(on) => {
+                if let Ok(mut s) = self.state.lock() {
+                    s.config_mut().probalance.enabled = on;
+                }
+                (self.log)(format!("[CLI] ProBalance {} requested.", on_off(on)));
+                // Logs the change and hands it to the throttler.
+                let _ = self.handle(DaemonCmd::ConfigChanged);
+                persist_config(&self.state);
+            }
+            Control::Profile(name) => self.load_rule_profile(&name),
+        }
+    }
+
+    fn load_rule_profile(&mut self, name: &str) {
+        let profile = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|s| s.config.rule_profiles.get(name).cloned());
+        let Some(profile) = profile else {
+            (self.log)(format!("[CLI] There is no rule profile named '{name}'."));
+            return;
+        };
+        // The engine lock is never taken inside the state lock here; the
+        // snapshot pass nests them the other way around.
+        let rules = match self.rule_engine.lock() {
+            Ok(mut engine) => {
+                engine.clear_rules();
+                for rule in &profile {
+                    engine.add_rule(crate::rules::Rule::from_config(rule));
+                }
+                engine.to_config_list()
+            }
+            Err(_) => return,
+        };
+        let count = rules.len();
+        if let Ok(mut s) = self.state.lock() {
+            s.config_mut().rules = rules;
+            s.rules_epoch += 1;
+        }
+        let _ = self.handle(DaemonCmd::ConfigChanged);
+        self.reapply_rules();
+        persist_config(&self.state);
+        (self.log)(format!(
+            "[CLI] Loaded rule profile '{name}' ({count} rules)."
+        ));
     }
 
     fn poll_overlay_toggle(&mut self) {
@@ -1922,11 +1997,18 @@ fn read_percpu_stats() -> Vec<(u32, [u64; 10])> {
     result
 }
 
+fn on_off(on: bool) -> &'static str {
+    if on {
+        "on"
+    } else {
+        "off"
+    }
+}
+
 /// Log lines for a configuration update: only for what changed. A HUD
 /// slider sends an update on every frame it is dragged, and each one used
 /// to log a line.
 fn config_change_notes(before: &Config, after: &Config) -> Vec<String> {
-    let on_off = |on: bool| if on { "on" } else { "off" };
     let mut notes = Vec::new();
     if before.probalance.enabled != after.probalance.enabled {
         notes.push(format!(

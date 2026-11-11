@@ -23,6 +23,16 @@ impl ProBalanceTab {
         }
     }
 
+    /// The switch was flipped somewhere else (`argus-lasso probalance on|off`):
+    /// show it, and keep the rest of an unapplied draft as it is. Without
+    /// this the next Apply would silently flip it back.
+    pub fn follow_enabled(&mut self, enabled: bool) {
+        if self.saved.enabled != enabled {
+            self.saved.enabled = enabled;
+            self.cfg.enabled = enabled;
+        }
+    }
+
     /// Plain-language summary of the thresholds, for the status card.
     fn summary(&self) -> String {
         format!(
