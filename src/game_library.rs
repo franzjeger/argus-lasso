@@ -139,7 +139,13 @@ pub fn lutris_games() -> (Vec<(String, String)>, String) {
             let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
             (vec![], format!("sqlite3 error: {err}"))
         }
-        Err(e) => (vec![], format!("sqlite3 not found: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
+            vec![],
+            "Listing Lutris games needs the sqlite3 command, which is not installed. \
+             Install your distribution's sqlite package and reopen this dialog."
+                .into(),
+        ),
+        Err(e) => (vec![], format!("sqlite3 could not be run: {e}")),
     }
 }
 

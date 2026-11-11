@@ -736,10 +736,7 @@ fn refresh_icons(tarball: &[u8], home: &Path) -> Vec<String> {
 }
 
 fn which(bin: &str) -> bool {
-    std::process::Command::new("which")
-        .arg(bin)
-        .output()
-        .is_ok_and(|o| o.status.success())
+    crate::utils::find_in_path(bin).is_some()
 }
 
 fn render_icon(renderer: &str, svg: &Path, size: u32, dest: &Path) -> bool {

@@ -882,11 +882,7 @@ pub fn set_process_nice_via_helper(pid: u32, start_ticks: u64, nice: i32) -> boo
 /// True if polkit's pkexec is available. Without it the helpers cannot be
 /// authorised at all, so installing them would leave dead files on disk.
 pub fn is_pkexec_available() -> bool {
-    Command::new("which")
-        .arg("pkexec")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    crate::utils::find_in_path("pkexec").is_some()
 }
 
 /// Ends each file embedded in the root command; no helper may contain it.

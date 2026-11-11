@@ -81,6 +81,26 @@ pub fn cpuset_to_cpulist(cpus: &HashSet<u32>) -> String {
 
 /// Return all thread IDs (TIDs) for a process by reading /proc/<pid>/task/.
 /// Falls back to [pid] on error.
+/// Where `program` would be run from, searching PATH the way the shell and
+/// `Command` do. Replaces running `which`, which is a process per question
+/// and is itself missing on minimal installs.
+pub fn find_in_path(program: &str) -> Option<std::path::PathBuf> {
+    find_in_dirs(program, std::env::split_paths(&std::env::var_os("PATH")?))
+}
+
+fn find_in_dirs(
+    program: &str,
+    dirs: impl IntoIterator<Item = std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    use nix::unistd::{access, AccessFlags};
+    dirs.into_iter()
+        // An empty PATH entry means the current directory to exec, which is
+        // not somewhere this app wants to find its tools.
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
+        .find(|path| path.is_file() && access(path, AccessFlags::X_OK).is_ok())
+}
+
 pub fn get_tids(pid: u32) -> Vec<u32> {
     let task_dir = format!("/proc/{pid}/task");
     match fs::read_dir(&task_dir) {
@@ -1005,15 +1025,48 @@ mod tests {
         let _ = set_ionice(pid, before.0, Some(before.1));
     }
 
+    #[test]
+    fn programs_are_found_in_path_only_when_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("argus-path-{}", uuid::Uuid::new_v4()));
+        let (first, second) = (dir.join("first"), dir.join("second"));
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let mode = |path: &std::path::Path, mode| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        // Not executable in the first directory, executable in the second.
+        fs::write(first.join("tool"), "").unwrap();
+        mode(&first.join("tool"), 0o644);
+        fs::write(second.join("tool"), "").unwrap();
+        mode(&second.join("tool"), 0o755);
+        // A directory with the program's name is not the program.
+        fs::create_dir(first.join("folder")).unwrap();
+        let dirs = || [std::path::PathBuf::new(), first.clone(), second.clone()];
+        assert_eq!(find_in_dirs("tool", dirs()), Some(second.join("tool")));
+        assert_eq!(find_in_dirs("folder", dirs()), None);
+        assert_eq!(find_in_dirs("absent", dirs()), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Restoring a rule's I/O priority used to give every thread the main
     /// thread's old value. Tested on a child with a thread of its own, so
     /// the test process's threads, which other tests change, are left alone.
     #[test]
     fn io_priorities_are_put_back_per_thread() {
-        let mut child = std::process::Command::new("python3")
+        // The one test that needs an outside program: a child with a second
+        // thread. Without python3 there is nothing to test it on.
+        let mut child = match std::process::Command::new("python3")
             .args(["-c", "import threading, time\nthreading.Thread(target=time.sleep, args=(30,)).start()\ntime.sleep(30)"])
             .spawn()
-            .unwrap();
+        {
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipped: python3 is not installed");
+                return;
+            }
+            Err(e) => panic!("could not start python3: {e}"),
+        };
         let pid = child.id();
         let worker = (0..400).find_map(|_| {
             std::thread::sleep(std::time::Duration::from_millis(5));
