@@ -255,22 +255,24 @@ pub fn set_affinity_if_changed(pid: u32, cpulist: &str) -> bool {
 
 /// Read current affinity of the main thread as a cpulist string.
 pub fn get_affinity_str(pid: u32) -> String {
-    use nix::sched::sched_getaffinity;
-    let Ok(target_pid) = validate_pid(pid, true) else {
-        return String::new();
-    };
-    match sched_getaffinity(target_pid) {
-        Ok(cpu_set) => {
-            let mut cpus = HashSet::new();
-            for i in 0..CpuSet::count() {
-                if cpu_set.is_set(i).unwrap_or(false) {
-                    cpus.insert(i as u32);
-                }
-            }
-            cpuset_to_cpulist(&cpus)
-        }
-        Err(_) => String::new(),
-    }
+    get_affinity_mask(pid)
+        .map(|mask| affinity_mask_to_cpulist(&mask))
+        .unwrap_or_default()
+}
+
+/// The raw affinity mask: one syscall, no allocation. Callers that sample
+/// every process compare it with the last one and only format on a change.
+pub fn get_affinity_mask(pid: u32) -> Option<CpuSet> {
+    let target_pid = validate_pid(pid, true).ok()?;
+    nix::sched::sched_getaffinity(target_pid).ok()
+}
+
+pub fn affinity_mask_to_cpulist(mask: &CpuSet) -> String {
+    let cpus: HashSet<u32> = (0..CpuSet::count())
+        .filter(|&i| mask.is_set(i).unwrap_or(false))
+        .map(|i| i as u32)
+        .collect();
+    cpuset_to_cpulist(&cpus)
 }
 
 use nix::sched::CpuSet;

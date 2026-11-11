@@ -349,10 +349,15 @@ mod ipc_server {
     }
     pub struct Broadcaster {
         latest: Arc<(Mutex<Latest>, Condvar)>,
+        /// Overlay clients connected right now, across every socket. A
+        /// client that went away is only noticed on the next failed write,
+        /// so this can lag by one telemetry frame.
+        clients: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl Broadcaster {
         pub fn start() -> Self {
             let latest = Arc::new((Mutex::new(Latest::default()), Condvar::new()));
+            let clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             for path in argus_ipc::socket_paths() {
                 let shared = latest.clone();
                 if let Some(parent) = path.parent() {
@@ -389,8 +394,8 @@ mod ipc_server {
                             argus_ipc::PROTOCOL_VERSION,
                             path.display()
                         );
+                        let count = clients.clone();
                         std::thread::spawn(move || {
-                            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                             for mut stream in listener.incoming().flatten() {
                                 // Relaxed is sufficient: atomic counter only bounds concurrent
                                 // overlay client threads and carries no dependent memory state.
@@ -457,7 +462,12 @@ mod ipc_server {
                     Err(e) => log::error!("Overlay socket {}: {e}", path.display()),
                 }
             }
-            Self { latest }
+            Self { latest, clients }
+        }
+        /// Whether any game is showing the overlay, i.e. whether telemetry
+        /// has a reader.
+        pub fn has_clients(&self) -> bool {
+            self.clients.load(std::sync::atomic::Ordering::Relaxed) > 0
         }
         pub fn broadcast(&self, msg: &IpcMessage) {
             let Ok(packet) = argus_ipc::encode(msg) else {
@@ -794,7 +804,13 @@ impl Daemon {
                 Duration::from_millis(self.config.monitor.display_refresh_interval_ms);
             let enforce_due =
                 self.enforcing() && now.duration_since(self.last_enforce) >= enforce_interval;
-            let display_due = now.duration_since(self.last_snapshot) >= display_interval;
+            // With the window closed to the tray nobody reads the published
+            // snapshot, so the display pass (per-process affinity, I/O
+            // priority and disk rates, plus the copy handed to the GUI) is
+            // skipped until a window is back. `last_snapshot` then lies in
+            // the past, so the first pass after reopening publishes at once.
+            let watched = self.window_open();
+            let display_due = watched && now.duration_since(self.last_snapshot) >= display_interval;
             let probalance_due = now.duration_since(self.last_pb) >= Duration::from_secs(1);
 
             if enforce_due || display_due || probalance_due {
@@ -807,18 +823,59 @@ impl Daemon {
                 self.tick_probalance(now);
             }
             if now.duration_since(self.last_sensors) >= Duration::from_secs(1) {
-                self.update_sensors(now);
+                if self.sensors_wanted(watched) {
+                    self.update_sensors(now);
+                } else {
+                    self.last_sensors = now;
+                }
             }
             if display_due {
                 self.publish(now);
+            } else if !watched && probalance_due {
+                // The tray tooltip still shows the load.
+                if let Ok(mut s) = self.state.lock() {
+                    s.cpu_avg = self.avg;
+                }
             }
 
-            // Sleep no longer than the enforcement interval so a sub-500ms
-            // rule_enforce_interval_ms is honoured instead of silently ignored.
-            let tick =
-                enforce_interval.clamp(Duration::from_millis(50), Duration::from_millis(500));
-            std::thread::sleep(tick);
+            // Sleep until the next pass is due rather than on a fixed tick,
+            // but wake at once for a command. Capped at 500 ms so a window
+            // reopened from the tray, or a toggle file, is picked up
+            // promptly; floored at 50 ms as before.
+            let mut wait = Duration::from_secs(1).saturating_sub(self.last_pb.elapsed());
+            wait = wait.min(Duration::from_secs(1).saturating_sub(self.last_sensors.elapsed()));
+            if self.enforcing() {
+                wait = wait.min(enforce_interval.saturating_sub(self.last_enforce.elapsed()));
+            }
+            if watched {
+                wait = wait.min(display_interval.saturating_sub(self.last_snapshot.elapsed()));
+            }
+            let wait = wait.clamp(Duration::from_millis(50), Duration::from_millis(500));
+            match cmd_rx.recv_timeout(wait) {
+                Ok(cmd) => {
+                    if self.handle(cmd).is_break() {
+                        return;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                // Every sender is gone: nothing can ask for a shutdown any
+                // more, so keep the old pacing instead of spinning.
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => std::thread::sleep(wait),
+            }
         }
+    }
+
+    /// A window is showing the published data. False while closed to the
+    /// tray; a poisoned lock counts as watched, the safe side.
+    fn window_open(&self) -> bool {
+        self.state.lock().map_or(true, |s| !s.window_closed)
+    }
+
+    /// Sensor readings have three readers: the window, an overlay in a game,
+    /// and the temperature alerts. With none of them there is no reason to
+    /// walk hwmon and NVML every second.
+    fn sensors_wanted(&self, watched: bool) -> bool {
+        watched || self.ipc.has_clients() || self.config.hw_alerts.enabled
     }
 
     /// With no enabled rules, no default affinity and no change left to put
@@ -1557,11 +1614,48 @@ impl ProcMeta {
 #[derive(Default)]
 pub struct SnapshotCaches {
     meta: HashMap<u32, ProcMeta>,
-    /// pid → (affinity, ionice) — display-only, so refreshed on the display
-    /// cadence rather than the much shorter enforce cadence.
-    display: HashMap<u32, (std::sync::Arc<str>, std::sync::Arc<str>)>,
+    /// pid → affinity and I/O priority — display-only, so refreshed on the
+    /// display cadence rather than the much shorter enforce cadence.
+    display: HashMap<u32, DisplayFields>,
     /// pid → (read_bytes, write_bytes) at the last I/O sample.
     io: HashMap<u32, (u64, u64)>,
+}
+
+/// The display strings of one process with the raw values they were made
+/// from. Almost no process changes its affinity or I/O priority between two
+/// passes, so the strings are only rebuilt when the raw value differs.
+struct DisplayFields {
+    mask: Option<nix::sched::CpuSet>,
+    ionice_raw: Option<(i32, i32)>,
+    affinity: std::sync::Arc<str>,
+    ionice: std::sync::Arc<str>,
+}
+
+impl DisplayFields {
+    fn sample(pid: u32, previous: Option<&DisplayFields>) -> Self {
+        let mask = utils::get_affinity_mask(pid);
+        let ionice_raw = utils::get_ionice_raw(pid);
+        let affinity = match previous {
+            Some(p) if p.mask == mask => p.affinity.clone(),
+            _ => mask
+                .map(|m| utils::affinity_mask_to_cpulist(&m))
+                .unwrap_or_default()
+                .into(),
+        };
+        let ionice = match previous {
+            Some(p) if p.ionice_raw == ionice_raw => p.ionice.clone(),
+            _ => ionice_raw
+                .map(|(class, level)| format!("{class}/{level}"))
+                .unwrap_or_default()
+                .into(),
+        };
+        Self {
+            mask,
+            ionice_raw,
+            affinity,
+            ionice,
+        }
+    }
 }
 
 impl SnapshotCaches {
@@ -1643,16 +1737,17 @@ fn collect_snapshot(
         let nice = stat.nice;
 
         let (affinity, ionice, disk_read_bps, disk_write_bps) = if detail {
-            let affinity: std::sync::Arc<str> = utils::get_affinity_str(pid).into();
-            let ionice: std::sync::Arc<str> = read_ionice(pid).into();
+            // A reused pid starts from scratch: the old process's strings
+            // are not this one's.
+            let previous = caches.display.get(&pid).filter(|_| same_process);
+            let fields = DisplayFields::sample(pid, previous);
             let (r, w) = read_proc_io(pid, &mut caches.io, io_elapsed);
-            caches
-                .display
-                .insert(pid, (affinity.clone(), ionice.clone()));
-            (affinity, ionice, r, w)
+            let shown = (fields.affinity.clone(), fields.ionice.clone());
+            caches.display.insert(pid, fields);
+            (shown.0, shown.1, r, w)
         } else {
             match caches.display.get(&pid) {
-                Some((a, i)) => (a.clone(), i.clone(), 0, 0),
+                Some(f) => (f.affinity.clone(), f.ionice.clone(), 0, 0),
                 None => ("".into(), "".into(), 0, 0),
             }
         };
@@ -1816,13 +1911,6 @@ fn read_percpu_stats() -> Vec<(u32, [u64; 10])> {
         }
     }
     result
-}
-
-fn read_ionice(pid: u32) -> String {
-    match utils::get_ionice_raw(pid) {
-        Some((class, level)) => format!("{class}/{level}"),
-        None => String::new(),
-    }
 }
 
 /// Log lines for a configuration update: only for what changed. A HUD
@@ -2004,6 +2092,29 @@ fn check_hw_alerts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unchanged affinity and I/O priority hand back the same strings
+    /// instead of formatting new ones for every process on every pass.
+    #[test]
+    fn display_fields_are_reused_while_the_raw_values_stand() {
+        let pid = std::process::id();
+        let first = DisplayFields::sample(pid, None);
+        assert!(!first.affinity.is_empty());
+        let second = DisplayFields::sample(pid, Some(&first));
+        assert!(std::sync::Arc::ptr_eq(&first.affinity, &second.affinity));
+        assert!(std::sync::Arc::ptr_eq(&first.ionice, &second.ionice));
+
+        // A different raw value is formatted afresh.
+        let stale = DisplayFields {
+            mask: None,
+            ionice_raw: Some((9, 9)),
+            affinity: "".into(),
+            ionice: "9/9".into(),
+        };
+        let fresh = DisplayFields::sample(pid, Some(&stale));
+        assert_eq!(fresh.affinity, first.affinity);
+        assert_eq!(fresh.ionice, first.ionice);
+    }
 
     fn proc_with_cmdline(cmd: &str) -> ProcInfo {
         ProcInfo {
