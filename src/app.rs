@@ -1412,21 +1412,18 @@ impl ArgusLassoApp {
             ref config,
             ..
         } = *frame;
-        let mut rules_changed = false;
-        let mut profiles_changed = false;
         let mut rule_profiles = config.rule_profiles.clone();
-        // Process names for the rule dialog's live match count.
-        self.rules_tab.show(
+        let changed = self.rules_tab.show(
             ui,
             ctx,
-            &self.rule_engine,
-            &mut rules_changed,
-            self.opacity,
-            snapshot,
-            &mut rule_profiles,
-            &mut profiles_changed,
+            crate::gui::rules_tab::RulesPage {
+                rule_engine: &self.rule_engine,
+                snapshot,
+                rule_profiles: &mut rule_profiles,
+                opacity: self.opacity,
+            },
         );
-        if rules_changed {
+        if changed.rules {
             // Never nest the engine lock inside the state lock —
             // the daemon nests them the other way around.
             let rules_cfg = self
@@ -1441,7 +1438,7 @@ impl ArgusLassoApp {
             self.send(DaemonCmd::ReapplyDefaults);
             self.save_config();
         }
-        if profiles_changed {
+        if changed.profiles {
             self.update_config(|c| c.rule_profiles = rule_profiles);
             self.save_config();
         }
