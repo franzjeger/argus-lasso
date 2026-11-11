@@ -1372,19 +1372,17 @@ impl ArgusLassoApp {
             gaming_active,
             proc_cpu_history,
         );
-        let mut trigger_rule = None;
-        crate::gui::action_handler::ActionHandler::handle(
-            action,
+        let rule = crate::gui::action_handler::ActionContext {
             snapshot,
-            &self.state,
-            &mut self.pending_kill,
-            &mut self.pending_stops,
-            &mut self.dialog_manager,
-            &mut self.detail_window,
-            &notify_error,
-            &mut trigger_rule,
-        );
-        if let Some(rule) = trigger_rule {
+            state: &self.state,
+            pending_kill: &mut self.pending_kill,
+            pending_stops: &mut self.pending_stops,
+            dialog_manager: &mut self.dialog_manager,
+            detail_window: &mut self.detail_window,
+            notify_error: &notify_error,
+        }
+        .handle(action);
+        if let Some(rule) = rule {
             self.rules_tab.open_add_dialog(Some(rule));
             self.active_tab = Tab::Rules;
         }

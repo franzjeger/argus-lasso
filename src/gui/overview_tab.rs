@@ -414,7 +414,11 @@ fn read_ram_mb() -> Option<(u64, u64)> {
 }
 
 fn read_load_avg() -> Option<(f32, f32, f32)> {
-    let text = std::fs::read_to_string("/proc/loadavg").ok()?;
+    parse_load_avg(&std::fs::read_to_string("/proc/loadavg").ok()?)
+}
+
+/// The 1, 5 and 15 minute load averages from /proc/loadavg.
+fn parse_load_avg(text: &str) -> Option<(f32, f32, f32)> {
     let mut parts = text.split_whitespace();
     let l1: f32 = parts.next()?.parse().ok()?;
     let l5: f32 = parts.next()?.parse().ok()?;
@@ -520,4 +524,20 @@ fn plot_rect(ui: &mut egui::Ui, top: f32, height: f32) -> egui::Rect {
     );
     ui.allocate_rect(rect, egui::Sense::hover());
     rect
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_averages_are_the_first_three_fields() {
+        assert_eq!(
+            parse_load_avg("0.52 1.25 12.00 3/1481 912345\n"),
+            Some((0.52, 1.25, 12.0))
+        );
+        assert_eq!(parse_load_avg("0.52 1.25"), None);
+        assert_eq!(parse_load_avg("a b c"), None);
+        assert_eq!(parse_load_avg(""), None);
+    }
 }
