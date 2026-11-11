@@ -1,8 +1,31 @@
 # Project status
 
-Reviewed on **2026-11-09**. Release
+Reviewed on **2026-11-11**. Version **1.6.0** is the current source: package
+version `1.6.0`, IPC protocol 6. Its release is tagged `v1.6.0`; the archives are
+published once the release run has been approved in the `release` environment.
 [v1.5.1](https://github.com/franzjeger/argus-lasso/releases/tag/v1.5.1) is the
-current release: package version `1.5.1`, IPC protocol 6.
+previous release.
+
+## Release candidate verification (1.6.0)
+
+Run on 2026-11-11 on the release branch:
+
+- `cargo fmt --all --check` and workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) passed.
+- Workspace tests passed: **338 tests** (`292` in `argus-lasso`, `22` in `argus-layer`, `19` in `argus-ipc`, `5` in `argus-sensors`).
+- The read-only X11/Xvfb tour completed all 20 screens. The Process rules,
+  Gaming Mode and Settings screens, whose code was restructured, are
+  pixel-identical to the tour of the preceding commit outside fields that show
+  live values; a control run of the same binary twice differs in the same fields.
+- `gaming`, `probalance` and `profile` were run against an isolated instance
+  (its own home, runtime directory, session bus and Xvfb display): refused with
+  exit status 1 when none was running; `probalance off|on` and a profile load
+  were applied, logged and saved within two seconds; an unknown profile was
+  refused with the list of saved ones. `gaming on` was not run live, because it
+  parks CPUs on the host; it sends the command the tray's checkbox sends.
+- Idle cost, window closed to the tray, default configuration, 631 processes,
+  both builds side by side for 240 seconds on the same machine: 1.5.1 used
+  0.40% of one core, 1.6.0 used 0.31%. What remains is mostly the once-a-second
+  process scan ProBalance needs.
 
 ## Release verification (1.5.1)
 

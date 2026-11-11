@@ -10,6 +10,78 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-11-11
+
+Command-line control of the running instance, a history of what ProBalance
+throttled, and a service that does far less while its window is closed.
+
+**Upgrading:** from 1.4.0 or later, the in-app updater installs this release.
+Restart running games afterwards to load the matching layer. The CPU control
+helpers are unchanged.
+
+### Added
+
+- `argus-lasso gaming on|off`, `argus-lasso probalance on|off` and
+  `argus-lasso profile [name]` control the instance that is already running:
+  Gaming Mode as the tray switches it, the ProBalance switch, and loading a saved
+  rule profile (no name lists them). They fail with a message when no instance
+  is running, and a request is never left to take effect at a later start. The
+  Process rules and ProBalance pages follow a change made this way.
+- The ProBalance page lists what has been throttled since the app started, per
+  program name: how often and for how long. The summary is also logged once per
+  day of uptime and at shutdown.
+
+### Changed
+
+- While the window is closed to the tray, the service no longer builds the
+  process table for display, reads hardware sensors (unless an overlay is
+  connected or hardware alerts are on) or publishes histories nobody sees. The
+  monitor thread sleeps until its next pass is due instead of waking on a fixed
+  tick. Sensor and CPU graphs therefore have a gap for the time the window was
+  closed. Measured side by side with 1.5.1 on one machine (default
+  configuration, 631 processes, 240 seconds): 0.40% of one core before, 0.31%
+  after. The once-a-second process scan ProBalance needs is what remains.
+- A missing `sqlite3` now says what to install when the Lutris game picker is
+  opened, instead of reporting a bare OS error.
+
+### Fixed
+
+- `--minimized` with a tray icon no longer maps a window on Wayland compositors
+  that ignore the hidden flag: the app starts waiting in the tray (#130).
+- Multi-CCD processors whose CCDs have equal L3 sizes, such as dual V-Cache
+  parts, are detected as two groups, and "No SMT" composes with the CCD
+  selection (#129).
+- A failed change to the extended-sensor service that printed nothing (a
+  cancelled authentication, for instance) now shows an error instead of nothing.
+- An Apply on the ProBalance page no longer flips the switch back when it was
+  changed elsewhere after the page was opened.
+
+### Performance
+
+- hwmon sensors are discovered once and re-read through files that stay open,
+  instead of walking `/sys/class/hwmon` and reopening every input each second.
+  The layout is discovered again every 30 seconds and whenever a read fails.
+- The affinity and I/O-priority columns are formatted only when a process's
+  values change, not for every process on every pass.
+- The configuration, the per-process CPU histories, the throttled set and the
+  notification list are shared with the GUI by reference instead of copied on
+  every frame.
+- `pkexec`, the file dialogs and the icon renderers are looked up in `PATH`
+  directly instead of running `which` for each question; this also works on
+  installs that have no `which`.
+- The rule editor's process-name list is gathered only while an editor is open.
+
+### Internal
+
+- The Gaming Mode, Process rules, Settings and Overview pages and `main()` are
+  split into one function per section; process-table actions take a context
+  struct. Rendering is unchanged: the UI tour's screens of the restructured
+  pages are pixel-identical before and after.
+- New tests cover process-table actions against real child processes (suspend,
+  resume, the undoable kill, refusing a row whose PID changed hands), the
+  command queue, the ProBalance history, and the log, sensor and overview pages'
+  formatting and classification.
+
 ## [1.5.1] — 2026-11-09
 
 CLI PID validation hardening, lazy cgroup unit lookups in ProBalance, cached
@@ -852,7 +924,8 @@ when the app asks, and the sensor service if you use it
 
 - Virtualized the process table; dropped per-frame clones and sysfs reads.
 
-[Unreleased]: https://github.com/franzjeger/argus-lasso/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/franzjeger/argus-lasso/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/franzjeger/argus-lasso/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/franzjeger/argus-lasso/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/franzjeger/argus-lasso/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/franzjeger/argus-lasso/compare/v1.3.1...v1.4.0

@@ -122,11 +122,48 @@ than silently reinterpreted. Existing exemptions, timing, method and nice settin
 are preserved. Subsequent config saves write the new keys. Recovery is constrained
 to stay below activation, and all percentage controls reject non-finite values.
 
+**Throttled since Argus started**, at the foot of the ProBalance page, lists the
+program names ProBalance has throttled since the app started: how many times,
+and for how long in total (summed over every process of that name). The same
+summary is written to the activity log once per day of uptime and at shutdown.
+It counts up to 256 names and is not kept across restarts.
+
 **Process rules → Live rule effects** lists running matches and requested versus
 observed values. Selecting a rule narrows the list; **Show all rules** clears it.
 Rules run top to bottom, with the last matching assignment winning for each field.
 Conflicting overlapping assignments are marked. Requested values are not a promise
 of successful enforcement: permissions, manual overrides and ProBalance can differ.
+
+## Controlling a running instance from the command line
+
+Three commands hand a request to the instance that is already running, for use
+from a keyboard shortcut, a script or a game launcher:
+
+```bash
+argus-lasso gaming on|off        # as the tray's Gaming Mode checkbox
+argus-lasso probalance on|off    # the ProBalance switch; saved like a click
+argus-lasso profile              # list the saved rule profiles
+argus-lasso profile "Work"       # replace the active rules with that profile
+```
+
+- `gaming on` parks the non-preferred CPUs when CPU control is set up and the
+  machine has an asymmetric topology, and raises the priority of detected games,
+  exactly as the tray does. A manual switch takes over from automatic detection
+  until it is switched back.
+- `profile` matches the exact name first, then a name that differs only in
+  capitals. Loading a profile replaces every active rule, as **Load** on the
+  Process rules page does, without the confirmation dialog. An open rule editor
+  is closed if the rule it was editing was replaced.
+- Each command fails with exit status 1 and a message when no instance is
+  running; nothing is queued for a later start, and requests left by an instance
+  that has exited are discarded at the next start. Exit status 0 confirms that
+  the request was handed over, not its outcome: the outcome is in the activity
+  log, tagged `[CLI]`. The running instance acts within about half a second.
+- Requests are files in `~/.config/argus-lasso/control-requests/`, a directory
+  only your user can write to. They carry no more authority than editing
+  `config.toml` does.
+
+`argus-lasso toggle-overlay` is described under [the overlay](overlay.md).
 
 ## Gaming, telemetry and windows
 

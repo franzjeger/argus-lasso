@@ -160,6 +160,9 @@ argus-lasso --minimized              # start hidden to tray
 argus-lasso --no-tray                # run without the tray
 argus-lasso status --top 10          # JSON snapshot
 argus-lasso install-helpers          # CPU control helpers; asks for authentication
+argus-lasso gaming on                # Gaming Mode in the running instance; off to undo
+argus-lasso probalance off           # ProBalance in the running instance; on to undo
+argus-lasso profile "Work"           # load a saved rule profile; no name lists them
 argus-lasso set-affinity 1234 '0-7'   # Linux logical CPU IDs
 argus-lasso kill 1234                # SIGTERM; --force uses SIGKILL
 RUST_LOG=debug argus-lasso           # diagnostics
@@ -168,6 +171,8 @@ RUST_LOG=debug argus-lasso           # diagnostics
 The process-table Delete action has an undo countdown; another pending action
 cancels the previous one. Closing/restarting resumes a pending target. GUI signals
 use stable process handles. The CLI kill command has no undo countdown. File dialogs use `kdialog`, `zenity` or `qarma`; Lutris scanning uses `sqlite3`.
+`gaming`, `probalance` and `profile` need a running instance and fail without one;
+see [controlling a running instance](docs/user-guide.md#controlling-a-running-instance-from-the-command-line).
 
 ## License
 
