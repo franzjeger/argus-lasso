@@ -1297,13 +1297,15 @@ impl ArgusLassoApp {
             Tab::Overview => {
                 self.overview_tab.show(
                     ui,
-                    cpu_history,
-                    cpu_avg,
-                    snapshot,
-                    disk_io_history,
-                    net_io_history,
-                    self.cpu_temp,
-                    self.throttled_count,
+                    &crate::gui::overview_tab::OverviewData {
+                        cpu_history,
+                        cpu_avg,
+                        snapshot,
+                        disk_io_history,
+                        net_io_history,
+                        cpu_temp: self.cpu_temp,
+                        throttled_count: self.throttled_count,
+                    },
                 );
             }
 
