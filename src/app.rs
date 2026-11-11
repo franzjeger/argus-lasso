@@ -642,6 +642,7 @@ struct FrameData {
     throttled_pids: Arc<std::collections::HashSet<u32>>,
     suspended_pids: std::collections::HashSet<u32>,
     throttle_infos: Vec<crate::probalance::ThrottleInfo>,
+    throttle_history: Vec<crate::probalance::ThrottleTally>,
     log_lines: std::collections::VecDeque<String>,
     config: Arc<Config>,
     gaming_active: bool,
@@ -771,6 +772,11 @@ impl ArgusLassoApp {
             suspended_pids: Default::default(),
             throttle_infos: if on_pb_tab {
                 s.throttle_infos.clone()
+            } else {
+                Default::default()
+            },
+            throttle_history: if on_pb_tab {
+                s.throttle_history.clone()
             } else {
                 Default::default()
             },
@@ -1278,6 +1284,7 @@ impl ArgusLassoApp {
         let FrameData {
             ref snapshot,
             ref throttle_infos,
+            ref throttle_history,
             ref hw_monitor,
             ref cpu_history,
             ref disk_io_history,
@@ -1305,10 +1312,13 @@ impl ArgusLassoApp {
             Tab::Rules => self.show_rules_tab(ui, ctx, frame),
 
             Tab::ProBalance => {
-                if let Some(pb_cfg) =
-                    self.probalance_tab
-                        .show(ui, snapshot, throttle_infos, cpu_avg)
-                {
+                if let Some(pb_cfg) = self.probalance_tab.show(
+                    ui,
+                    snapshot,
+                    throttle_infos,
+                    throttle_history,
+                    cpu_avg,
+                ) {
                     self.update_config(|c| c.probalance = pb_cfg);
                     self.save_config();
                 }

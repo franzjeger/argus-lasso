@@ -140,6 +140,8 @@ pub struct AppState {
     pub throttled_pids: Arc<HashSet<u32>>,
     /// Detailed throttle info for ProBalance tab live view
     pub throttle_infos: Vec<crate::probalance::ThrottleInfo>,
+    /// What ProBalance has throttled since the app started, most often first.
+    pub throttle_history: Vec<crate::probalance::ThrottleTally>,
     /// Log lines ring buffer (max 2000)
     pub log_lines: std::collections::VecDeque<String>,
     /// Current config (read by GUI for settings display)
@@ -733,6 +735,8 @@ struct Daemon {
     last_snapshot: Instant,
     last_sensors: Instant,
     last_io_sample: Instant,
+    /// When the ProBalance history was last summarised in the log.
+    last_history_note: Instant,
     toggle_dir: std::path::PathBuf,
 }
 
@@ -797,6 +801,7 @@ impl Daemon {
             last_snapshot: now,
             last_sensors: now - Duration::from_secs(1),
             last_io_sample: now,
+            last_history_note: now,
             toggle_dir: crate::config::config_dir(),
         }
     }
@@ -834,6 +839,15 @@ impl Daemon {
             }
             if probalance_due {
                 self.tick_probalance(now);
+                // Once a day of uptime, what the throttling has amounted to.
+                if now.duration_since(self.last_history_note) >= Duration::from_secs(24 * 3600) {
+                    self.last_history_note = now;
+                    if let Some(summary) =
+                        crate::probalance::history_summary(&self.probalance.history())
+                    {
+                        (self.log)(summary);
+                    }
+                }
             }
             if now.duration_since(self.last_sensors) >= Duration::from_secs(1) {
                 if self.sensors_wanted(watched) {
@@ -1092,6 +1106,9 @@ impl Daemon {
 
     fn shutdown(&mut self) {
         (self.log)("[Shutdown] Restoring system state…".into());
+        if let Some(summary) = crate::probalance::history_summary(&self.probalance.history()) {
+            (self.log)(summary);
+        }
         // Parked CPUs first: they matter to the whole system, and the rest
         // (a pkexec per gaming nice, systemctl per throttled unit) can take
         // long enough for the exit to cut it off.
@@ -1489,6 +1506,7 @@ impl Daemon {
             s.cpu_generation = s.cpu_generation.wrapping_add(1);
             s.throttled_pids = Arc::new(throttled);
             s.throttle_infos = throttle_infos;
+            s.throttle_history = self.probalance.history();
             s.cpu_avg = self.avg;
             push_capped(&mut s.cpu_history, self.avg, 120);
             // Aggregate disk/net totals for the Overview graphs
