@@ -342,6 +342,258 @@ fn lock_instance_in(
     }
 }
 
+/// Run a one-shot subcommand. The GUI is not started.
+fn run_command(cmd: Cmd) {
+    match cmd {
+        Cmd::BuildInfo => {
+            println!(
+                "{}",
+                serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "build_id": argus_ipc::BUILD_ID,
+                "protocol": argus_ipc::PROTOCOL_VERSION, "arch": std::env::consts::ARCH })
+            );
+        }
+        Cmd::RollbackUpdate => {
+            let _lock = match acquire_single_instance_lock() {
+                Ok(Some(lock)) => lock,
+                Ok(None) => {
+                    eprintln!("Close Argus before rollback.");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Cannot confirm Argus is closed ({e}); rollback cancelled.");
+                    std::process::exit(1);
+                }
+            };
+            match updater::rollback_update() {
+                Ok(true) => {
+                    println!("Previous app and overlay restored. Restart Argus and games.")
+                }
+                Ok(false) => {
+                    eprintln!("No previous installation is available.");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("Rollback failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Cmd::Record { seconds } => match argus_ipc::capture::toggle(seconds) {
+            Ok(c) => println!(
+                "{}",
+                if c.active {
+                    "Recording requested"
+                } else {
+                    "Recording stopped"
+                }
+            ),
+            Err(e) => {
+                eprintln!("Recording failed: {e}");
+                std::process::exit(1);
+            }
+        },
+        Cmd::Kill { pid, force } => match kill_cli_pid(pid, force) {
+            Ok(()) => println!("{}illed PID {pid}", if force { "Force k" } else { "K" }),
+            Err(e) => {
+                eprintln!("Kill failed: {e}");
+                std::process::exit(1);
+            }
+        },
+        Cmd::SetAffinity { pid, mask } => match utils::set_affinity(pid, &mask) {
+            Ok(()) => println!("Affinity set to '{mask}' for PID {pid}"),
+            Err(e) => {
+                eprintln!("Failed to set affinity for PID {pid}: {e}");
+                std::process::exit(1);
+            }
+        },
+        Cmd::Status { top } => {
+            let mut procs = monitor::oneshot_snapshot();
+            procs.sort_by(|a, b| {
+                b.cpu_percent
+                    .partial_cmp(&a.cpu_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.pid.cmp(&b.pid))
+            });
+            let total_count = procs.len();
+            if top > 0 {
+                procs.truncate(top);
+            }
+            let load = std::fs::read_to_string("/proc/loadavg")
+                .ok()
+                .map(|s| {
+                    s.split_whitespace()
+                        .take(3)
+                        .filter_map(|v| v.parse::<f64>().ok())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut offline: Vec<u32> = utils::get_offline_cpus().into_iter().collect();
+            offline.sort_unstable();
+            let json = serde_json::json!({
+                "cpu_percent_scale": "share_of_total_available_capacity",
+                "cpu_model": monitor::read_cpu_model(),
+                "cpus_online": utils::get_online_cpus().len(),
+                "cpus_offline": offline,
+                "load_avg": load,
+                "process_count": total_count,
+                "processes": procs.iter().map(|p| serde_json::json!({
+                    "pid": p.pid,
+                    "name": p.name.as_ref(),
+                    "cpu_percent": (p.cpu_percent as f64 * 10.0).round() / 10.0,
+                    "mem_bytes": p.mem_rss,
+                    "nice": p.nice,
+                    "affinity": p.affinity.as_ref(),
+                })).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        }
+        Cmd::ToggleOverlay => {
+            if let Err(e) = overlay_toggle::request(&config::config_dir()) {
+                eprintln!("Failed to request toggle: {e}");
+                std::process::exit(1);
+            }
+            println!("Overlay toggle requested.");
+        }
+        Cmd::Gaming { state } => {
+            let on = state == Switch::On;
+            exit_with(
+                send_control(&overlay_toggle::Control::Gaming(on))
+                    .map(|()| format!("Gaming Mode {} requested.", state.word())),
+            );
+        }
+        Cmd::Probalance { state } => {
+            let on = state == Switch::On;
+            exit_with(
+                send_control(&overlay_toggle::Control::ProBalance(on))
+                    .map(|()| format!("ProBalance {} requested.", state.word())),
+            );
+        }
+        Cmd::Profile { name } => {
+            let mut saved: Vec<String> = config::load(false).0.rule_profiles.into_keys().collect();
+            saved.sort();
+            let Some(name) = name else {
+                if saved.is_empty() {
+                    println!("No rule profiles are saved yet.");
+                }
+                for name in saved {
+                    println!("{name}");
+                }
+                return;
+            };
+            exit_with(pick_rule_profile(&saved, &name).and_then(|name| {
+                send_control(&overlay_toggle::Control::Profile(name.clone()))
+                    .map(|()| format!("Rule profile '{name}' requested."))
+            }));
+        }
+        Cmd::InstallHelpers => {
+            let (installed, message) = cpu_park::install_helper_via_pkexec();
+            println!("{message}");
+            if !installed {
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Take the single-instance lock, which keeps a second instance (launched
+/// from the app menu while the tray service runs, say) from clobbering
+/// config.toml. Held for the whole process lifetime and released on exit.
+/// Break: another instance is running, and this launch was handed to it.
+fn claim_single_instance(
+    minimized: bool,
+) -> std::ops::ControlFlow<(), Option<nix::fcntl::Flock<std::fs::File>>> {
+    use std::ops::ControlFlow;
+    ControlFlow::Continue(match acquire_single_instance_lock() {
+        Ok(Some(lock)) => {
+            // Requests left while no instance ran are not for this one:
+            // a --minimized start must not come up showing because of
+            // an old launch.
+            overlay_toggle::drain_show_window(&config::config_dir());
+            // Nor is a command: Gaming Mode asked of an instance that
+            // has since exited must not switch on at the next login.
+            overlay_toggle::drain_control(&config::config_dir());
+            Some(lock)
+        }
+        Ok(None) => {
+            // Launching from the app menu while the tray service runs
+            // should bring up the existing window, not do nothing. A
+            // --minimized launch is a session start, which has nothing
+            // to show.
+            if minimized {
+                eprintln!("Argus-Lasso is already running.");
+            } else {
+                match overlay_toggle::request_show_window(&config::config_dir()) {
+                    Ok(()) => eprintln!("Argus-Lasso is already running; showing its window."),
+                    Err(e) => eprintln!(
+                    "Argus-Lasso is already running, and could not be asked to show its window: {e}"
+                ),
+                }
+            }
+            return ControlFlow::Break(());
+        }
+        // Not being able to create the lock is not evidence of another
+        // instance; say what is unprotected and carry on.
+        Err(e) => {
+            eprintln!(
+                "Warning: no single-instance lock ({e}); a second instance \
+             could overwrite this one's settings."
+            );
+            None
+        }
+    })
+}
+
+/// The system tray icon, over D-Bus StatusNotifierItem (KDE/freedesktop, no
+/// libxdo). None when the service could not be started.
+fn start_tray(
+    state: &Arc<Mutex<monitor::AppState>>,
+    cmd_tx: &crossbeam_channel::Sender<monitor::DaemonCmd>,
+    gui_context: &gui::SharedContext,
+) -> Option<ksni::blocking::Handle<ArgusLassoTray>> {
+    use ksni::blocking::TrayMethods;
+    // Shown unless the tray says otherwise while it registers.
+    if let Ok(mut s) = state.lock() {
+        s.tray_available = true;
+    }
+    match (ArgusLassoTray {
+        state: Arc::clone(state),
+        cmd_tx: cmd_tx.clone(),
+        context: Arc::clone(gui_context),
+    })
+    .assume_sni_available(true)
+    .spawn()
+    {
+        Ok(h) => {
+            // Shown or waiting for the desktop's tray; the tray logs which.
+            log::info!("Tray icon service started");
+            Some(h)
+        }
+        Err(e) => {
+            log::warn!("Tray icon unavailable: {e}");
+            None
+        }
+    }
+}
+
+/// The configuration to start with, and what to tell the user when the
+/// stored one could not be read.
+fn load_config(tour: bool, tour_theme: Option<&str>) -> (config::Config, Option<String>) {
+    // The tour renders a throwaway session: it must not write a config,
+    // which migrating an old one would.
+    let (mut cfg, load_error) = config::load(!tour);
+    if tour {
+        ui_tour::prepare_config(&mut cfg, tour_theme);
+    }
+    // Set the unreadable file aside before anything can save over it — but
+    // never from the read-only tour, which must not write configuration.
+    let notice = match load_error {
+        Some(error) if !tour => Some(config::preserve_unreadable(&error)),
+        Some(error) => Some(format!("Settings {error}. Defaults are in use.")),
+        None => None,
+    };
+    (cfg, notice)
+}
+
 fn main() {
     logfile::init_logger();
 
@@ -349,219 +601,19 @@ fn main() {
 
     // Handle CLI subcommands — run action and exit without launching the GUI.
     if let Some(cmd) = args.command {
-        match cmd {
-            Cmd::BuildInfo => {
-                println!(
-                    "{}",
-                    serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "build_id": argus_ipc::BUILD_ID,
-                    "protocol": argus_ipc::PROTOCOL_VERSION, "arch": std::env::consts::ARCH })
-                );
-                return;
-            }
-            Cmd::RollbackUpdate => {
-                let _lock = match acquire_single_instance_lock() {
-                    Ok(Some(lock)) => lock,
-                    Ok(None) => {
-                        eprintln!("Close Argus before rollback.");
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("Cannot confirm Argus is closed ({e}); rollback cancelled.");
-                        std::process::exit(1);
-                    }
-                };
-                match updater::rollback_update() {
-                    Ok(true) => {
-                        println!("Previous app and overlay restored. Restart Argus and games.")
-                    }
-                    Ok(false) => {
-                        eprintln!("No previous installation is available.");
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("Rollback failed: {e}");
-                        std::process::exit(1);
-                    }
-                }
-                return;
-            }
-            Cmd::Record { seconds } => {
-                match argus_ipc::capture::toggle(seconds) {
-                    Ok(c) => println!(
-                        "{}",
-                        if c.active {
-                            "Recording requested"
-                        } else {
-                            "Recording stopped"
-                        }
-                    ),
-                    Err(e) => {
-                        eprintln!("Recording failed: {e}");
-                        std::process::exit(1);
-                    }
-                }
-                return;
-            }
-            Cmd::Kill { pid, force } => {
-                match kill_cli_pid(pid, force) {
-                    Ok(()) => println!("{}illed PID {pid}", if force { "Force k" } else { "K" }),
-                    Err(e) => {
-                        eprintln!("Kill failed: {e}");
-                        std::process::exit(1);
-                    }
-                }
-                return;
-            }
-            Cmd::SetAffinity { pid, mask } => {
-                match utils::set_affinity(pid, &mask) {
-                    Ok(()) => println!("Affinity set to '{mask}' for PID {pid}"),
-                    Err(e) => {
-                        eprintln!("Failed to set affinity for PID {pid}: {e}");
-                        std::process::exit(1);
-                    }
-                }
-                return;
-            }
-            Cmd::Status { top } => {
-                let mut procs = monitor::oneshot_snapshot();
-                procs.sort_by(|a, b| {
-                    b.cpu_percent
-                        .partial_cmp(&a.cpu_percent)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.pid.cmp(&b.pid))
-                });
-                let total_count = procs.len();
-                if top > 0 {
-                    procs.truncate(top);
-                }
-                let load = std::fs::read_to_string("/proc/loadavg")
-                    .ok()
-                    .map(|s| {
-                        s.split_whitespace()
-                            .take(3)
-                            .filter_map(|v| v.parse::<f64>().ok())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let mut offline: Vec<u32> = utils::get_offline_cpus().into_iter().collect();
-                offline.sort_unstable();
-                let json = serde_json::json!({
-                    "cpu_percent_scale": "share_of_total_available_capacity",
-                    "cpu_model": monitor::read_cpu_model(),
-                    "cpus_online": utils::get_online_cpus().len(),
-                    "cpus_offline": offline,
-                    "load_avg": load,
-                    "process_count": total_count,
-                    "processes": procs.iter().map(|p| serde_json::json!({
-                        "pid": p.pid,
-                        "name": p.name.as_ref(),
-                        "cpu_percent": (p.cpu_percent as f64 * 10.0).round() / 10.0,
-                        "mem_bytes": p.mem_rss,
-                        "nice": p.nice,
-                        "affinity": p.affinity.as_ref(),
-                    })).collect::<Vec<_>>(),
-                });
-                println!("{}", serde_json::to_string_pretty(&json).unwrap());
-                return;
-            }
-            Cmd::ToggleOverlay => {
-                if let Err(e) = overlay_toggle::request(&config::config_dir()) {
-                    eprintln!("Failed to request toggle: {e}");
-                    std::process::exit(1);
-                }
-                println!("Overlay toggle requested.");
-                return;
-            }
-            Cmd::Gaming { state } => {
-                let on = state == Switch::On;
-                exit_with(
-                    send_control(&overlay_toggle::Control::Gaming(on))
-                        .map(|()| format!("Gaming Mode {} requested.", state.word())),
-                );
-            }
-            Cmd::Probalance { state } => {
-                let on = state == Switch::On;
-                exit_with(
-                    send_control(&overlay_toggle::Control::ProBalance(on))
-                        .map(|()| format!("ProBalance {} requested.", state.word())),
-                );
-            }
-            Cmd::Profile { name } => {
-                let mut saved: Vec<String> =
-                    config::load(false).0.rule_profiles.into_keys().collect();
-                saved.sort();
-                let Some(name) = name else {
-                    if saved.is_empty() {
-                        println!("No rule profiles are saved yet.");
-                    }
-                    for name in saved {
-                        println!("{name}");
-                    }
-                    return;
-                };
-                exit_with(pick_rule_profile(&saved, &name).and_then(|name| {
-                    send_control(&overlay_toggle::Control::Profile(name.clone()))
-                        .map(|()| format!("Rule profile '{name}' requested."))
-                }));
-            }
-            Cmd::InstallHelpers => {
-                let (installed, message) = cpu_park::install_helper_via_pkexec();
-                println!("{message}");
-                if !installed {
-                    std::process::exit(1);
-                }
-                return;
-            }
-        }
+        run_command(cmd);
+        return;
     }
 
-    // ── Single-instance guard ──────────────────────────────────────────────
-    // Prevents a second instance (e.g. launched from the app menu while the
-    // tray service runs) from clobbering config.toml. Held for the whole
-    // process lifetime; released automatically on exit.
     // --ui-tour is a throwaway render pass that never writes config, so it
-    // is exempt: requiring the lock would mean stopping the running instance
-    // just to re-take screenshots.
+    // is exempt from the single-instance lock: requiring it would mean
+    // stopping the running instance just to re-take screenshots.
     let _instance_lock = if args.ui_tour.is_some() {
         None
     } else {
-        match acquire_single_instance_lock() {
-            Ok(Some(lock)) => {
-                // Requests left while no instance ran are not for this one:
-                // a --minimized start must not come up showing because of
-                // an old launch.
-                overlay_toggle::drain_show_window(&config::config_dir());
-                // Nor is a command: Gaming Mode asked of an instance that
-                // has since exited must not switch on at the next login.
-                overlay_toggle::drain_control(&config::config_dir());
-                Some(lock)
-            }
-            Ok(None) => {
-                // Launching from the app menu while the tray service runs
-                // should bring up the existing window, not do nothing. A
-                // --minimized launch is a session start, which has nothing
-                // to show.
-                if args.minimized {
-                    eprintln!("Argus-Lasso is already running.");
-                } else {
-                    match overlay_toggle::request_show_window(&config::config_dir()) {
-                        Ok(()) => eprintln!("Argus-Lasso is already running; showing its window."),
-                        Err(e) => eprintln!(
-                            "Argus-Lasso is already running, and could not be asked to show its window: {e}"
-                        ),
-                    }
-                }
-                return;
-            }
-            // Not being able to create the lock is not evidence of another
-            // instance; say what is unprotected and carry on.
-            Err(e) => {
-                eprintln!(
-                    "Warning: no single-instance lock ({e}); a second instance \
-                     could overwrite this one's settings."
-                );
-                None
-            }
+        match claim_single_instance(args.minimized) {
+            std::ops::ControlFlow::Continue(lock) => lock,
+            std::ops::ControlFlow::Break(()) => return,
         }
     };
 
@@ -581,20 +633,8 @@ fn main() {
     // Build icon RGBA once; reused for window decoration icon.
     let icon_rgba = make_icon_rgba();
 
-    // Load config
-    // The tour renders a throwaway session: it must not write a config,
-    // which migrating an old one would.
-    let (mut cfg, load_error) = config::load(args.ui_tour.is_none());
-    if args.ui_tour.is_some() {
-        ui_tour::prepare_config(&mut cfg, args.tour_theme.as_deref());
-    }
-    // Set the unreadable file aside before anything can save over it — but
-    // never from the read-only tour, which must not write configuration.
-    let load_notice = match load_error {
-        Some(error) if args.ui_tour.is_none() => Some(config::preserve_unreadable(&error)),
-        Some(error) => Some(format!("Settings {error}. Defaults are in use.")),
-        None => None,
-    };
+    let tour = args.ui_tour.is_some();
+    let (cfg, load_notice) = load_config(tour, args.tour_theme.as_deref());
 
     // Termination signals are taken by one thread, below: blocked here,
     // before any other thread starts, so every thread inherits the mask.
@@ -661,32 +701,10 @@ fn main() {
         );
     }
 
-    // System tray via D-Bus StatusNotifierItem (KDE/freedesktop, no libxdo).
-    // Spawned after state + cmd_tx exist so the menu can read/toggle gaming mode.
+    // Started after the state and the command channel exist, so the menu
+    // can read and toggle Gaming Mode.
     let _tray_handle = if !args.no_tray && args.ui_tour.is_none() {
-        use ksni::blocking::TrayMethods;
-        // Shown unless the tray says otherwise while it registers.
-        if let Ok(mut s) = state.lock() {
-            s.tray_available = true;
-        }
-        match (ArgusLassoTray {
-            state: Arc::clone(&state),
-            cmd_tx: cmd_tx.clone(),
-            context: Arc::clone(&gui_context),
-        })
-        .assume_sni_available(true)
-        .spawn()
-        {
-            Ok(h) => {
-                // Shown or waiting for the desktop's tray; the tray logs which.
-                log::info!("Tray icon service started");
-                Some(h)
-            }
-            Err(e) => {
-                log::warn!("Tray icon unavailable: {e}");
-                None
-            }
-        }
+        start_tray(&state, &cmd_tx, &gui_context)
     } else {
         None
     };
