@@ -87,7 +87,7 @@ png = "0.18"
 ureq = { version = "3.3.0", features = ["rustls"] }
 sha2 = "0.11.0"
 minisign-verify = "0.3.0"
-ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "global_shortcuts"] }
+ashpd = { version = "0.14.0", default-features = false, features = ["async-io", "global_shortcuts"] }
 async-io = "2"
 futures-util = "0.3"
 shlex = "2"
