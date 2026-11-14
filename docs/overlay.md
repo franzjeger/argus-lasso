@@ -56,6 +56,44 @@ between comparisons. Disable unrelated overlays unless they are the consistent
 external measurement tool. Repeat and rotate cases; report the measurement window
 and variation. Turning off the entire daemon would confound this comparison.
 
+## Frame rate limit
+
+**Gaming → Overlay → Limit frame rate** holds every game that loads the layer to
+a number of frames per second, from 10 to 1000. It is off by default. A change
+applies at once to running games, also from the command line:
+
+```text
+argus-lasso fps-limit 120
+argus-lasso fps-limit off
+```
+
+For one game, set its own cap in the Steam launch options; it wins over the
+setting above, and `0` exempts the game:
+
+```text
+ARGUS_LASSO_HUD=1 ARGUS_LASSO_FPS_LIMIT=60 %command%
+```
+
+The cap applies whether or not the HUD is shown, including with
+`ARGUS_LASSO_DRAW=0`, but only where the layer is active: a game it is not
+loaded for is not limited.
+
+The layer waits just before each frame is presented. The frames come evenly
+spaced, but the game has already read input and rendered by then, so **a game's
+own limiter gives lower input latency; prefer it where there is one.** The layer
+sleeps most of the wait and spins the last quarter millisecond to land on time,
+which costs a little CPU on the presenting thread. A game slower than the cap is
+never hurried to catch up.
+
+Limits of this first version:
+
+- Vulkan only, like the HUD: DXVK and VKD3D games are covered, OpenGL ones not.
+- It counts the presents that pass through the layer. Whether frames made by
+  DLSS or FSR frame generation do has not been measured; with frame generation
+  on, compare the HUD's FPS with the game's own counter before relying on it.
+- There is no variable-refresh-rate automation; pick a cap a few frames under
+  the display's refresh rate yourself.
+
 ## Rendering and update rates
 
 Run `argus-lasso toggle-overlay` to queue a visibility toggle, for example from
@@ -130,11 +168,11 @@ cat ~/.local/share/vulkan/implicit_layer.d/ArgusOverlay.json
 rg libargus_layer /proc/GAME_PID/maps
 ```
 
-Protocol **6** has a checked header and length limit, and a [postcard](https://docs.rs/postcard)
+Protocol **7** has a checked header and length limit, and a [postcard](https://docs.rs/postcard)
 payload (protocol 5 used bincode, which is no longer maintained). Startup logs
 identify builds, protocol and connection status. The daemon replays current
 configuration when a client connects. IPC uses the user's private runtime socket,
-plus a private `~/.local/share/argus-lasso/ipc/overlay-v6.sock` fallback visible
+plus a private `~/.local/share/argus-lasso/ipc/overlay-v7.sock` fallback visible
 inside the tested Steam runtime. The socket names carry the protocol version, so a
 game still running a layer from before an update shows "Telemetry disconnected"
 until it is restarted, rather than misreading messages. `ARGUS_LASSO_SOCKET` supplies an exclusive diagnostic override.

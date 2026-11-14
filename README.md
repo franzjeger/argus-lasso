@@ -162,6 +162,7 @@ argus-lasso status --top 10          # JSON snapshot
 argus-lasso install-helpers          # CPU control helpers; asks for authentication
 argus-lasso gaming on                # Gaming Mode in the running instance; off to undo
 argus-lasso probalance off           # ProBalance in the running instance; on to undo
+argus-lasso fps-limit 120            # cap games' frame rate through the layer; off to lift
 argus-lasso profile "Work"           # load a saved rule profile; no name lists them
 argus-lasso set-affinity 1234 '0-7'   # Linux logical CPU IDs
 argus-lasso kill 1234                # SIGTERM; --force uses SIGKILL

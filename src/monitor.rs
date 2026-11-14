@@ -966,6 +966,16 @@ impl Daemon {
                 persist_config(&self.state);
             }
             Control::Profile(name) => self.load_rule_profile(&name),
+            Control::FpsLimit(fps) => {
+                let fps = argus_ipc::normalized_fps_limit(fps);
+                if let Ok(mut s) = self.state.lock() {
+                    s.config_mut().gaming_mode.overlay.fps_limit = fps;
+                }
+                (self.log)(format!("[CLI] {} requested.", fps_limit_words(fps)));
+                // Logs the change and sends it to the games' layers.
+                let _ = self.handle(DaemonCmd::ConfigChanged);
+                persist_config(&self.state);
+            }
         }
     }
 
@@ -2026,12 +2036,28 @@ fn on_off(on: bool) -> &'static str {
 /// Log lines for a configuration update: only for what changed. A HUD
 /// slider sends an update on every frame it is dragged, and each one used
 /// to log a line.
+/// A frame-rate cap in words; 0 is no cap.
+pub(crate) fn fps_limit_words(fps: u32) -> String {
+    if fps == 0 {
+        "Frame rate limit off".into()
+    } else {
+        format!("Frame rate limit {fps} FPS")
+    }
+}
+
 fn config_change_notes(before: &Config, after: &Config) -> Vec<String> {
     let mut notes = Vec::new();
     if before.probalance.enabled != after.probalance.enabled {
         notes.push(format!(
             "Config updated — ProBalance {}",
             on_off(after.probalance.enabled)
+        ));
+    }
+    let fps_limit = |c: &Config| c.gaming_mode.overlay.fps_limit;
+    if fps_limit(before) != fps_limit(after) {
+        notes.push(format!(
+            "Config updated — {}",
+            fps_limit_words(fps_limit(after))
         ));
     }
     if before.ui.notifications_enabled != after.ui.notifications_enabled {

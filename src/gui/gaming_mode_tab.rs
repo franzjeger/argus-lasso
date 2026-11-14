@@ -98,6 +98,10 @@ pub struct GamingModeTab {
     /// The shared overlay visibility as this tab last took it (see
     /// `follow_overlay_shown`).
     overlay_shown_seen: bool,
+    /// The shared frame-rate cap as last taken, likewise.
+    fps_limit_seen: u32,
+    /// The cap the checkbox turns on: the last one used, or 60.
+    fps_limit_choice: u32,
     pub topo: Option<CpuTopology>,
     pub topo_description: String,
     /// Mirrors the daemon, which owns Gaming Mode (see `sync_gaming_state`).
@@ -191,6 +195,11 @@ impl GamingModeTab {
 
         let mut tab = Self {
             overlay_shown_seen: config.gaming_mode.overlay.show_overlay,
+            fps_limit_seen: config.gaming_mode.overlay.fps_limit,
+            fps_limit_choice: match config.gaming_mode.overlay.fps_limit {
+                0 => 60,
+                fps => fps,
+            },
             config,
             topo: Some(topo),
             topo_description,
@@ -467,6 +476,60 @@ impl GamingModeTab {
         } else {
             shared
         }
+    }
+
+    /// The frame-rate cap also changes from the CLI; see
+    /// `follow_overlay_shown`.
+    pub fn follow_fps_limit(&mut self, shared: u32) {
+        self.config.gaming_mode.overlay.fps_limit = shared;
+        self.fps_limit_seen = shared;
+        if shared != 0 {
+            self.fps_limit_choice = shared;
+        }
+    }
+
+    /// The cap to store with a config this tab sent; see `overlay_shown`.
+    pub fn fps_limit(&self, sent: u32, shared: u32) -> u32 {
+        if sent != self.fps_limit_seen {
+            sent
+        } else {
+            shared
+        }
+    }
+
+    /// The frame-rate cap's switch and value. True when either changed.
+    fn fps_limit_row(&mut self, ui: &mut Ui) -> bool {
+        let limit = &mut self.config.gaming_mode.overlay.fps_limit;
+        let mut on = *limit != 0;
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            let hover = "Holds every game that loads the overlay layer to this frame rate, \
+                         and applies at once to running games. A game's own limiter gives \
+                         lower input latency; use that where there is one. For one game, \
+                         add ARGUS_LASSO_FPS_LIMIT=<fps> to its launch options (0 exempts it).";
+            if ui
+                .checkbox(&mut on, "Limit frame rate")
+                .on_hover_text(hover)
+                .changed()
+            {
+                *limit = if on { self.fps_limit_choice } else { 0 };
+                changed = true;
+            }
+            let mut fps = self.fps_limit_choice;
+            let range = argus_ipc::FPS_LIMIT_MIN..=argus_ipc::FPS_LIMIT_MAX;
+            if ui
+                .add_enabled(
+                    on,
+                    egui::DragValue::new(&mut fps).range(range).suffix(" FPS"),
+                )
+                .changed()
+            {
+                self.fps_limit_choice = fps;
+                *limit = fps;
+                changed = true;
+            }
+        });
+        changed
     }
 
     pub fn overlay_window(&mut self, ctx: &egui::Context, opacity: f32) -> bool {
@@ -981,6 +1044,7 @@ impl GamingModeTab {
                 &mut self.overlay_settings_open,
                 crate::utils::get_cpu_count(),
             );
+            overlay_changed |= self.fps_limit_row(ui);
             ui.separator();
             let mut global = self.config.ui.global_overlay;
             if ui.checkbox(&mut global, "Automatically show in detected Vulkan games").on_hover_text("Detects Steam/Proton games. Terminal windows and desktop applications are skipped. Restart applications after changing this setting. Other games can opt in with ARGUS_LASSO_HUD=1; disable an individual game with ARGUS_LASSO_HUD_DISABLE=1.").changed() {
@@ -1535,5 +1599,26 @@ mod overlay_tests {
         assert!(tab.overlay_shown(false, true));
         // The user switching it on in this tab wins over the shared value.
         assert!(tab.overlay_shown(true, false));
+    }
+
+    /// The same for the frame-rate cap, which `argus-lasso fps-limit` sets.
+    #[test]
+    fn a_cap_set_elsewhere_survives_the_next_overlay_edit() {
+        let mut tab = GamingModeTab::new(crate::config::Config::default());
+        assert_eq!(tab.fps_limit_choice, 60);
+
+        tab.follow_fps_limit(120);
+        assert_eq!(tab.config.gaming_mode.overlay.fps_limit, 120);
+        // The checkbox now turns on the cap that was last in use.
+        assert_eq!(tab.fps_limit_choice, 120);
+
+        // Another edit sends 120 back while the CLI lifted the cap.
+        assert_eq!(tab.fps_limit(120, 0), 0);
+        // A cap chosen in this tab wins.
+        assert_eq!(tab.fps_limit(90, 120), 90);
+
+        // Lifting the cap keeps the value for the next time it is ticked.
+        tab.follow_fps_limit(0);
+        assert_eq!(tab.fps_limit_choice, 120);
     }
 }

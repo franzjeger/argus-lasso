@@ -185,6 +185,21 @@ fn send_control(control: &overlay_toggle::Control) -> Result<(), String> {
         .map_err(|e| format!("Could not reach the running instance: {e}"))
 }
 
+/// The cap `argus-lasso fps-limit` was given: "off" (or 0) for none,
+/// otherwise frames per second within what the layer accepts.
+fn parse_fps_limit(word: &str) -> Result<u32, String> {
+    let (min, max) = (argus_ipc::FPS_LIMIT_MIN, argus_ipc::FPS_LIMIT_MAX);
+    match word.trim() {
+        "off" | "0" => Ok(0),
+        number => match number.parse::<u32>() {
+            Ok(fps) if (min..=max).contains(&fps) => Ok(fps),
+            _ => Err(format!(
+                "'{word}' is not a frame rate limit: give {min}–{max} frames per second, or 'off'."
+            )),
+        },
+    }
+}
+
 /// The rule profile `wanted` names, or why there is none.
 fn pick_rule_profile(saved: &[String], wanted: &str) -> Result<String, String> {
     if saved.iter().any(|name| name == wanted) {
@@ -239,6 +254,9 @@ enum Cmd {
     Gaming { state: Switch },
     /// Turn ProBalance on or off in the running instance
     Probalance { state: Switch },
+    /// Cap the frame rate of games showing the overlay layer: a number of
+    /// frames per second, or "off". Applies at once to running games.
+    FpsLimit { limit: String },
     /// Replace the active rules with a saved rule profile in the running
     /// instance. Without a name, list the saved profiles.
     Profile { name: Option<String> },
@@ -467,6 +485,12 @@ fn run_command(cmd: Cmd) {
                 send_control(&overlay_toggle::Control::ProBalance(on))
                     .map(|()| format!("ProBalance {} requested.", state.word())),
             );
+        }
+        Cmd::FpsLimit { limit } => {
+            exit_with(parse_fps_limit(&limit).and_then(|fps| {
+                send_control(&overlay_toggle::Control::FpsLimit(fps))
+                    .map(|()| format!("{} requested.", monitor::fps_limit_words(fps)))
+            }));
         }
         Cmd::Profile { name } => {
             let mut saved: Vec<String> = config::load(false).0.rule_profiles.into_keys().collect();
@@ -975,6 +999,20 @@ fn kill_cli_pid(pid: u32, force: bool) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_frame_rate_limit_is_a_number_in_range_or_off() {
+        use super::parse_fps_limit;
+        assert_eq!(parse_fps_limit("off"), Ok(0));
+        assert_eq!(parse_fps_limit("0"), Ok(0));
+        assert_eq!(parse_fps_limit(" 144 "), Ok(144));
+        assert_eq!(parse_fps_limit("10"), Ok(10));
+        assert_eq!(parse_fps_limit("1000"), Ok(1000));
+        // Refused rather than clamped: 5 would otherwise quietly become 10.
+        for bad in ["5", "1001", "-60", "60fps", "", "on"] {
+            assert!(parse_fps_limit(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn a_rule_profile_is_picked_by_exact_name_then_by_name_apart_from_capitals() {
         let saved = ["Work".to_string(), "work".to_string(), "Gaming".to_string()];
