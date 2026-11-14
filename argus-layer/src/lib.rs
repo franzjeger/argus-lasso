@@ -16,6 +16,7 @@ pub mod font;
 pub mod hud;
 mod limiter;
 mod renderer;
+mod status;
 
 use argus_ipc::{IpcMessage, OverlayConfig, TelemetryFrame};
 use ash::vk;
@@ -233,6 +234,7 @@ fn start_ipc_thread() {
                             eprintln!("[Argus-Layer] IPC connected socket={} daemon_build={build} protocol={protocol}", path.display());
                             TELEMETRY.write_or_recover().connected = true;
                             last_error.clear();
+                            status::connected(&stream);
                         }
                         IpcMessage::Telemetry(mut frame) => {
                             sanitize_telemetry_frame(&mut frame);
@@ -245,10 +247,13 @@ fn start_ipc_thread() {
                             tel.received = Some(Instant::now());
                         }
                         IpcMessage::Config(config) => *OVERLAY_CONFIG.write_or_recover() = config,
+                        // Only a layer sends these.
+                        IpcMessage::Status(_) => {}
                     }
                 }
             })();
             TELEMETRY.write_or_recover().connected = false;
+            status::disconnected();
             if let Err(e) = result {
                 let error = e.to_string();
                 if error != last_error {
@@ -947,11 +952,23 @@ pub unsafe extern "system" fn argus_vkCreateSwapchainKHR(
             );
             if !*PASSTHROUGH {
                 init_overlay(device, ci, swapchain);
+            } else if *ACTIVE {
+                status::report(
+                    false,
+                    "HUD drawing is switched off for this game (ARGUS_LASSO_DRAW=0)",
+                );
             }
             vk::Result::SUCCESS
         }),
         || created_result(&created),
     )
+}
+
+/// The HUD is left off the swapchain being created: say why, here and to
+/// the daemon.
+fn skipped(reason: &str) {
+    eprintln!("[Argus-Layer] HUD skipped: {reason}");
+    status::report(false, format!("No HUD: {reason}"));
 }
 
 /// Build the HUD resources for a swapchain the game just created. Any gap in
@@ -967,7 +984,7 @@ unsafe fn init_overlay(
         || ci.image_array_layers != 1
         || ci.flags.contains(vk::SwapchainCreateFlagsKHR::PROTECTED)
     {
-        eprintln!("[Argus-Layer] HUD skipped: unsupported swapchain usage/layers/protection");
+        skipped("the game's swapchain is protected, layered or not a colour attachment");
         return;
     }
     // Images may have no memory until first acquired, and the HUD makes its
@@ -981,7 +998,7 @@ unsafe fn init_overlay(
             .contains(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
             && ci.image_usage.contains(vk::ImageUsageFlags::STORAGE))
     {
-        eprintln!("[Argus-Layer] HUD skipped: deferred-memory or mutable-format storage swapchain");
+        skipped("the game's swapchain defers its memory or is a mutable-format storage image");
         return;
     }
     // The HUD's colours are display-encoded sRGB; an HDR swapchain needs them
@@ -991,10 +1008,10 @@ unsafe fn init_overlay(
         .and_then(|v| renderer::parse_encoding(&v));
     let Some(encoding) = renderer::target_encoding(ci.image_format, ci.image_color_space, forced)
     else {
-        eprintln!(
-            "[Argus-Layer] HUD skipped: colour space {:?} with format {:?} is not supported",
+        skipped(&format!(
+            "colour space {:?} with format {:?} is not supported",
             ci.image_color_space, ci.image_format
-        );
+        ));
         return;
     };
     let hud_nits = renderer::parse_nits(std::env::var("ARGUS_LASSO_HUD_NITS").ok().as_deref());
@@ -1048,9 +1065,13 @@ unsafe fn init_overlay(
                 ci.image_color_space,
                 encoding
             );
+            status::report(
+                true,
+                renderer::describe(ci.image_extent, encoding, ci.image_color_space, forced),
+            );
         }
         None => {
-            eprintln!("[Argus-Layer] WARNING: Could not create overlay resources");
+            skipped("its Vulkan resources could not be created");
         }
     }
 }
@@ -1205,6 +1226,7 @@ unsafe fn submit_overlay(queue: vk::Queue, pi: &vk::PresentInfoKHR) -> Option<vk
         if !state.present_skip_logged {
             state.present_skip_logged = true;
             eprintln!("[Argus-Layer] HUD skipped on this swapchain: {reason}");
+            status::report(false, format!("No HUD: {reason}"));
         }
         return None;
     }

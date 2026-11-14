@@ -17,7 +17,8 @@ use std::io::{self, Read, Write};
 ///
 /// 6: postcard instead of bincode 1, which is no longer maintained.
 /// 7: `OverlayConfig::fps_limit`.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// 8: `IpcMessage::Status`, the first message a layer sends.
+pub const PROTOCOL_VERSION: u32 = 8;
 pub const MAX_MESSAGE_SIZE: usize = 256 * 1024;
 pub const BUILD_ID: &str = env!("ARGUS_BUILD_ID");
 
@@ -104,7 +105,21 @@ pub enum IpcMessage {
     },
     Telemetry(TelemetryFrame),
     Config(OverlayConfig),
+    /// From a layer to the daemon: what became of the HUD in that game.
+    Status(LayerStatus),
 }
+
+/// Whether a game's layer draws the HUD, and if not, why. A game without a
+/// HUD otherwise only says so on stderr, which for a Steam game nobody sees.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct LayerStatus {
+    pub drawing: bool,
+    /// One line for the user; see `MAX_STATUS_DETAIL`.
+    pub detail: String,
+}
+
+/// A status line longer than this is cut by whoever receives it.
+pub const MAX_STATUS_DETAIL: usize = 200;
 
 pub fn encode(msg: &IpcMessage) -> io::Result<Vec<u8>> {
     let data = postcard::to_allocvec(msg).map_err(io::Error::other)?;
@@ -525,6 +540,10 @@ mod tests {
             },
             IpcMessage::Telemetry(TelemetryFrame::default()),
             IpcMessage::Config(OverlayConfig::default()),
+            IpcMessage::Status(LayerStatus {
+                drawing: true,
+                detail: "x".into(),
+            }),
         ];
         for msg in defaults.iter().chain(&samples()) {
             for byte in postcard::to_allocvec(msg).unwrap() {
@@ -533,7 +552,7 @@ mod tests {
         }
         assert_eq!(
             (PROTOCOL_VERSION, hash),
-            (7, 0xe5a8_8077_4c25_9bd2),
+            (8, 0xb7d1_6e74_0acc_5706),
             "the wire encoding changed"
         );
     }

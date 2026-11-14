@@ -56,6 +56,30 @@ between comparisons. Disable unrelated overlays unless they are the consistent
 external measurement tool. Repeat and rotate cases; report the measurement window
 and variation. Turning off the entire daemon would confound this comparison.
 
+## Games and their HUD state
+
+**Gaming → Overlay → Games** lists every game whose layer is connected, with what
+the layer says of its HUD: `HUD on, 3440x1440 HDR10`, or `No HUD:` and the reason,
+such as an unsupported colour space or a present from a queue the HUD cannot
+draw on. The same lines go to the **Log** page, prefixed `[Overlay]`, where they
+can be read after the game has closed. Before this the reason was only written
+to the game's stderr.
+
+`(assumed from the image format)` after HDR10 or scRGB means the swapchain was a
+pass-through one and the layer went by its format; see [HDR](#hdr).
+
+Each row has the game's own settings, which apply at once and are kept for the
+next time it runs:
+
+- **Own frame rate limit** replaces the general limit for this game. 0 means no
+  limit for it.
+- **Hide HUD** keeps the HUD off in this game while it stays on elsewhere.
+
+A game is known by its process name, as the process table shows it
+(`PathOfExileSteam.exe`). Games with settings of their own stay in the list while
+not running; a row whose settings are all back to the general ones is forgotten.
+In `config.toml` they are `[gaming_mode.games."<name>"]` tables.
+
 ## Frame rate limit
 
 **Gaming → Overlay → Limit frame rate** holds every game that loads the layer to
@@ -67,14 +91,18 @@ argus-lasso fps-limit 120
 argus-lasso fps-limit off
 ```
 
-For one game, set its own cap in the Steam launch options; it wins over the
-setting above, and `0` exempts the game:
+For one game, tick **Own frame rate limit** on its row under **Games** in the same
+section (see [Games and their HUD state](#games-and-their-hud-state)), or set the
+cap in its Steam launch options. The launch option wins over both settings, and
+`0` exempts the game:
 
 ```text
 ARGUS_LASSO_HUD=1 ARGUS_LASSO_FPS_LIMIT=60 %command%
 ```
 
-The cap applies whether or not the HUD is shown, including with
+While a cap is in force the HUD's FPS value carries it, as in `60 [cap 60]`, so
+a capped game is not mistaken for a slow one. The cap applies whether or not the
+HUD is shown, including with
 `ARGUS_LASSO_DRAW=0`, but only where the layer is active: a game it is not
 loaded for is not limited.
 
@@ -168,11 +196,11 @@ cat ~/.local/share/vulkan/implicit_layer.d/ArgusOverlay.json
 rg libargus_layer /proc/GAME_PID/maps
 ```
 
-Protocol **7** has a checked header and length limit, and a [postcard](https://docs.rs/postcard)
+Protocol **8** has a checked header and length limit, and a [postcard](https://docs.rs/postcard)
 payload (protocol 5 used bincode, which is no longer maintained). Startup logs
 identify builds, protocol and connection status. The daemon replays current
 configuration when a client connects. IPC uses the user's private runtime socket,
-plus a private `~/.local/share/argus-lasso/ipc/overlay-v7.sock` fallback visible
+plus a private `~/.local/share/argus-lasso/ipc/overlay-v8.sock` fallback visible
 inside the tested Steam runtime. The socket names carry the protocol version, so a
 game still running a layer from before an update shows "Telemetry disconnected"
 until it is restarted, rather than misreading messages. `ARGUS_LASSO_SOCKET` supplies an exclusive diagnostic override.

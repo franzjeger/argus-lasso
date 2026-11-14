@@ -98,6 +98,8 @@ pub struct GamingModeTab {
     /// The shared overlay visibility as this tab last took it (see
     /// `follow_overlay_shown`).
     overlay_shown_seen: bool,
+    /// Games whose layer is connected now, from the daemon.
+    overlay_clients: Vec<crate::monitor::OverlayClient>,
     /// The shared frame-rate cap as last taken, likewise.
     fps_limit_seen: u32,
     /// The cap the checkbox turns on: the last one used, or 60.
@@ -195,6 +197,7 @@ impl GamingModeTab {
 
         let mut tab = Self {
             overlay_shown_seen: config.gaming_mode.overlay.show_overlay,
+            overlay_clients: Vec::new(),
             fps_limit_seen: config.gaming_mode.overlay.fps_limit,
             fps_limit_choice: match config.gaming_mode.overlay.fps_limit {
                 0 => 60,
@@ -497,6 +500,82 @@ impl GamingModeTab {
         }
     }
 
+    /// The games connected now, as the daemon reports them.
+    pub fn follow_overlay_clients(&mut self, clients: &[crate::monitor::OverlayClient]) {
+        if self.overlay_clients != clients {
+            self.overlay_clients = clients.to_vec();
+        }
+    }
+
+    /// One row per game: the ones running now with what their layer says of
+    /// the HUD, and the ones with settings of their own. True when a
+    /// setting changed.
+    fn games_list(&mut self, ui: &mut Ui) -> bool {
+        use crate::gui::theme as th;
+        let rows = game_rows(&self.overlay_clients, &self.config.gaming_mode.games);
+        ui.label(egui::RichText::new("Games").strong());
+        if rows.is_empty() {
+            th::help_text(
+                ui,
+                "No game is showing the overlay layer. A running game appears here with \
+                 the state of its HUD, and can be given a frame rate limit of its own.",
+            );
+            return false;
+        }
+        let general = self.config.gaming_mode.overlay.fps_limit;
+        let mut changed = false;
+        for row in rows {
+            let mut game = self
+                .config
+                .gaming_mode
+                .games
+                .get(&row.name)
+                .cloned()
+                .unwrap_or_default();
+            let before = game.clone();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(&row.name).strong());
+                match &row.status {
+                    Some((true, detail)) => ui.label(detail),
+                    Some((false, detail)) => ui.colored_label(th::Breeze::WARNING, detail),
+                    None => ui.weak("not running"),
+                };
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                let mut own = game.fps_limit.is_some();
+                ui.checkbox(&mut own, "Own frame rate limit").on_hover_text(
+                    "Instead of the limit above, for this game only. 0 means no limit. \
+                     ARGUS_LASSO_FPS_LIMIT in the game's launch options still wins.",
+                );
+                let mut fps = game.fps_limit.unwrap_or(general);
+                ui.add_enabled(
+                    own,
+                    egui::DragValue::new(&mut fps)
+                        // Typing 144 must not cap the game to 1, then 14, on the way.
+                        .update_while_editing(false)
+                        .range(0..=argus_ipc::FPS_LIMIT_MAX)
+                        .suffix(" FPS"),
+                );
+                game.fps_limit = own.then_some(match fps {
+                    0 => 0,
+                    fps => fps.max(argus_ipc::FPS_LIMIT_MIN),
+                });
+                ui.checkbox(&mut game.hide_hud, "Hide HUD");
+            });
+            if game != before {
+                changed = true;
+                let games = &mut self.config.gaming_mode.games;
+                if game.is_default() {
+                    games.remove(&row.name);
+                } else {
+                    games.insert(row.name, game);
+                }
+            }
+        }
+        changed
+    }
+
     /// The frame-rate cap's switch and value. True when either changed.
     fn fps_limit_row(&mut self, ui: &mut Ui) -> bool {
         let limit = &mut self.config.gaming_mode.overlay.fps_limit;
@@ -520,7 +599,11 @@ impl GamingModeTab {
             if ui
                 .add_enabled(
                     on,
-                    egui::DragValue::new(&mut fps).range(range).suffix(" FPS"),
+                    egui::DragValue::new(&mut fps)
+                        // Typing 144 must not cap the game to 1, then 14, on the way.
+                        .update_while_editing(false)
+                        .range(range)
+                        .suffix(" FPS"),
                 )
                 .changed()
             {
@@ -1045,6 +1128,8 @@ impl GamingModeTab {
                 crate::utils::get_cpu_count(),
             );
             overlay_changed |= self.fps_limit_row(ui);
+            ui.separator();
+            overlay_changed |= self.games_list(ui);
             ui.separator();
             let mut global = self.config.ui.global_overlay;
             if ui.checkbox(&mut global, "Automatically show in detected Vulkan games").on_hover_text("Detects Steam/Proton games. Terminal windows and desktop applications are skipped. Restart applications after changing this setting. Other games can opt in with ARGUS_LASSO_HUD=1; disable an individual game with ARGUS_LASSO_HUD_DISABLE=1.").changed() {
@@ -1578,6 +1663,48 @@ mod launcher_tests {
     }
 }
 
+/// A game in the overlay section's list.
+#[derive(Debug, PartialEq)]
+struct GameRow {
+    name: String,
+    /// Whether its HUD is drawn and what its layer says, if it is running.
+    status: Option<(bool, String)>,
+}
+
+/// The games to list: those connected now, then those that only have
+/// settings of their own, each name once.
+fn game_rows(
+    clients: &[crate::monitor::OverlayClient],
+    games: &std::collections::BTreeMap<String, crate::config::GameOverlay>,
+) -> Vec<GameRow> {
+    let mut rows: Vec<GameRow> = Vec::new();
+    for client in clients {
+        // A game can hold several connections (one per process, or a
+        // launcher beside it): the one that draws speaks for the name.
+        match rows.iter_mut().find(|row| row.name == client.name) {
+            Some(row) => {
+                if client.drawing && !matches!(row.status, Some((true, _))) {
+                    row.status = Some((true, client.detail.clone()));
+                }
+            }
+            None => rows.push(GameRow {
+                name: client.name.clone(),
+                status: Some((client.drawing, client.detail.clone())),
+            }),
+        }
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    for name in games.keys() {
+        if !rows.iter().any(|row| row.name == *name) {
+            rows.push(GameRow {
+                name: name.clone(),
+                status: None,
+            });
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod overlay_tests {
     use super::GamingModeTab;
@@ -1599,6 +1726,35 @@ mod overlay_tests {
         assert!(tab.overlay_shown(false, true));
         // The user switching it on in this tab wins over the shared value.
         assert!(tab.overlay_shown(true, false));
+    }
+
+    #[test]
+    fn the_games_list_names_each_game_once_running_ones_first() {
+        use super::{game_rows, GameRow};
+        let client = crate::monitor::OverlayClient::for_test;
+        let clients = [
+            client("Zeta.exe", false, "No HUD: reason"),
+            client("Alpha.exe", false, "Connected"),
+            // A second process of the same game, which does draw.
+            client("Alpha.exe", true, "HUD on, 3440x1440 HDR10"),
+        ];
+        let games = [
+            ("Alpha.exe".to_owned(), Default::default()),
+            ("Stored.exe".to_owned(), Default::default()),
+        ]
+        .into();
+        let row = |name: &str, status: Option<(bool, &str)>| GameRow {
+            name: name.into(),
+            status: status.map(|(drawing, detail)| (drawing, detail.to_owned())),
+        };
+        assert_eq!(
+            game_rows(&clients, &games),
+            [
+                row("Alpha.exe", Some((true, "HUD on, 3440x1440 HDR10"))),
+                row("Zeta.exe", Some((false, "No HUD: reason"))),
+                row("Stored.exe", None),
+            ]
+        );
     }
 
     /// The same for the frame-rate cap, which `argus-lasso fps-limit` sets.

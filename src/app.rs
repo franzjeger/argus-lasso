@@ -556,6 +556,8 @@ impl eframe::App for ArgusLassoApp {
             .follow_overlay_shown(config.gaming_mode.overlay.show_overlay);
         self.gaming_mode_tab
             .follow_fps_limit(config.gaming_mode.overlay.fps_limit);
+        self.gaming_mode_tab
+            .follow_overlay_clients(&frame.overlay_clients);
 
         // Only push CPU bars + history when the daemon has emitted a new sample.
         // The hwmon temp scan (a full /sys/class/hwmon walk) also lives here —
@@ -645,6 +647,7 @@ struct FrameData {
     suspended_pids: std::collections::HashSet<u32>,
     throttle_infos: Vec<crate::probalance::ThrottleInfo>,
     throttle_history: Vec<crate::probalance::ThrottleTally>,
+    overlay_clients: Vec<crate::monitor::OverlayClient>,
     log_lines: std::collections::VecDeque<String>,
     config: Arc<Config>,
     gaming_active: bool,
@@ -786,6 +789,11 @@ impl ArgusLassoApp {
             },
             throttle_history: if on_pb_tab {
                 s.throttle_history.clone()
+            } else {
+                Default::default()
+            },
+            overlay_clients: if self.active_tab == Tab::GamingMode {
+                s.overlay_clients.clone()
             } else {
                 Default::default()
             },

@@ -20,9 +20,18 @@ current source, release and verification status, see [docs/status.md](docs/statu
   and is the better choice where there is one. See
   [docs/overlay.md](docs/overlay.md#frame-rate-limit).
 
+- **Gaming → Overlay → Games** lists the games whose layer is connected and what
+  each says of its HUD, including why there is none; the same lines go to the
+  log as `[Overlay]`. A game without a HUD used to explain itself on stderr
+  only. See [docs/overlay.md](docs/overlay.md#games-and-their-hud-state).
+- A game can have a frame rate limit of its own and its HUD hidden, set on its
+  row in that list and applied at once; the daemon now sends each game its own
+  settings.
+- The HUD shows the frame rate limit in force beside the FPS value.
+
 ### Changed
 
-- The overlay protocol is 7 and its sockets are `overlay-v7.sock`. Restart
+- The overlay protocol is 8 and its sockets are `overlay-v8.sock`. Restart
   running games after updating; until then their HUD shows "Telemetry
   disconnected".
 
