@@ -58,7 +58,7 @@ and variation. Turning off the entire daemon would confound this comparison.
 
 ## Games and their HUD state
 
-**Gaming → Overlay → Games** lists every game whose layer is connected, with what
+**Gaming → Games** has a card for every game whose layer is connected, with what
 the layer says of its HUD: `HUD on, 3440x1440 HDR10`, or `No HUD:` and the reason,
 such as an unsupported colour space or a present from a queue the HUD cannot
 draw on. The same lines go to the **Log** page, prefixed `[Overlay]`, where they
@@ -68,17 +68,15 @@ to the game's stderr.
 `(assumed from the image format)` after HDR10 or scRGB means the swapchain was a
 pass-through one and the layer went by its format; see [HDR](#hdr).
 
-Each row has the game's own settings, which apply at once and are kept for the
-next time it runs:
+The card is the game's profile. Its overlay settings apply at once and are kept
+for the next time the game runs:
 
 - **Own frame rate limit** replaces the general limit for this game. 0 means no
   limit for it.
 - **Hide HUD** keeps the HUD off in this game while it stays on elsewhere.
 
-A game is known by its process name, as the process table shows it
-(`PathOfExileSteam.exe`). Games with settings of their own stay in the list while
-not running; a row whose settings are all back to the general ones is forgotten.
-In `config.toml` they are `[gaming_mode.games."<name>"]` tables.
+The rest of the profile is about Gaming Mode; see
+[Game profiles](user-guide.md#game-profiles) in the user guide.
 
 ## Frame rate limit
 
@@ -91,8 +89,8 @@ argus-lasso fps-limit 120
 argus-lasso fps-limit off
 ```
 
-For one game, tick **Own frame rate limit** on its row under **Games** in the same
-section (see [Games and their HUD state](#games-and-their-hud-state)), or set the
+For one game, tick **Own frame rate limit** on its card under **Gaming → Games**
+(see [Games and their HUD state](#games-and-their-hud-state)), or set the
 cap in its Steam launch options. The launch option wins over both settings, and
 `0` exempts the game:
 

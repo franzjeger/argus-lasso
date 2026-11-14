@@ -20,13 +20,16 @@ current source, release and verification status, see [docs/status.md](docs/statu
   and is the better choice where there is one. See
   [docs/overlay.md](docs/overlay.md#frame-rate-limit).
 
-- **Gaming → Overlay → Games** lists the games whose layer is connected and what
-  each says of its HUD, including why there is none; the same lines go to the
-  log as `[Overlay]`. A game without a HUD used to explain itself on stderr
-  only. See [docs/overlay.md](docs/overlay.md#games-and-their-hud-state).
-- A game can have a frame rate limit of its own and its HUD hidden, set on its
-  row in that list and applied at once; the daemon now sends each game its own
-  settings.
+- Game profiles, on the new **Gaming → Games** page: what differs for one game,
+  chosen from the Steam library or named by its process name. When the game is detected its profile decides whether
+  Gaming Mode comes on, whether the non-preferred CPUs are parked and whether
+  game processes get their priority raised; its overlay can have a frame rate
+  limit of its own and the HUD hidden, applied at once. See
+  [docs/user-guide.md](docs/user-guide.md#game-profiles).
+- The same page shows, for each game whose layer is connected, what it says of
+  its HUD, including why there is none; the same lines go to the log as
+  `[Overlay]`. A game without a HUD used to explain itself on stderr only. See
+  [docs/overlay.md](docs/overlay.md#games-and-their-hud-state).
 - The HUD shows the frame rate limit in force beside the FPS value.
 
 ### Changed
@@ -37,6 +40,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- The Steam and Lutris game pickers ignored every click on their lists, so no
+  game could be chosen. Steam's runtimes and Proton are no longer listed as
+  games.
 - The HUD is drawn in HDR games. It was left off every swapchain that was not
   sRGB, which included all HDR ones, so a game started with
   `PROTON_ENABLE_HDR=1` showed no HUD at all. Its colours are now converted for

@@ -1548,6 +1548,9 @@ impl SteamGamePickerDialog {
                             .collect();
 
                         egui_extras::TableBuilder::new(ui)
+                            // Without a sense the rows report no clicks at
+                            // all, and nothing could be chosen.
+                            .sense(egui::Sense::click())
                             .striped(true)
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                             .column(egui_extras::Column::exact(80.0))
@@ -1561,10 +1564,14 @@ impl SteamGamePickerDialog {
                                         row.set_selected(sel);
 
                                         row.col(|ui| {
-                                            ui.label(appid.as_str());
+                                            ui.add(
+                                                egui::Label::new(appid.as_str()).selectable(false),
+                                            );
                                         });
                                         row.col(|ui| {
-                                            ui.label(name.as_str());
+                                            ui.add(
+                                                egui::Label::new(name.as_str()).selectable(false),
+                                            );
                                         });
 
                                         let resp = row.response();
@@ -1682,6 +1689,9 @@ impl LutrisGamePickerDialog {
                             .collect();
 
                         egui_extras::TableBuilder::new(ui)
+                            // Without a sense the rows report no clicks at
+                            // all, and nothing could be chosen.
+                            .sense(egui::Sense::click())
                             .striped(true)
                             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                             .column(egui_extras::Column::remainder())
@@ -1694,7 +1704,9 @@ impl LutrisGamePickerDialog {
                                         row.set_selected(sel);
 
                                         row.col(|ui| {
-                                            ui.label(label.as_str());
+                                            ui.add(
+                                                egui::Label::new(label.as_str()).selectable(false),
+                                            );
                                         });
 
                                         let resp = row.response();

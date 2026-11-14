@@ -86,6 +86,7 @@ pub enum GamingSection {
     #[default]
     Cpu,
     Launcher,
+    Games,
     Overlay,
     Recording,
     Sensors,
@@ -98,6 +99,15 @@ pub struct GamingModeTab {
     /// The shared overlay visibility as this tab last took it (see
     /// `follow_overlay_shown`).
     overlay_shown_seen: bool,
+    /// The name being typed on the Games page.
+    new_game_name: String,
+    /// Choosing a game for a profile from the Steam library.
+    profile_picker: Option<crate::gui::dialogs::SteamGamePickerDialog>,
+    /// Installed Steam games as (appid, name), for the cards' titles; read
+    /// when the Games page is first shown.
+    steam_library: Option<Vec<(String, String)>>,
+    /// Games added there that have no setting of their own yet.
+    added_games: Vec<String>,
     /// Games whose layer is connected now, from the daemon.
     overlay_clients: Vec<crate::monitor::OverlayClient>,
     /// The shared frame-rate cap as last taken, likewise.
@@ -197,6 +207,10 @@ impl GamingModeTab {
 
         let mut tab = Self {
             overlay_shown_seen: config.gaming_mode.overlay.show_overlay,
+            new_game_name: String::new(),
+            profile_picker: None,
+            steam_library: None,
+            added_games: Vec::new(),
             overlay_clients: Vec::new(),
             fps_limit_seen: config.gaming_mode.overlay.fps_limit,
             fps_limit_choice: match config.gaming_mode.overlay.fps_limit {
@@ -507,23 +521,60 @@ impl GamingModeTab {
         }
     }
 
-    /// One row per game: the ones running now with what their layer says of
-    /// the HUD, and the ones with settings of their own. True when a
-    /// setting changed.
-    fn games_list(&mut self, ui: &mut Ui) -> bool {
+    /// The Games page: one card per game with what differs for it.
+    fn games_section(&mut self, ui: &mut Ui) {
         use crate::gui::theme as th;
-        let rows = game_rows(&self.overlay_clients, &self.config.gaming_mode.games);
-        ui.label(egui::RichText::new("Games").strong());
-        if rows.is_empty() {
+        let mut changed = false;
+        th::card(ui, "Game profiles", |ui| {
             th::help_text(
                 ui,
-                "No game is showing the overlay layer. A running game appears here with \
-                 the state of its HUD, and can be given a frame rate limit of its own.",
+                "What differs for one game: how Gaming Mode treats it when it is detected, \
+                 and what its overlay shows. Choose a game from the Steam library, or name \
+                 any other by its process name, as the Processes page shows it. Games \
+                 showing the overlay are listed while they run.",
             );
-            return false;
-        }
-        let general = self.config.gaming_mode.overlay.fps_limit;
-        let mut changed = false;
+            ui.horizontal(|ui| {
+                ui.label("Add a game");
+                if ui
+                    .button("Steam library…")
+                    .on_hover_text("The profile then covers every process of that Steam game.")
+                    .clicked()
+                {
+                    self.profile_picker = Some(crate::gui::dialogs::SteamGamePickerDialog::new());
+                }
+                ui.label("or");
+                let entry = ui.add(
+                    egui::TextEdit::singleline(&mut self.new_game_name)
+                        .hint_text("process name, e.g. Game.exe")
+                        .desired_width(220.0),
+                );
+                let name = self.new_game_name.trim().to_owned();
+                let enter = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui
+                    .add_enabled(!name.is_empty(), egui::Button::new("Add"))
+                    .clicked()
+                    || enter)
+                    && !name.is_empty()
+                {
+                    // Shown until it has a setting of its own or the page is left.
+                    if !self.added_games.contains(&name) {
+                        self.added_games.push(name);
+                    }
+                    self.new_game_name.clear();
+                }
+            });
+        });
+        let rows = game_rows(
+            &self.overlay_clients,
+            &self.config.gaming_mode.games,
+            &self.added_games,
+        );
+        let library = self
+            .steam_library
+            .get_or_insert_with(crate::game_library::steam_games)
+            .clone();
+        let general_limit = self.config.gaming_mode.overlay.fps_limit;
+        let auto_park = self.config.gaming_mode.auto_park;
         for row in rows {
             let mut game = self
                 .config
@@ -533,47 +584,94 @@ impl GamingModeTab {
                 .cloned()
                 .unwrap_or_default();
             let before = game.clone();
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(&row.name).strong());
+            let (title, known_as) = game_title(&row, &library);
+            th::card(ui, &title, |ui| {
+                if let Some(known_as) = known_as {
+                    ui.weak(known_as);
+                }
                 match &row.status {
                     Some((true, detail)) => ui.label(detail),
                     Some((false, detail)) => ui.colored_label(th::Breeze::WARNING, detail),
-                    None => ui.weak("not running"),
+                    None => ui.weak("Not showing the overlay now"),
                 };
-            });
-            ui.horizontal(|ui| {
-                ui.add_space(16.0);
-                let mut own = game.fps_limit.is_some();
-                ui.checkbox(&mut own, "Own frame rate limit").on_hover_text(
-                    "Instead of the limit above, for this game only. 0 means no limit. \
-                     ARGUS_LASSO_FPS_LIMIT in the game's launch options still wins.",
-                );
-                let mut fps = game.fps_limit.unwrap_or(general);
-                ui.add_enabled(
-                    own,
-                    egui::DragValue::new(&mut fps)
-                        // Typing 144 must not cap the game to 1, then 14, on the way.
-                        .update_while_editing(false)
-                        .range(0..=argus_ipc::FPS_LIMIT_MAX)
-                        .suffix(" FPS"),
-                );
-                game.fps_limit = own.then_some(match fps {
-                    0 => 0,
-                    fps => fps.max(argus_ipc::FPS_LIMIT_MIN),
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("When detected").strong());
+                ui.checkbox(&mut game.no_gaming_mode, "Do not turn on Gaming Mode")
+                    .on_hover_text(
+                        "For a game that does not need it. Gaming Mode switched on by hand \
+                         stays on.",
+                    );
+                ui.add_enabled_ui(!game.no_gaming_mode, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("CPU parking");
+                        let text = |park: Option<bool>| match park {
+                            None if auto_park => "As in general (park)",
+                            None => "As in general (do not park)",
+                            Some(true) => "Park non-preferred CPUs",
+                            Some(false) => "Do not park",
+                        };
+                        egui::ComboBox::from_id_salt(("game_park", &row.name))
+                            .selected_text(text(game.park))
+                            .show_ui(ui, |ui| {
+                                for choice in [None, Some(true), Some(false)] {
+                                    ui.selectable_value(&mut game.park, choice, text(choice));
+                                }
+                            });
+                    });
+                    let mut boost = !game.no_boost;
+                    ui.checkbox(&mut boost, "Raise the priority of game processes");
+                    game.no_boost = !boost;
+                });
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Overlay").strong());
+                ui.horizontal(|ui| {
+                    let mut own = game.fps_limit.is_some();
+                    ui.checkbox(&mut own, "Own frame rate limit").on_hover_text(
+                        "Instead of the general limit, for this game only. 0 means no limit. \
+                         ARGUS_LASSO_FPS_LIMIT in the game's launch options still wins.",
+                    );
+                    let mut fps = game.fps_limit.unwrap_or(general_limit);
+                    ui.add_enabled(
+                        own,
+                        egui::DragValue::new(&mut fps)
+                            // Typing 144 must not cap the game to 1, then 14, on the way.
+                            .update_while_editing(false)
+                            .range(0..=argus_ipc::FPS_LIMIT_MAX)
+                            .suffix(" FPS"),
+                    );
+                    game.fps_limit = own.then_some(match fps {
+                        0 => 0,
+                        fps => fps.max(argus_ipc::FPS_LIMIT_MIN),
+                    });
                 });
                 ui.checkbox(&mut game.hide_hud, "Hide HUD");
+                if !before.is_default()
+                    && ui
+                        .button("Reset to general settings")
+                        .on_hover_text("Forget this game's profile.")
+                        .clicked()
+                {
+                    game = Default::default();
+                }
             });
             if game != before {
                 changed = true;
                 let games = &mut self.config.gaming_mode.games;
                 if game.is_default() {
                     games.remove(&row.name);
+                    // Keep the card while the page is open: it was just edited.
+                    if !self.added_games.contains(&row.name) {
+                        self.added_games.push(row.name);
+                    }
                 } else {
                     games.insert(row.name, game);
                 }
             }
         }
-        changed
+        if changed {
+            self.events
+                .push(GamingEvent::ConfigChanged(Box::new(self.config.clone())));
+        }
     }
 
     /// The frame-rate cap's switch and value. True when either changed.
@@ -637,6 +735,7 @@ impl GamingModeTab {
             &[
                 (GamingSection::Cpu, "CPU & performance"),
                 (GamingSection::Launcher, "Launcher & profiles"),
+                (GamingSection::Games, "Games"),
                 (GamingSection::Overlay, "Overlay"),
                 (GamingSection::Recording, "Recording"),
                 (GamingSection::Sensors, "Sensors"),
@@ -647,6 +746,7 @@ impl GamingModeTab {
             .show(ui, |ui| match self.section {
                 GamingSection::Cpu => self.cpu_section(ui),
                 GamingSection::Launcher => self.launcher_section(ui),
+                GamingSection::Games => self.games_section(ui),
                 GamingSection::Overlay => self.overlay_section(ui),
                 GamingSection::Recording => {
                     crate::gui::theme::card_untitled(ui, |ui| self.benchmark.show(ui))
@@ -1128,8 +1228,11 @@ impl GamingModeTab {
                 crate::utils::get_cpu_count(),
             );
             overlay_changed |= self.fps_limit_row(ui);
-            ui.separator();
-            overlay_changed |= self.games_list(ui);
+            th::help_text(
+                ui,
+                "A game can have its own limit and its HUD hidden: see the Games page, \
+                 which also shows why a game has no HUD.",
+            );
             ui.separator();
             let mut global = self.config.ui.global_overlay;
             if ui.checkbox(&mut global, "Automatically show in detected Vulkan games").on_hover_text("Detects Steam/Proton games. Terminal windows and desktop applications are skipped. Restart applications after changing this setting. Other games can opt in with ARGUS_LASSO_HUD=1; disable an individual game with ARGUS_LASSO_HUD_DISABLE=1.").changed() {
@@ -1226,6 +1329,20 @@ impl GamingModeTab {
                     self.command = format!("steam -applaunch {appid}");
                 }
                 self.steam_picker = None;
+            }
+        }
+        if let Some(picker) = &mut self.profile_picker {
+            if let Some(result) = picker.show(ctx, opacity) {
+                // The picker just read the library: titles for new installs too.
+                self.steam_library = Some(std::mem::take(&mut picker.games));
+                if let Some((appid, _)) = result {
+                    let key = crate::config::steam_profile_key(&appid);
+                    // Shown until it has a setting of its own or the page is left.
+                    if !self.added_games.contains(&key) {
+                        self.added_games.push(key);
+                    }
+                }
+                self.profile_picker = None;
             }
         }
 
@@ -1666,38 +1783,70 @@ mod launcher_tests {
 /// A game in the overlay section's list.
 #[derive(Debug, PartialEq)]
 struct GameRow {
+    /// The key of its profile: a process name, or `steam:<appid>`.
     name: String,
+    /// Its process name, for a Steam game that is running.
+    process: Option<String>,
     /// Whether its HUD is drawn and what its layer says, if it is running.
     status: Option<(bool, String)>,
 }
 
-/// The games to list: those connected now, then those that only have
-/// settings of their own, each name once.
+/// A card's title, and what else the game is known as: a Steam game goes by
+/// its library name, with the app and its running process below.
+fn game_title(row: &GameRow, library: &[(String, String)]) -> (String, Option<String>) {
+    let Some(appid) = crate::config::steam_app_of(&row.name) else {
+        return (row.name.clone(), None);
+    };
+    let app = format!("Steam app {appid}");
+    let known_as = match &row.process {
+        Some(process) => format!("{app} · {process}"),
+        None => app.clone(),
+    };
+    match library.iter().find(|(id, _)| id == appid) {
+        Some((_, title)) => (title.clone(), Some(known_as)),
+        None => (app, row.process.clone()),
+    }
+}
+
+/// The games to list: those connected now, then those that only have a
+/// profile, then those just added; each once. A running Steam game is listed
+/// as the Steam game, unless its process name has a profile already.
 fn game_rows(
     clients: &[crate::monitor::OverlayClient],
-    games: &std::collections::BTreeMap<String, crate::config::GameOverlay>,
+    games: &std::collections::BTreeMap<String, crate::config::GameProfile>,
+    added: &[String],
 ) -> Vec<GameRow> {
     let mut rows: Vec<GameRow> = Vec::new();
     for client in clients {
         // A game can hold several connections (one per process, or a
         // launcher beside it): the one that draws speaks for the name.
-        match rows.iter_mut().find(|row| row.name == client.name) {
+        let steam_key = client
+            .steam_app
+            .as_deref()
+            .filter(|_| !games.contains_key(&client.name))
+            .map(crate::config::steam_profile_key);
+        let process = steam_key.is_some().then(|| client.name.clone());
+        let name = steam_key.unwrap_or_else(|| client.name.clone());
+        match rows.iter_mut().find(|row| row.name == name) {
             Some(row) => {
                 if client.drawing && !matches!(row.status, Some((true, _))) {
                     row.status = Some((true, client.detail.clone()));
+                    row.process = process;
                 }
             }
             None => rows.push(GameRow {
-                name: client.name.clone(),
+                name,
+                process,
                 status: Some((client.drawing, client.detail.clone())),
             }),
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
-    for name in games.keys() {
+    for name in games.keys().chain(added) {
         if !rows.iter().any(|row| row.name == *name) {
             rows.push(GameRow {
                 name: name.clone(),
+                process: None,
                 status: None,
             });
         }
@@ -1745,15 +1894,71 @@ mod overlay_tests {
         .into();
         let row = |name: &str, status: Option<(bool, &str)>| GameRow {
             name: name.into(),
+            process: None,
             status: status.map(|(drawing, detail)| (drawing, detail.to_owned())),
         };
+        let added = ["Zeta.exe".to_owned(), "New.exe".to_owned()];
         assert_eq!(
-            game_rows(&clients, &games),
+            game_rows(&clients, &games, &added),
             [
                 row("Alpha.exe", Some((true, "HUD on, 3440x1440 HDR10"))),
                 row("Zeta.exe", Some((false, "No HUD: reason"))),
                 row("Stored.exe", None),
+                row("New.exe", None),
             ]
+        );
+    }
+
+    /// A running Steam game is one card under its library title, where a
+    /// profile then covers all its processes.
+    #[test]
+    fn a_running_steam_game_is_listed_as_the_steam_game() {
+        use super::{game_rows, game_title, GameRow};
+        let client = crate::monitor::OverlayClient::for_test;
+        let clients = [
+            client("Game.exe", true, "HUD on").of_steam_app("620"),
+            // Its process name has a profile already: that one stays.
+            client("Own.exe", true, "HUD on").of_steam_app("400"),
+        ];
+        let games = [
+            ("Own.exe".to_owned(), Default::default()),
+            ("steam:10".to_owned(), Default::default()),
+        ]
+        .into();
+        let rows = game_rows(&clients, &games, &[]);
+        assert_eq!(
+            rows,
+            [
+                GameRow {
+                    name: "Own.exe".into(),
+                    process: None,
+                    status: Some((true, "HUD on".into())),
+                },
+                GameRow {
+                    name: "steam:620".into(),
+                    process: Some("Game.exe".into()),
+                    status: Some((true, "HUD on".into())),
+                },
+                GameRow {
+                    name: "steam:10".into(),
+                    process: None,
+                    status: None,
+                },
+            ]
+        );
+        let library = [("620".to_owned(), "Portal 2".to_owned())];
+        assert_eq!(game_title(&rows[0], &library), ("Own.exe".to_owned(), None));
+        assert_eq!(
+            game_title(&rows[1], &library),
+            (
+                "Portal 2".to_owned(),
+                Some("Steam app 620 · Game.exe".to_owned())
+            )
+        );
+        // No longer installed: the app number is all there is.
+        assert_eq!(
+            game_title(&rows[2], &library),
+            ("Steam app 10".to_owned(), None)
         );
     }
 

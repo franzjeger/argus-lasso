@@ -642,6 +642,21 @@ pub fn resolve_name(comm: &str, cmdline: &[String]) -> String {
     comm.to_string()
 }
 
+/// The Steam app `pid` was launched as: Steam puts `SteamAppId` in the
+/// environment of every process of a game, launchers and Proton included.
+pub fn steam_app_id(pid: u32) -> Option<String> {
+    steam_app_in(&std::fs::read(format!("/proc/{pid}/environ")).ok()?)
+}
+
+fn steam_app_in(environ: &[u8]) -> Option<String> {
+    environ.split(|byte| *byte == 0).find_map(|var| {
+        let id = std::str::from_utf8(var.strip_prefix(b"SteamAppId=")?).ok()?;
+        // 0 is what a non-Steam shortcut gets.
+        (id != "0" && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| id.to_owned())
+    })
+}
+
 /// Resolve Wine executables even when the application clears argv[0] and comm.
 /// Only inspect maps for Wine hosts without an executable name in argv[0].
 /// Multiple distinct mapped executables are ambiguous, so never guess between them.
@@ -928,6 +943,19 @@ pub(crate) static PROCESS_NICE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mute
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_steam_app_comes_from_the_environment() {
+        let app = |environ: &[u8]| super::steam_app_in(environ);
+        assert_eq!(
+            app(b"HOME=/home/u\0SteamAppId=2694490\0SteamGameId=2694490\0").as_deref(),
+            Some("2694490")
+        );
+        // A non-Steam shortcut, and a process Steam did not start.
+        assert_eq!(app(b"SteamAppId=0\0"), None);
+        assert_eq!(app(b"HOME=/home/u\0NotSteamAppId=5\0"), None);
+        assert_eq!(app(b"SteamAppId=5; rm\0"), None);
+    }
+
     use super::*;
 
     /// A worker thread of this test process, parked until dropped, so its
