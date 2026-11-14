@@ -15,7 +15,7 @@ memory bandwidth benchmarks report decimal GB/s. Temperature readings use °C.
 | Process rules | Persistent rules matched against processes |
 | ProBalance | Automatic priority adjustments, active interventions and exemptions |
 | Gaming → CPU & performance | Gaming mode, logical CPU assignment, parking and CPU control helpers |
-| Gaming → Launcher & profiles | Steam/Lutris game selection and launch profiles |
+| Gaming → Games | Your games: launching, Gaming Mode and overlay settings for each |
 | Gaming → Overlay | Enable the HUD, choose loading behavior and open customization |
 | Gaming → Recording | Start/stop frame captures, configure a shortcut and inspect results |
 | Gaming → Sensors | Optional extended sensor service and its actual availability |
@@ -168,7 +168,7 @@ argus-lasso profile "Work"       # replace the active rules with that profile
 
 ## Gaming, telemetry and windows
 
-Launcher commands support quoted paths and arguments, including spaces. Commands
+A game's launch command on the Games page supports quoted paths and arguments, including spaces. Commands
 are executed directly: shell operators and variable expansion are not evaluated.
 An invalid command or failed launch is shown immediately. If this launch enabled
 CPU parking but the program could not start, that parking is undone.
@@ -206,14 +206,23 @@ The desktop app and game layer always run as the regular user. See
 
 ### Game profiles
 
-**Gaming → Games** holds what differs for one game. **Steam library…** lists the
-installed Steam games; a profile made that way belongs to the Steam game and
-covers every process it starts, whatever the executable is called. Any other
-game is added by its process name, as the Processes page shows it. Games that
-show the overlay get a card while they run. A card whose settings are all back
-to the general ones is forgotten.
+**Gaming → Games** lists your games, one card each, with what differs for that
+game. It replaces the Launcher & profiles page of 1.6 and earlier; the profiles
+saved there are turned into games the first time this version starts (their own
+choice of preferred CPUs is not carried over).
 
-When automatic detection finds the game:
+Add a game from the **Steam library…** or **Lutris…**, or by its process name,
+as the Processes page shows it. A Steam game's settings cover every process it
+starts, whatever the executable is called. Games that show the overlay get a
+card while they run, kept from the first setting changed on it. **Remove game**
+takes a game off the page.
+
+**Launch** starts the game. A Steam or Lutris game needs no command; any other
+needs one in the field beside the button, and one given there is used instead
+for a library game too. While the launched game runs its card shows that, with
+**Force quit game**.
+
+Gaming Mode for the game:
 
 - **Do not turn on Gaming Mode** leaves this game alone. Gaming Mode switched on
   by hand stays on.
@@ -221,16 +230,22 @@ When automatic detection finds the game:
   is set for this game: park the non-preferred CPUs, or do not park.
 - **Raise the priority of game processes** can be turned off for this game.
 
-The log says `Using the profile for …` when a profile applies. A Steam game's
-profile applies from its first process. One stored under a process name applies
-once that process exists: Steam's launchers start a few seconds before it, and
-until then the general settings hold, so with parking on in general and off for
-the game the CPUs are parked for those seconds and brought back. A profile under
-the process name wins over the Steam game's.
+Automatic detection applies this to Steam and Proton games however they were
+started; the log says `Using the profile for …`. A Steam game's settings apply
+from its first process. Those stored under a process name apply once that
+process exists: Steam's launchers start a few seconds before it, and until then
+the general settings hold. Settings under the process name win over the Steam
+game's.
+
+A game detection does not find (a Lutris or other game, or any game with
+detection switched off) gets Gaming Mode when it is launched from its card:
+the CPUs chosen on the CPU & performance page are parked, unless the game says
+not to park, and Gaming Mode is turned off again when the game exits if the
+page's checkbox says so. Its overlay settings apply too when launched this way.
 
 The same card has the game's overlay settings (its own frame rate limit, HUD
 hidden) and, while it runs, the state of its HUD; see
 [docs/overlay.md](overlay.md#games-and-their-hud-state).
 
-In `config.toml` a profile is a `[gaming_mode.games."<process name>"]` or
-`[gaming_mode.games."steam:<appid>"]` table.
+In `config.toml` a game is a `[gaming_mode.games."<key>"]` table, the key being
+a process name, `steam:<appid>` or `lutris:<slug>`.

@@ -20,11 +20,13 @@ current source, release and verification status, see [docs/status.md](docs/statu
   and is the better choice where there is one. See
   [docs/overlay.md](docs/overlay.md#frame-rate-limit).
 
-- Game profiles, on the new **Gaming → Games** page: what differs for one game,
-  chosen from the Steam library or named by its process name. When the game is detected its profile decides whether
-  Gaming Mode comes on, whether the non-preferred CPUs are parked and whether
-  game processes get their priority raised; its overlay can have a frame rate
-  limit of its own and the HUD hidden, applied at once. See
+- The **Gaming → Games** page: your games, one card each, added from the Steam
+  or Lutris library or by process name. A card launches the game and holds what
+  differs for it: whether Gaming Mode comes on, whether the non-preferred CPUs
+  are parked, whether game processes get their priority raised, and for its
+  overlay a frame rate limit of its own and the HUD hidden, applied at once.
+  Steam and Proton games get this however they are started; other games when
+  launched from their card. See
   [docs/user-guide.md](docs/user-guide.md#game-profiles).
 - The same page shows, for each game whose layer is connected, what it says of
   its HUD, including why there is none; the same lines go to the log as
@@ -34,6 +36,10 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Changed
 
+- The Launcher & profiles page is gone: launching is part of each game's card
+  on the Games page. Its saved profiles become games there; a profile's own
+  choice of preferred CPUs is not carried over, the CPU & performance page's
+  choice is used.
 - The overlay protocol is 8 and its sockets are `overlay-v8.sock`. Restart
   running games after updating; until then their HUD shows "Telemetry
   disconnected".

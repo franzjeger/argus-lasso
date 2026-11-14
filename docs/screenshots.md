@@ -35,10 +35,6 @@ context menu, expanded sensor group or process-action confirmation.
 
 <picture><source media="(prefers-color-scheme: dark)" srcset="../assets/screenshots/2026-09-30/dark/gaming-mode.png"><img alt="Gaming — CPU &amp; performance" src="../assets/screenshots/2026-09-30/light/gaming-mode.png"></picture>
 
-## Gaming — Launcher & profiles
-
-<picture><source media="(prefers-color-scheme: dark)" srcset="../assets/screenshots/2026-09-30/dark/gaminglauncher.png"><img alt="Gaming — Launcher &amp; profiles" src="../assets/screenshots/2026-09-30/light/gaminglauncher.png"></picture>
-
 ## Gaming — Overlay
 
 <picture><source media="(prefers-color-scheme: dark)" srcset="../assets/screenshots/2026-09-30/dark/gamingoverlay.png"><img alt="Gaming — Overlay" src="../assets/screenshots/2026-09-30/light/gamingoverlay.png"></picture>

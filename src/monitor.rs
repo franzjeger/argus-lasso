@@ -332,6 +332,8 @@ mod ipc_server {
         pub name: String,
         /// The Steam app it runs as, which they can be stored under too.
         pub steam_app: Option<String>,
+        /// The game the Games page launched it as, likewise.
+        pub launched: Option<String>,
         pub drawing: bool,
         /// What the layer last said about its HUD.
         pub detail: String,
@@ -352,6 +354,7 @@ mod ipc_server {
                 pid: 0,
                 name: name.into(),
                 steam_app: None,
+                launched: None,
                 drawing,
                 detail: detail.into(),
             }
@@ -362,6 +365,9 @@ mod ipc_server {
             self
         }
     }
+
+    /// The Steam app and the launched game a process runs as.
+    pub(super) type RunsAs<'a> = (Option<&'a str>, Option<&'a str>);
 
     #[derive(Default)]
     pub(super) struct Latest {
@@ -387,10 +393,11 @@ mod ipc_server {
             self.telemetry_gen = self.telemetry_gen.wrapping_add(1).max(1);
         }
 
-        /// The settings as process `game` of Steam app `steam_app` gets them.
-        fn config_for(&self, game: &str, steam_app: Option<&str>) -> Option<OverlayConfig> {
+        /// The settings as process `game` gets them, with the Steam app and
+        /// launched game it runs as.
+        fn config_for(&self, game: &str, runs_as: RunsAs) -> Option<OverlayConfig> {
             let general = self.config.as_ref()?;
-            let own = crate::config::profile_key(&self.games, game, steam_app)
+            let own = crate::config::profile_key(&self.games, game, runs_as.0, runs_as.1)
                 .and_then(|key| self.games.get(&key));
             Some(match own {
                 Some(own) => own.apply(general),
@@ -403,14 +410,14 @@ mod ipc_server {
         pub(super) fn next_packets(
             &self,
             game: &str,
-            steam_app: Option<&str>,
+            runs_as: RunsAs,
             sent_config: &mut u64,
             sent_telemetry: &mut u64,
         ) -> [Option<Vec<u8>>; 2] {
             let cfg = (self.config_gen != *sent_config)
                 .then(|| {
                     *sent_config = self.config_gen;
-                    let config = self.config_for(game, steam_app)?;
+                    let config = self.config_for(game, runs_as)?;
                     argus_ipc::encode(&IpcMessage::Config(config)).ok()
                 })
                 .flatten();
@@ -496,7 +503,7 @@ mod ipc_server {
             return;
         }
         let name = client_name(pid);
-        let steam_app = crate::utils::steam_app_id(pid);
+        let (steam_app, launched) = crate::utils::game_identity(pid);
         clients
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -505,6 +512,7 @@ mod ipc_server {
                 pid,
                 name: name.clone(),
                 steam_app: steam_app.clone(),
+                launched: launched.clone(),
                 drawing: false,
                 detail: "Connected; the game has not created a swapchain yet".into(),
             });
@@ -522,7 +530,7 @@ mod ipc_server {
             }
             let packets = latest.next_packets(
                 &name,
-                steam_app.as_deref(),
+                (steam_app.as_deref(), launched.as_deref()),
                 &mut sent_config,
                 &mut sent_telemetry,
             );
@@ -897,7 +905,7 @@ fn detect_gaming<'a>(
         } else {
             None
         };
-        let Some(key) = crate::config::profile_key(games, name, app.as_deref()) else {
+        let Some(key) = crate::config::profile_key(games, name, app.as_deref(), None) else {
             continue;
         };
         let profile = &games[&key];
@@ -2871,14 +2879,14 @@ mod persistence_tests {
 
         // First wake-up sends both initial packets.
         assert_eq!(
-            latest.next_packets("game", None, &mut sent_cfg, &mut sent_tel),
+            latest.next_packets("game", (None, None), &mut sent_cfg, &mut sent_tel),
             [config_packet(&config), Some(vec![4, 5, 6])]
         );
 
         // A 1 Hz telemetry update sends only the telemetry packet, not Config again.
         latest.set_telemetry(vec![7, 8, 9]);
         assert_eq!(
-            latest.next_packets("game", None, &mut sent_cfg, &mut sent_tel),
+            latest.next_packets("game", (None, None), &mut sent_cfg, &mut sent_tel),
             [None, Some(vec![7, 8, 9])]
         );
 
@@ -2889,7 +2897,7 @@ mod persistence_tests {
         };
         latest.set_config(&dragged, &games);
         assert_eq!(
-            latest.next_packets("game", None, &mut sent_cfg, &mut sent_tel),
+            latest.next_packets("game", (None, None), &mut sent_cfg, &mut sent_tel),
             [config_packet(&dragged), None]
         );
     }
@@ -2925,7 +2933,7 @@ mod persistence_tests {
         latest.set_config(&general, &games);
 
         let sent_to = |game: &str| {
-            let [config, _] = latest.next_packets(game, None, &mut 0, &mut 0);
+            let [config, _] = latest.next_packets(game, (None, None), &mut 0, &mut 0);
             match argus_ipc::read_message(&mut config.unwrap().as_slice()).unwrap() {
                 IpcMessage::Config(config) => (config.fps_limit, config.show_overlay),
                 other => panic!("{other:?}"),
@@ -2955,6 +2963,13 @@ mod persistence_tests {
                 "Own.exe".to_owned(),
                 GameProfile {
                     fps_limit: Some(30),
+                    ..Default::default()
+                },
+            ),
+            (
+                "lutris:own".to_owned(),
+                GameProfile {
+                    fps_limit: Some(45),
                     ..Default::default()
                 },
             ),
@@ -2992,7 +3007,8 @@ mod persistence_tests {
         };
         latest.set_config(&general, &games);
         let limit = |game: &str, steam_app: Option<&str>| {
-            let [config, _] = latest.next_packets(game, steam_app, &mut 0, &mut 0);
+            let [config, _] =
+                latest.next_packets(game, (steam_app, Some("lutris:own")), &mut 0, &mut 0);
             match argus_ipc::read_message(&mut config.unwrap().as_slice()).unwrap() {
                 argus_ipc::IpcMessage::Config(config) => config.fps_limit,
                 other => panic!("{other:?}"),
@@ -3000,7 +3016,8 @@ mod persistence_tests {
         };
         assert_eq!(limit("Game.exe", Some("620")), 60);
         assert_eq!(limit("Game.exe", Some("400")), 144);
-        assert_eq!(limit("Game.exe", None), 144);
+        // Not a Steam app, but launched from the Games page as a game there.
+        assert_eq!(limit("Game.exe", None), 45);
         // A profile under the process name is the more specific one.
         assert_eq!(limit("Own.exe", Some("620")), 30);
     }
