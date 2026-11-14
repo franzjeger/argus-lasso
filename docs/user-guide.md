@@ -41,7 +41,7 @@ as a successful disk write.
 window is closed: rules, ProBalance and Gaming Mode carry on, and the window
 comes back from the tray icon, its **Open Argus-Lasso** item or the app menu.
 The tray menu's **Gaming Mode** and **In-game overlay** checkboxes switch those
-on and off without opening the window.
+on and off without opening the window, and **Overlay shows** picks a preset.
 **Quit** in the tray menu stops Argus and restores CPUs and priorities. Without a
 tray icon (`--no-tray`, or a desktop without a tray) the setting is unavailable
 and closing the window quits.
@@ -145,6 +145,7 @@ from a keyboard shortcut, a script or a game launcher:
 argus-lasso gaming on|off        # as the tray's Gaming Mode checkbox
 argus-lasso probalance on|off    # the ProBalance switch; saved like a click
 argus-lasso fps-limit 120|off    # cap games' frame rate; see docs/overlay.md
+argus-lasso overlay-preset minimal|medium|full|next   # what the HUD shows
 argus-lasso profile              # list the saved rule profiles
 argus-lasso profile "Work"       # replace the active rules with that profile
 ```

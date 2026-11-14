@@ -133,7 +133,26 @@ checkbox on **Gaming → Overlay**:
 - the app icon's **Show or hide the in-game overlay** action, in launchers and
   docks that list an application's actions.
 
-They all queue the same request as `argus-lasso toggle-overlay`. Each
+### Presets
+
+**Gaming → Overlay → Shows** picks what the HUD shows in one click, as does the
+tray menu's **Overlay shows** and the command line:
+
+```bash
+argus-lasso overlay-preset minimal   # FPS and frametime
+argus-lasso overlay-preset medium    # frame statistics and graph; GPU, CPU and RAM load, temperature, power, memory
+argus-lasso overlay-preset full      # every reading, with the per-thread list
+argus-lasso overlay-preset next      # step to the next one; bind it to a key
+```
+
+A preset replaces which readings are shown and leaves position, size, colours,
+the CPUs chosen for the thread list and the frame rate limit alone. Running
+games follow at once. Once a reading is switched by hand in **Customize
+overlay** the page says **Custom**, and `next` starts again from minimal.
+
+### Showing and hiding
+
+The four ways above all queue the same request as `argus-lasso toggle-overlay`. Each
 invocation queues a separate request; two
 toggles cancel each other. The running monitor consumes requests on its next
 tick and saves the resulting visibility. If Argus is stopped, requests wait

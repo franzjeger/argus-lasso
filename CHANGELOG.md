@@ -33,6 +33,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
   `[Overlay]`. A game without a HUD used to explain itself on stderr only. See
   [docs/overlay.md](docs/overlay.md#games-and-their-hud-state).
 - The HUD shows the frame rate limit in force beside the FPS value.
+- Overlay presets: **Minimal** (FPS and frametime), **Medium** (frame
+  statistics and graph, with load, temperature, power and memory of the GPU,
+  CPU and RAM) and **Full** (every reading). Pick one on **Gaming → Overlay**,
+  in the tray menu's **Overlay shows**, or with `argus-lasso overlay-preset
+  minimal|medium|full|next`; `next` steps through them from one key. Position,
+  size and colours are kept. See [docs/overlay.md](docs/overlay.md#presets).
 - Quicker ways to show or hide the HUD while playing: an **In-game overlay**
   checkbox in the tray menu, a second portal shortcut beside the recording one
   (suggested Shift+F3, set up on **Gaming → Recording**), and a **Show or hide

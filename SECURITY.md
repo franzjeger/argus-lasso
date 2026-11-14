@@ -30,7 +30,8 @@ What runs with which authority, so a report can say which boundary it crosses:
   authentication. The optional sensor service is a separate systemd unit whose
   output is readable by its group only.
 - **Requests to a running instance** (`toggle-overlay`, `gaming`, `probalance`,
-  `profile`, and a second launch asking for the window) are files in
+  `fps-limit`, `overlay-preset`, `profile`, and a second launch asking for the
+  window) are files in
   `~/.config/argus-lasso/`, in directories created with mode 0700. Anyone who
   can write there can already edit `config.toml`, so they grant nothing new. A
   request holds one line from a fixed vocabulary; anything else is discarded,

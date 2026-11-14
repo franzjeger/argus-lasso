@@ -71,6 +71,7 @@ pub fn show(ui: &mut Ui, config: &mut OverlayConfig, open: &mut bool, _cpu_count
     if !config.show_overlay {
         *open = false;
     }
+    changed |= presets(ui, config);
     super::theme::help_text(
         ui,
         "Choose readings, colors and layout in Customize overlay. To show or hide it \
@@ -79,6 +80,44 @@ pub fn show(ui: &mut Ui, config: &mut OverlayConfig, open: &mut bool, _cpu_count
     );
     changed
 }
+/// One click for what the HUD shows. None is selected once readings have
+/// been chosen by hand in Customize overlay.
+fn presets(ui: &mut Ui, config: &mut OverlayConfig) -> bool {
+    use argus_ipc::OverlayPreset;
+    let mut changed = false;
+    ui.add_enabled_ui(config.show_overlay, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Shows");
+            let current = OverlayPreset::of(config);
+            for preset in OverlayPreset::ALL {
+                let hint = match preset {
+                    OverlayPreset::Minimal => "FPS and frametime only",
+                    OverlayPreset::Medium => {
+                        "Frame statistics and graph; load, temperature, power and memory \
+                         of the GPU, CPU and RAM"
+                    }
+                    OverlayPreset::Full => "Every reading, with the per-thread list",
+                };
+                // Buttons: a selectable label is borderless text while off,
+                // with nothing to show it can be clicked.
+                if ui
+                    .add(egui::Button::new(preset.label()).selected(current == Some(preset)))
+                    .on_hover_text(hint)
+                    .clicked()
+                    && current != Some(preset)
+                {
+                    config.set_content(preset.content());
+                    changed = true;
+                }
+            }
+            if current.is_none() {
+                ui.weak("Custom");
+            }
+        });
+    });
+    changed
+}
+
 pub fn window(
     ctx: &egui::Context,
     config: &mut OverlayConfig,
