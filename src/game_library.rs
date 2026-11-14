@@ -55,6 +55,14 @@ fn manifest_game(text: &str) -> Option<(String, String)> {
     Some((vdf_value(text, "appid")?, vdf_value(text, "name")?))
 }
 
+/// What Steam installs beside the games to run them: nothing to launch or
+/// to give a profile.
+fn is_steam_tool(name: &str) -> bool {
+    name.starts_with("Steam Linux Runtime")
+        || name.starts_with("Proton ")
+        || name == "Steamworks Common Redistributables"
+}
+
 /// Installed Steam apps as (appid, name), sorted by name. Reads the default
 /// library and every library listed in its libraryfolders.vdf.
 pub fn steam_games() -> Vec<(String, String)> {
@@ -98,7 +106,9 @@ fn steam_games_under(roots: &[PathBuf]) -> Vec<(String, String)> {
                     .as_deref()
                     .and_then(manifest_game)
                 {
-                    games.insert(id, name);
+                    if !is_steam_tool(&name) {
+                        games.insert(id, name);
+                    }
                 }
             }
         }
@@ -219,6 +229,18 @@ mod tests {
             manifest("10", "Alpha"),
         )
         .unwrap();
+        // What Steam installs to run the games is not a game.
+        for (id, tool) in [
+            ("1628350", "Steam Linux Runtime 3.0 (sniper)"),
+            ("2805730", "Proton 9.0"),
+            ("228980", "Steamworks Common Redistributables"),
+        ] {
+            std::fs::write(
+                extra.join(format!("steamapps/appmanifest_{id}.acf")),
+                manifest(id, tool),
+            )
+            .unwrap();
+        }
         assert_eq!(
             steam_games_under(&[root.join("steam")]),
             [("10".into(), "Alpha".into()), ("20".into(), "beta".into())]

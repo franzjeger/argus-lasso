@@ -40,6 +40,9 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ### Fixed
 
+- The Steam and Lutris game pickers ignored every click on their lists, so no
+  game could be chosen. Steam's runtimes and Proton are no longer listed as
+  games.
 - The HUD is drawn in HDR games. It was left off every swapchain that was not
   sRGB, which included all HDR ones, so a game started with
   `PROTON_ENABLE_HDR=1` showed no HUD at all. Its colours are now converted for
