@@ -14,6 +14,9 @@ pub struct FrameStats {
     last: Option<Instant>,
     samples: VecDeque<(Instant, f32)>,
     graph: GraphHistory,
+    /// The frame-rate cap in force, 0 for none: shown beside the frame
+    /// rate, where a capped game otherwise looks like a slow one.
+    pub cap: u32,
 }
 impl FrameStats {
     pub fn record(&mut self, now: Instant) {
@@ -260,6 +263,15 @@ fn section(rows: &mut Vec<Row>, mut content: Vec<Row>, dividers: bool) {
     }
     rows.extend(content);
 }
+/// The frame rate, with the cap holding it there if there is one.
+fn fps_text(fps: f32, cap: u32) -> String {
+    if cap == 0 {
+        format!("{fps:>5.0}")
+    } else {
+        format!("{fps:>5.0} [cap {cap}]")
+    }
+}
+
 fn content_rows(
     tel: Option<&TelemetryFrame>,
     status: &str,
@@ -279,7 +291,7 @@ fn content_rows(
         add_row(
             &mut part,
             [
-                f.fps.then(|| cell(Fps, "FPS", format!("{fps:>5.0}"))),
+                f.fps.then(|| cell(Fps, "FPS", fps_text(fps, stats.cap))),
                 f.frametime
                     .then(|| cell(Frametime, "FRAME", format!("{ms:>6.2} ms"))),
             ],
@@ -651,6 +663,11 @@ impl Rasterizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_capped_frame_rate_says_so() {
+        assert_eq!(fps_text(143.6, 0), "  144");
+        assert_eq!(fps_text(59.9, 60), "   60 [cap 60]");
+    }
     #[test]
     fn graph_preserves_short_spikes_and_has_fixed_time_window() {
         let mut g = GraphHistory::default();

@@ -134,6 +134,33 @@ pub fn target_encoding(
     }
 }
 
+/// One line for the user on a swapchain the HUD is drawn on: its size and
+/// what the HUD's colours are written as, and whether that was a guess.
+pub fn describe(
+    extent: vk::Extent2D,
+    encoding: Encoding,
+    color_space: vk::ColorSpaceKHR,
+    forced: Option<Encoding>,
+) -> String {
+    let colours = match encoding {
+        Encoding::Srgb | Encoding::Linear => "SDR",
+        Encoding::Pq => "HDR10",
+        Encoding::ScRgb => "scRGB HDR",
+    };
+    let basis = if color_space != vk::ColorSpaceKHR::PASS_THROUGH_EXT {
+        ""
+    } else if forced == Some(encoding) {
+        " (set with ARGUS_LASSO_HUD_COLORSPACE)"
+    } else {
+        // The swapchain does not say; see `target_encoding`.
+        " (assumed from the image format; ARGUS_LASSO_HUD_COLORSPACE overrides)"
+    };
+    format!(
+        "HUD on, {}x{} {colours}{basis}",
+        extent.width, extent.height
+    )
+}
+
 /// `ARGUS_LASSO_HUD_COLORSPACE`: what a pass-through swapchain holds.
 pub fn parse_encoding(value: &str) -> Option<Encoding> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -674,6 +701,7 @@ impl OverlayState {
                 .last_update
                 .is_none_or(|last| now.duration_since(last).as_millis() >= 250)
         {
+            self.stats.cap = crate::limiter::current();
             self.worker.request(tel, status, config, &self.stats);
             self.last_update = Some(now);
             self.last_config = Some(config.clone());
@@ -1027,6 +1055,33 @@ mod tests {
         assert_eq!(
             target_encoding(F::B8G8R8A8_UNORM, Cs::EXTENDED_SRGB_LINEAR_EXT, None),
             None
+        );
+    }
+
+    #[test]
+    fn the_status_line_says_when_hdr_was_a_guess() {
+        let extent = vk::Extent2D {
+            width: 3440,
+            height: 1440,
+        };
+        assert_eq!(
+            describe(extent, Encoding::Srgb, Cs::SRGB_NONLINEAR, None),
+            "HUD on, 3440x1440 SDR"
+        );
+        assert_eq!(
+            describe(extent, Encoding::Pq, Cs::HDR10_ST2084_EXT, None),
+            "HUD on, 3440x1440 HDR10"
+        );
+        assert!(describe(extent, Encoding::Pq, Cs::PASS_THROUGH_EXT, None)
+            .starts_with("HUD on, 3440x1440 HDR10 (assumed from the image format"));
+        assert_eq!(
+            describe(
+                extent,
+                Encoding::Srgb,
+                Cs::PASS_THROUGH_EXT,
+                Some(Encoding::Srgb)
+            ),
+            "HUD on, 3440x1440 SDR (set with ARGUS_LASSO_HUD_COLORSPACE)"
         );
     }
 

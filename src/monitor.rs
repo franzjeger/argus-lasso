@@ -142,6 +142,8 @@ pub struct AppState {
     pub throttle_infos: Vec<crate::probalance::ThrottleInfo>,
     /// What ProBalance has throttled since the app started, most often first.
     pub throttle_history: Vec<crate::probalance::ThrottleTally>,
+    /// Games whose overlay layer is connected, and what each says of its HUD.
+    pub overlay_clients: Vec<OverlayClient>,
     /// Log lines ring buffer (max 2000)
     pub log_lines: std::collections::VecDeque<String>,
     /// Current config (read by GUI for settings display)
@@ -310,7 +312,9 @@ pub fn shutdown_and_wait(state: &Arc<Mutex<AppState>>, cmd_tx: &Sender<DaemonCmd
 // ── Overlay IPC Server ────────────────────────────────────────────────────────
 
 mod ipc_server {
-    use argus_ipc::IpcMessage;
+    use crate::config::GameOverlay;
+    use argus_ipc::{IpcMessage, OverlayConfig};
+    use std::collections::BTreeMap;
     use std::io::Write;
     use std::os::unix::{
         fs::{DirBuilderExt, PermissionsExt},
@@ -318,39 +322,85 @@ mod ipc_server {
     };
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
+
+    /// A game whose layer is connected now.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OverlayClient {
+        id: u64,
+        pub pid: u32,
+        /// The process name, which is also the key of its own settings.
+        pub name: String,
+        pub drawing: bool,
+        /// What the layer last said about its HUD.
+        pub detail: String,
+    }
+
+    impl OverlayClient {
+        pub(super) fn same_connection(&self, other: &Self) -> bool {
+            self.id == other.id
+        }
+    }
+
+    #[cfg(test)]
+    impl OverlayClient {
+        pub fn for_test(name: &str, drawing: bool, detail: &str) -> Self {
+            Self {
+                // Distinct per name, which is all the tests need.
+                id: name.bytes().map(u64::from).sum(),
+                pid: 0,
+                name: name.into(),
+                drawing,
+                detail: detail.into(),
+            }
+        }
+    }
+
     #[derive(Default)]
     pub(super) struct Latest {
-        config: Option<Vec<u8>>,
+        config: Option<OverlayConfig>,
+        games: BTreeMap<String, GameOverlay>,
         telemetry: Option<Vec<u8>>,
         config_gen: u64,
         telemetry_gen: u64,
     }
     impl Latest {
-        pub(super) fn record(&mut self, msg: &IpcMessage, packet: Vec<u8>) -> bool {
-            match msg {
-                IpcMessage::Config(_) => {
-                    self.config = Some(packet);
-                    self.config_gen = self.config_gen.wrapping_add(1).max(1);
-                    true
-                }
-                IpcMessage::Telemetry(_) => {
-                    self.telemetry = Some(packet);
-                    self.telemetry_gen = self.telemetry_gen.wrapping_add(1).max(1);
-                    true
-                }
-                _ => false,
-            }
+        pub(super) fn set_config(
+            &mut self,
+            config: &OverlayConfig,
+            games: &BTreeMap<String, GameOverlay>,
+        ) {
+            self.config = Some(config.clone());
+            self.games = games.clone();
+            self.config_gen = self.config_gen.wrapping_add(1).max(1);
         }
 
+        pub(super) fn set_telemetry(&mut self, packet: Vec<u8>) {
+            self.telemetry = Some(packet);
+            self.telemetry_gen = self.telemetry_gen.wrapping_add(1).max(1);
+        }
+
+        /// The settings as the game named `game` gets them.
+        fn config_for(&self, game: &str) -> Option<OverlayConfig> {
+            let general = self.config.as_ref()?;
+            Some(match self.games.get(game) {
+                Some(own) => own.apply(general),
+                None => general.clone(),
+            })
+        }
+
+        /// What `game`'s client has not been sent yet: its config, then the
+        /// telemetry.
         pub(super) fn next_packets(
             &self,
+            game: &str,
             sent_config: &mut u64,
             sent_telemetry: &mut u64,
         ) -> [Option<Vec<u8>>; 2] {
             let cfg = (self.config_gen != *sent_config)
                 .then(|| {
                     *sent_config = self.config_gen;
-                    self.config.clone()
+                    let config = self.config_for(game)?;
+                    argus_ipc::encode(&IpcMessage::Config(config)).ok()
                 })
                 .flatten();
             let tel = (self.telemetry_gen != *sent_telemetry)
@@ -362,17 +412,133 @@ mod ipc_server {
             [cfg, tel]
         }
     }
+
+    /// The name the process table shows for `pid`, which the user knows the
+    /// game by and its own settings are stored under.
+    fn client_name(pid: u32) -> String {
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        let cmdline: Vec<String> = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .unwrap_or_default()
+            .split(|byte| *byte == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect();
+        crate::utils::resolve_process_name(pid, comm.trim(), &cmdline)
+    }
+
+    /// A status line from a layer, made safe to show: one line, bounded.
+    pub(super) fn status_detail(detail: &str) -> String {
+        detail
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(argus_ipc::MAX_STATUS_DETAIL)
+            .collect()
+    }
+
+    type Clients = Arc<Mutex<Vec<OverlayClient>>>;
+
+    /// Take status messages from one layer until it goes away.
+    fn read_status(mut stream: UnixStream, clients: Clients, id: u64) {
+        let _ = stream.set_read_timeout(None);
+        while let Ok(message) = argus_ipc::read_message(&mut stream) {
+            let IpcMessage::Status(status) = message else {
+                continue;
+            };
+            let mut clients = clients.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(client) = clients.iter_mut().find(|c| c.id == id) {
+                client.drawing = status.drawing;
+                client.detail = status_detail(&status.detail);
+            }
+        }
+        // The writer only notices a closed game on its next write; make that
+        // one fail.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// Serve one connected layer: greet it, then send what changes.
+    fn serve(
+        mut stream: UnixStream,
+        shared: &(Mutex<Latest>, Condvar),
+        clients: &Clients,
+        id: u64,
+    ) {
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+        let mut cred: nix::libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of_val(&cred) as nix::libc::socklen_t;
+        use std::os::fd::AsRawFd;
+        let ok = unsafe {
+            nix::libc::getsockopt(
+                stream.as_raw_fd(),
+                nix::libc::SOL_SOCKET,
+                nix::libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut _,
+                &mut len,
+            )
+        } == 0;
+        let pid = if ok { cred.pid as u32 } else { 0 };
+        let hello = IpcMessage::Hello {
+            build: argus_ipc::BUILD_ID.into(),
+            protocol: argus_ipc::PROTOCOL_VERSION,
+            host_pid: pid,
+        };
+        if argus_ipc::write_message(&mut stream, &hello).is_err() {
+            return;
+        }
+        let name = client_name(pid);
+        clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(OverlayClient {
+                id,
+                pid,
+                name: name.clone(),
+                drawing: false,
+                detail: "Connected; the game has not created a swapchain yet".into(),
+            });
+        if let Ok(reader) = stream.try_clone() {
+            let clients = clients.clone();
+            std::thread::spawn(move || read_status(reader, clients, id));
+        }
+        let mut sent_config = 0u64;
+        let mut sent_telemetry = 0u64;
+        loop {
+            let (lock, changed) = shared;
+            let mut latest = lock.lock().unwrap_or_else(|e| e.into_inner());
+            while latest.config_gen == sent_config && latest.telemetry_gen == sent_telemetry {
+                latest = changed.wait(latest).unwrap_or_else(|e| e.into_inner());
+            }
+            let packets = latest.next_packets(&name, &mut sent_config, &mut sent_telemetry);
+            drop(latest);
+            if packets
+                .iter()
+                .flatten()
+                .any(|packet| stream.write_all(packet).is_err())
+            {
+                break;
+            }
+        }
+        // Also ends the status reader, which holds the other handle.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|c| c.id != id);
+    }
+
     pub struct Broadcaster {
         latest: Arc<(Mutex<Latest>, Condvar)>,
         /// Overlay clients connected right now, across every socket. A
         /// client that went away is only noticed on the next failed write,
         /// so this can lag by one telemetry frame.
         clients: Arc<std::sync::atomic::AtomicUsize>,
+        connected: Clients,
     }
     impl Broadcaster {
         pub fn start() -> Self {
             let latest = Arc::new((Mutex::new(Latest::default()), Condvar::new()));
             let clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let connected = Clients::default();
+            let next_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
             for path in argus_ipc::socket_paths() {
                 let shared = latest.clone();
                 if let Some(parent) = path.parent() {
@@ -410,8 +576,10 @@ mod ipc_server {
                             path.display()
                         );
                         let count = clients.clone();
+                        let connected = connected.clone();
+                        let next_id = next_id.clone();
                         std::thread::spawn(move || {
-                            for mut stream in listener.incoming().flatten() {
+                            for stream in listener.incoming().flatten() {
                                 // Relaxed is sufficient: atomic counter only bounds concurrent
                                 // overlay client threads and carries no dependent memory state.
                                 if count.load(std::sync::atomic::Ordering::Relaxed) >= 16 {
@@ -420,55 +588,10 @@ mod ipc_server {
                                 count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let count = count.clone();
                                 let shared = shared.clone();
+                                let connected = connected.clone();
+                                let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 std::thread::spawn(move || {
-                                    let _ =
-                                        stream.set_write_timeout(Some(Duration::from_millis(250)));
-                                    let mut cred: nix::libc::ucred = unsafe { std::mem::zeroed() };
-                                    let mut len =
-                                        std::mem::size_of_val(&cred) as nix::libc::socklen_t;
-                                    use std::os::fd::AsRawFd;
-                                    let ok = unsafe {
-                                        nix::libc::getsockopt(
-                                            stream.as_raw_fd(),
-                                            nix::libc::SOL_SOCKET,
-                                            nix::libc::SO_PEERCRED,
-                                            &mut cred as *mut _ as *mut _,
-                                            &mut len,
-                                        )
-                                    } == 0;
-                                    let hello = IpcMessage::Hello {
-                                        build: argus_ipc::BUILD_ID.into(),
-                                        protocol: argus_ipc::PROTOCOL_VERSION,
-                                        host_pid: if ok { cred.pid as u32 } else { 0 },
-                                    };
-                                    if argus_ipc::write_message(&mut stream, &hello).is_ok() {
-                                        let mut sent_config = 0u64;
-                                        let mut sent_telemetry = 0u64;
-                                        loop {
-                                            let (lock, changed) = &*shared;
-                                            let mut latest =
-                                                lock.lock().unwrap_or_else(|e| e.into_inner());
-                                            while latest.config_gen == sent_config
-                                                && latest.telemetry_gen == sent_telemetry
-                                            {
-                                                latest = changed
-                                                    .wait(latest)
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                            }
-                                            let packets = latest.next_packets(
-                                                &mut sent_config,
-                                                &mut sent_telemetry,
-                                            );
-                                            drop(latest);
-                                            if packets
-                                                .iter()
-                                                .flatten()
-                                                .any(|packet| stream.write_all(packet).is_err())
-                                            {
-                                                break;
-                                            }
-                                        }
-                                    }
+                                    serve(stream, &shared, &connected, id);
                                     count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                                 });
                             }
@@ -477,24 +600,42 @@ mod ipc_server {
                     Err(e) => log::error!("Overlay socket {}: {e}", path.display()),
                 }
             }
-            Self { latest, clients }
+            Self {
+                latest,
+                clients,
+                connected,
+            }
         }
         /// Whether any game is showing the overlay, i.e. whether telemetry
         /// has a reader.
         pub fn has_clients(&self) -> bool {
             self.clients.load(std::sync::atomic::Ordering::Relaxed) > 0
         }
-        pub fn broadcast(&self, msg: &IpcMessage) {
-            let Ok(packet) = argus_ipc::encode(msg) else {
+        /// The games connected now, and what their layers say of the HUD.
+        pub fn clients(&self) -> Vec<OverlayClient> {
+            self.connected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        /// The overlay settings, and what differs per game; each client is
+        /// sent its own.
+        pub fn set_config(&self, config: &OverlayConfig, games: &BTreeMap<String, GameOverlay>) {
+            let mut latest = self.latest.0.lock().unwrap_or_else(|e| e.into_inner());
+            latest.set_config(config, games);
+            self.latest.1.notify_all();
+        }
+        pub fn broadcast_telemetry(&self, frame: argus_ipc::TelemetryFrame) {
+            let Ok(packet) = argus_ipc::encode(&IpcMessage::Telemetry(frame)) else {
                 return;
             };
             let mut latest = self.latest.0.lock().unwrap_or_else(|e| e.into_inner());
-            if latest.record(msg, packet) {
-                self.latest.1.notify_all();
-            }
+            latest.set_telemetry(packet);
+            self.latest.1.notify_all();
         }
     }
 }
+pub use ipc_server::OverlayClient;
 
 pub fn spawn(
     state: Arc<Mutex<AppState>>,
@@ -696,6 +837,8 @@ struct Daemon {
     show_window_pending: bool,
     config: Config,
     ipc: ipc_server::Broadcaster,
+    /// The overlay clients as last logged.
+    logged_clients: Vec<OverlayClient>,
     log: Box<dyn Fn(String) + Send>,
     probalance: ProBalance,
     hw_collector: HwCollector,
@@ -748,9 +891,7 @@ impl Daemon {
         gui_context: crate::gui::SharedContext,
     ) -> Self {
         let ipc = ipc_server::Broadcaster::start();
-        ipc.broadcast(&argus_ipc::IpcMessage::Config(
-            config.gaming_mode.overlay.clone(),
-        ));
+        ipc.set_config(&config.gaming_mode.overlay, &config.gaming_mode.games);
 
         let mut probalance = ProBalance::new(config.probalance.clone())
             .with_journal(crate::probalance::journal_path());
@@ -777,6 +918,7 @@ impl Daemon {
             show_window_pending: false,
             config,
             ipc,
+            logged_clients: Vec::new(),
             log,
             probalance,
             hw_collector: HwCollector::new(),
@@ -934,6 +1076,20 @@ impl Daemon {
         for control in crate::overlay_toggle::drain_control(&self.toggle_dir) {
             self.apply_control(control);
         }
+        self.log_overlay_clients();
+    }
+
+    /// Put what the games' layers report in the log: a game that shows no
+    /// HUD has said why, and this is where it can be read afterwards.
+    fn log_overlay_clients(&mut self) {
+        let clients = self.ipc.clients();
+        if clients == self.logged_clients {
+            return;
+        }
+        for line in overlay_client_notes(&self.logged_clients, &clients) {
+            (self.log)(line);
+        }
+        self.logged_clients = clients;
     }
 
     /// Carry out a request made with `argus-lasso gaming|probalance|profile`.
@@ -1020,8 +1176,7 @@ impl Daemon {
         }
         let overlay = &mut self.config.gaming_mode.overlay;
         overlay.show_overlay = !overlay.show_overlay;
-        self.ipc
-            .broadcast(&argus_ipc::IpcMessage::Config(overlay.clone()));
+        self.ipc.set_config(overlay, &self.config.gaming_mode.games);
         // Merge just the field this toggle actually changed into shared
         // state, not the whole Config: `config` here is this thread's own
         // mirror, refreshed only by DaemonCmd::ConfigChanged, so it can't
@@ -1059,9 +1214,10 @@ impl Daemon {
                 };
                 self.probalance.update_config(cfg.probalance.clone());
                 let before = std::mem::replace(&mut self.config, Config::clone(&cfg));
-                self.ipc.broadcast(&argus_ipc::IpcMessage::Config(
-                    self.config.gaming_mode.overlay.clone(),
-                ));
+                self.ipc.set_config(
+                    &self.config.gaming_mode.overlay,
+                    &self.config.gaming_mode.games,
+                );
                 for note in config_change_notes(&before, &self.config) {
                     (self.log)(note);
                 }
@@ -1455,52 +1611,52 @@ impl Daemon {
         let vram_used = hw.get_vram_usage_gb();
         let vram_total = hw.get_vram_total_gb();
 
-        self.ipc.broadcast(&argus_ipc::IpcMessage::Telemetry(
-            argus_ipc::TelemetryFrame {
-                cpu_name,
-                cpu_usage_percent: self.avg as u8,
-                cpu_temp_c: cpu_temp,
-                cpu_power_w: cpu_power,
-                gpu_name,
-                gpu_usage_percent: gpu_usage,
-                gpu_temp_c: gpu_temp,
-                gpu_power_w: gpu_power,
-                gpu_core_clock_mhz: hw.get_gpu_core_clock(),
-                gpu_mem_clock_mhz: hw.get_gpu_mem_clock(),
-                gpu_fan_speed_percent: hw.get_gpu_fan_speed(),
-                cpu_freq_mhz: hw.get_cpu_freq(),
-                ram_speed_mts: extended
-                    .and_then(|s| s.ram_speed_mts)
-                    .or_else(get_ram_speed_mts),
-                ram_used_gb: ram_used,
-                ram_total_gb: ram_total,
-                vram_used_gb: vram_used,
-                vram_total_gb: vram_total,
-                active_profile,
-                game: None,
-                launch_profiles: {
-                    self.gaming.launch_profiles.retain(|p| {
-                        crate::fast_proc::read_stat(p.pid, &mut [0; 1024])
-                            .is_some_and(|s| s.starttime == p.start_ticks)
-                    });
-                    self.gaming.launch_profiles.clone()
-                },
-                probalance_pids: self.probalance.throttled_pids().into_iter().collect(),
-                parked_cores,
-                cpus: logical_cpus(&self.cpu_percents),
-                sample_unix_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-                sample_interval_ms: 1000,
-                cpu_power_status: extended.map(|s| s.cpu_power_status.clone()).unwrap_or_else(
-                    || sensor_access_status("/sys/class/powercap/intel-rapl:0/energy_uj"),
-                ),
-                ram_speed_status: extended
-                    .map(|s| s.ram_speed_status.clone())
-                    .unwrap_or_else(|| sensor_access_status("/sys/firmware/dmi/tables/DMI")),
+        self.ipc.broadcast_telemetry(argus_ipc::TelemetryFrame {
+            cpu_name,
+            cpu_usage_percent: self.avg as u8,
+            cpu_temp_c: cpu_temp,
+            cpu_power_w: cpu_power,
+            gpu_name,
+            gpu_usage_percent: gpu_usage,
+            gpu_temp_c: gpu_temp,
+            gpu_power_w: gpu_power,
+            gpu_core_clock_mhz: hw.get_gpu_core_clock(),
+            gpu_mem_clock_mhz: hw.get_gpu_mem_clock(),
+            gpu_fan_speed_percent: hw.get_gpu_fan_speed(),
+            cpu_freq_mhz: hw.get_cpu_freq(),
+            ram_speed_mts: extended
+                .and_then(|s| s.ram_speed_mts)
+                .or_else(get_ram_speed_mts),
+            ram_used_gb: ram_used,
+            ram_total_gb: ram_total,
+            vram_used_gb: vram_used,
+            vram_total_gb: vram_total,
+            active_profile,
+            game: None,
+            launch_profiles: {
+                self.gaming.launch_profiles.retain(|p| {
+                    crate::fast_proc::read_stat(p.pid, &mut [0; 1024])
+                        .is_some_and(|s| s.starttime == p.start_ticks)
+                });
+                self.gaming.launch_profiles.clone()
             },
-        ));
+            probalance_pids: self.probalance.throttled_pids().into_iter().collect(),
+            parked_cores,
+            cpus: logical_cpus(&self.cpu_percents),
+            sample_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            sample_interval_ms: 1000,
+            cpu_power_status: extended
+                .map(|s| s.cpu_power_status.clone())
+                .unwrap_or_else(|| {
+                    sensor_access_status("/sys/class/powercap/intel-rapl:0/energy_uj")
+                }),
+            ram_speed_status: extended
+                .map(|s| s.ram_speed_status.clone())
+                .unwrap_or_else(|| sensor_access_status("/sys/firmware/dmi/tables/DMI")),
+        });
     }
 
     /// Hand the GUI this pass's snapshot and histories.
@@ -1517,6 +1673,7 @@ impl Daemon {
             s.throttled_pids = Arc::new(throttled);
             s.throttle_infos = throttle_infos;
             s.throttle_history = self.probalance.history();
+            s.overlay_clients = self.ipc.clients();
             s.cpu_avg = self.avg;
             push_capped(&mut s.cpu_history, self.avg, 120);
             // Aggregate disk/net totals for the Overview graphs
@@ -2036,6 +2193,26 @@ fn on_off(on: bool) -> &'static str {
 /// Log lines for a configuration update: only for what changed. A HUD
 /// slider sends an update on every frame it is dragged, and each one used
 /// to log a line.
+/// Log lines for what changed among the connected overlay clients.
+fn overlay_client_notes(before: &[OverlayClient], after: &[OverlayClient]) -> Vec<String> {
+    let mut notes = Vec::new();
+    for client in after {
+        let known = before.iter().find(|old| old.same_connection(client));
+        if known.is_none_or(|old| old.detail != client.detail) {
+            notes.push(format!(
+                "[Overlay] {} ({}): {}",
+                client.name, client.pid, client.detail
+            ));
+        }
+    }
+    for old in before {
+        if !after.iter().any(|client| client.same_connection(old)) {
+            notes.push(format!("[Overlay] {} ({}) disconnected", old.name, old.pid));
+        }
+    }
+    notes
+}
+
 /// A frame-rate cap in words; 0 is no cap.
 pub(crate) fn fps_limit_words(fps: u32) -> String {
     if fps == 0 {
@@ -2509,35 +2686,120 @@ mod persistence_tests {
 
     #[test]
     fn ipc_broadcaster_only_sends_changed_packet_stream() {
-        use argus_ipc::IpcMessage;
+        use argus_ipc::{IpcMessage, OverlayConfig};
         let mut latest = super::ipc_server::Latest::default();
-        let cfg_msg = IpcMessage::Config(Default::default());
-        let tel_msg = IpcMessage::Telemetry(Default::default());
+        let config = OverlayConfig::default();
+        let config_packet =
+            |c: &OverlayConfig| argus_ipc::encode(&IpcMessage::Config(c.clone())).ok();
+        let games = Default::default();
 
-        assert!(latest.record(&cfg_msg, vec![1, 2, 3]));
-        assert!(latest.record(&tel_msg, vec![4, 5, 6]));
+        latest.set_config(&config, &games);
+        latest.set_telemetry(vec![4, 5, 6]);
 
         let mut sent_cfg = 0u64;
         let mut sent_tel = 0u64;
 
         // First wake-up sends both initial packets.
         assert_eq!(
-            latest.next_packets(&mut sent_cfg, &mut sent_tel),
-            [Some(vec![1, 2, 3]), Some(vec![4, 5, 6])]
+            latest.next_packets("game", &mut sent_cfg, &mut sent_tel),
+            [config_packet(&config), Some(vec![4, 5, 6])]
         );
 
         // A 1 Hz telemetry update sends only the telemetry packet, not Config again.
-        assert!(latest.record(&tel_msg, vec![7, 8, 9]));
+        latest.set_telemetry(vec![7, 8, 9]);
         assert_eq!(
-            latest.next_packets(&mut sent_cfg, &mut sent_tel),
+            latest.next_packets("game", &mut sent_cfg, &mut sent_tel),
             [None, Some(vec![7, 8, 9])]
         );
 
         // A UI slider drag sends only Config, not Telemetry again.
-        assert!(latest.record(&cfg_msg, vec![10, 11]));
+        let dragged = OverlayConfig {
+            font_px: 20,
+            ..config
+        };
+        latest.set_config(&dragged, &games);
         assert_eq!(
-            latest.next_packets(&mut sent_cfg, &mut sent_tel),
-            [Some(vec![10, 11]), None]
+            latest.next_packets("game", &mut sent_cfg, &mut sent_tel),
+            [config_packet(&dragged), None]
+        );
+    }
+
+    #[test]
+    fn each_game_is_sent_the_settings_with_its_own_differences() {
+        use crate::config::GameOverlay;
+        use argus_ipc::{IpcMessage, OverlayConfig};
+        let general = OverlayConfig {
+            fps_limit: 144,
+            ..Default::default()
+        };
+        let games = [
+            (
+                "Capped.exe".to_owned(),
+                GameOverlay {
+                    fps_limit: Some(60),
+                    hide_hud: false,
+                },
+            ),
+            (
+                "Quiet.exe".to_owned(),
+                GameOverlay {
+                    fps_limit: Some(0),
+                    hide_hud: true,
+                },
+            ),
+        ]
+        .into();
+        let mut latest = super::ipc_server::Latest::default();
+        latest.set_config(&general, &games);
+
+        let sent_to = |game: &str| {
+            let [config, _] = latest.next_packets(game, &mut 0, &mut 0);
+            match argus_ipc::read_message(&mut config.unwrap().as_slice()).unwrap() {
+                IpcMessage::Config(config) => (config.fps_limit, config.show_overlay),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(sent_to("Other.exe"), (144, true));
+        assert_eq!(sent_to("Capped.exe"), (60, true));
+        // Some(0) lifts the cap for that game; None would inherit it.
+        assert_eq!(sent_to("Quiet.exe"), (0, false));
+    }
+
+    #[test]
+    fn the_log_follows_what_each_games_layer_reports() {
+        let client = OverlayClient::for_test;
+        let connected = [client("Game.exe", false, "Connected")];
+        assert_eq!(
+            overlay_client_notes(&[], &connected),
+            ["[Overlay] Game.exe (0): Connected"]
+        );
+        // Nothing new, nothing logged.
+        assert!(overlay_client_notes(&connected, &connected).is_empty());
+        let skipped = [client(
+            "Game.exe",
+            false,
+            "No HUD: colour space X is not supported",
+        )];
+        assert_eq!(
+            overlay_client_notes(&connected, &skipped),
+            ["[Overlay] Game.exe (0): No HUD: colour space X is not supported"]
+        );
+        assert_eq!(
+            overlay_client_notes(&skipped, &[]),
+            ["[Overlay] Game.exe (0) disconnected"]
+        );
+    }
+
+    #[test]
+    fn a_layers_status_line_is_made_safe_to_show() {
+        let long = "x".repeat(1000);
+        assert_eq!(
+            super::ipc_server::status_detail(&long).len(),
+            argus_ipc::MAX_STATUS_DETAIL
+        );
+        assert_eq!(
+            super::ipc_server::status_detail("HUD off\n[fake log line]\u{1b}[31m"),
+            "HUD off[fake log line][31m"
         );
     }
 }

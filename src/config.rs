@@ -222,6 +222,37 @@ pub struct GamingModeConfig {
     /// Vulkan overlay configuration
     #[serde(default)]
     pub overlay: argus_ipc::OverlayConfig,
+    /// What differs for one game, by the process name its layer connects
+    /// under (as the process table shows it).
+    pub games: std::collections::BTreeMap<String, GameOverlay>,
+}
+
+/// One game's departures from the overlay settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GameOverlay {
+    /// This game's frame-rate cap instead of the general one; `Some(0)` is
+    /// no cap for this game.
+    pub fps_limit: Option<u32>,
+    /// Never show the HUD in this game.
+    pub hide_hud: bool,
+}
+
+impl GameOverlay {
+    /// Nothing differs: the entry need not be kept.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The overlay settings as this game gets them.
+    pub fn apply(&self, general: &argus_ipc::OverlayConfig) -> argus_ipc::OverlayConfig {
+        let mut config = general.clone();
+        if let Some(limit) = self.fps_limit {
+            config.fps_limit = argus_ipc::normalized_fps_limit(limit);
+        }
+        config.show_overlay &= !self.hide_hud;
+        config
+    }
 }
 
 // ── Rule (stored inline in config) ───────────────────────────────────────────
@@ -412,6 +443,7 @@ fn load_from(path: &Path) -> (Config, Option<String>) {
                 cfg.probalance.normalize();
                 let overlay = &mut cfg.gaming_mode.overlay;
                 overlay.fps_limit = argus_ipc::normalized_fps_limit(overlay.fps_limit);
+                cfg.gaming_mode.games.retain(|_, game| !game.is_default());
                 log::info!("Loaded config from {}", path.display());
                 return (cfg, None);
             }
@@ -639,6 +671,47 @@ mod tests {
             MonitorConfig::default().display_refresh_interval_ms
         );
         assert!(cfg.rules.is_empty());
+    }
+
+    #[test]
+    fn a_games_own_overlay_settings_apply_over_the_general_ones() {
+        let general = argus_ipc::OverlayConfig {
+            fps_limit: 144,
+            ..Default::default()
+        };
+        assert!(GameOverlay::default().is_default());
+        assert_eq!(GameOverlay::default().apply(&general), general);
+
+        let own = GameOverlay {
+            fps_limit: Some(5),
+            hide_hud: true,
+        };
+        let applied = own.apply(&general);
+        // Brought into range like the general limit.
+        assert_eq!(applied.fps_limit, argus_ipc::FPS_LIMIT_MIN);
+        assert!(!applied.show_overlay);
+
+        // Hiding the HUD everywhere is not undone by a game's entry.
+        let hidden = argus_ipc::OverlayConfig {
+            show_overlay: false,
+            ..general
+        };
+        assert!(!GameOverlay::default().apply(&hidden).show_overlay);
+    }
+
+    #[test]
+    fn per_game_overlay_settings_survive_the_config_file() {
+        let mut cfg = Config::default();
+        cfg.gaming_mode.games.insert(
+            "PathOfExileSteam.exe".into(),
+            GameOverlay {
+                fps_limit: Some(120),
+                hide_hud: false,
+            },
+        );
+        let text = toml::to_string(&cfg).unwrap();
+        let decoded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(decoded.gaming_mode.games, cfg.gaming_mode.games);
     }
 
     #[test]

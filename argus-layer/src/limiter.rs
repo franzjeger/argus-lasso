@@ -4,6 +4,7 @@
 //! the screen evenly spaced. The game has already sampled input and rendered
 //! by then, which a game's own limiter avoids; that one is the better choice
 //! where it exists.
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,14 @@ lazy_static::lazy_static! {
         .and_then(|v| v.trim().parse().ok());
     // One for the process: two swapchains presenting at once share the cap.
     static ref STATE: Mutex<State> = Mutex::new(State::default());
+}
+
+/// The cap in force, for the HUD to show.
+static CURRENT: AtomicU32 = AtomicU32::new(0);
+
+/// The frame-rate cap presents are held to now; 0 is none.
+pub fn current() -> u32 {
+    CURRENT.load(Ordering::Relaxed)
 }
 
 #[derive(Default)]
@@ -58,6 +67,7 @@ pub fn wait(configured: u32) {
     if state.limit != limit {
         state.limit = limit;
         state.deadline = None;
+        CURRENT.store(limit, Ordering::Relaxed);
         if limit == 0 {
             eprintln!("[Argus-Layer] Frame rate limit off");
         } else {
