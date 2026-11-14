@@ -983,15 +983,20 @@ unsafe fn init_overlay(
         eprintln!("[Argus-Layer] HUD skipped: deferred-memory or mutable-format storage swapchain");
         return;
     }
-    // The HUD's colours are display-encoded sRGB. Under HDR10 (PQ) they
-    // would mean up to thousands of nits, under scRGB something else again.
-    if ci.image_color_space != vk::ColorSpaceKHR::SRGB_NONLINEAR {
+    // The HUD's colours are display-encoded sRGB; an HDR swapchain needs them
+    // converted, and one whose encoding is unknown is left alone.
+    let forced = std::env::var("ARGUS_LASSO_HUD_COLORSPACE")
+        .ok()
+        .and_then(|v| renderer::parse_encoding(&v));
+    let Some(encoding) = renderer::target_encoding(ci.image_format, ci.image_color_space, forced)
+    else {
         eprintln!(
-            "[Argus-Layer] HUD skipped: colour space {:?} is not sRGB",
-            ci.image_color_space
+            "[Argus-Layer] HUD skipped: colour space {:?} with format {:?} is not supported",
+            ci.image_color_space, ci.image_format
         );
         return;
-    }
+    };
+    let hud_nits = renderer::parse_nits(std::env::var("ARGUS_LASSO_HUD_NITS").ok().as_deref());
     let Some((physical_device, ash_dev)) = DEVICE_MAP
         .read_or_recover()
         .get(&device)
@@ -1029,15 +1034,18 @@ unsafe fn init_overlay(
         qf,
         &images,
         ci.image_format,
+        encoding,
+        hud_nits,
         ci.image_extent,
-        ci.pre_transform,
     ) {
         Some(mut state) => {
             state.swapchain = swapchain;
             OVERLAY_STATES.lock_or_recover().insert(swapchain, state);
             eprintln!(
-                "[Argus-Layer] Overlay initialised for swapchain ({} images)",
-                images.len()
+                "[Argus-Layer] Overlay initialised for swapchain ({} images, colour space {:?}, HUD written as {:?})",
+                images.len(),
+                ci.image_color_space,
+                encoding
             );
         }
         None => {

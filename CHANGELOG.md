@@ -10,6 +10,16 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ## [Unreleased]
 
+### Fixed
+
+- The HUD is drawn in HDR games. It was left off every swapchain that was not
+  sRGB, which included all HDR ones, so a game started with
+  `PROTON_ENABLE_HDR=1` showed no HUD at all. Its colours are now converted for
+  HDR10 (PQ) and scRGB, with HUD white at 203 nits (`ARGUS_LASSO_HUD_NITS`
+  changes it). The pass-through swapchains Proton's Wayland driver creates are
+  judged by their format; `ARGUS_LASSO_HUD_COLORSPACE` overrides the guess. See
+  [docs/overlay.md](docs/overlay.md#hdr).
+
 ## [1.6.0] — 2026-11-11
 
 Command-line control of the running instance, a history of what ProBalance
