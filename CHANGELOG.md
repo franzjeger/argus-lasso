@@ -10,6 +10,12 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-11-14
+
+A Games page with a card per game, a frame rate limit, overlay presets and
+quicker ways to show or hide the HUD, and a HUD that is drawn in HDR games.
+The overlay protocol changed: restart running games after updating.
+
 ### Added
 
 - A frame rate limit for games that load the overlay layer: **Gaming → Overlay →
@@ -985,7 +991,8 @@ when the app asks, and the sensor service if you use it
 
 - Virtualized the process table; dropped per-frame clones and sysfs reads.
 
-[Unreleased]: https://github.com/franzjeger/argus-lasso/compare/v1.6.0...HEAD
+[Unreleased]: https://github.com/franzjeger/argus-lasso/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/franzjeger/argus-lasso/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/franzjeger/argus-lasso/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/franzjeger/argus-lasso/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/franzjeger/argus-lasso/compare/v1.4.0...v1.5.0
