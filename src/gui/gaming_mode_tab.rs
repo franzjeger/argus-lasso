@@ -101,6 +101,11 @@ pub struct GamingModeTab {
     overlay_shown_seen: bool,
     /// The name being typed on the Games page.
     new_game_name: String,
+    /// Choosing a game for a profile from the Steam library.
+    profile_picker: Option<crate::gui::dialogs::SteamGamePickerDialog>,
+    /// Installed Steam games as (appid, name), for the cards' titles; read
+    /// when the Games page is first shown.
+    steam_library: Option<Vec<(String, String)>>,
     /// Games added there that have no setting of their own yet.
     added_games: Vec<String>,
     /// Games whose layer is connected now, from the daemon.
@@ -203,6 +208,8 @@ impl GamingModeTab {
         let mut tab = Self {
             overlay_shown_seen: config.gaming_mode.overlay.show_overlay,
             new_game_name: String::new(),
+            profile_picker: None,
+            steam_library: None,
             added_games: Vec::new(),
             overlay_clients: Vec::new(),
             fps_limit_seen: config.gaming_mode.overlay.fps_limit,
@@ -522,11 +529,20 @@ impl GamingModeTab {
             th::help_text(
                 ui,
                 "What differs for one game: how Gaming Mode treats it when it is detected, \
-                 and what its overlay shows. A game is known by its process name, as the \
-                 Processes page shows it. Games showing the overlay are listed while they run.",
+                 and what its overlay shows. Choose a game from the Steam library, or name \
+                 any other by its process name, as the Processes page shows it. Games \
+                 showing the overlay are listed while they run.",
             );
             ui.horizontal(|ui| {
                 ui.label("Add a game");
+                if ui
+                    .button("Steam library…")
+                    .on_hover_text("The profile then covers every process of that Steam game.")
+                    .clicked()
+                {
+                    self.profile_picker = Some(crate::gui::dialogs::SteamGamePickerDialog::new());
+                }
+                ui.label("or");
                 let entry = ui.add(
                     egui::TextEdit::singleline(&mut self.new_game_name)
                         .hint_text("process name, e.g. Game.exe")
@@ -553,6 +569,10 @@ impl GamingModeTab {
             &self.config.gaming_mode.games,
             &self.added_games,
         );
+        let library = self
+            .steam_library
+            .get_or_insert_with(crate::game_library::steam_games)
+            .clone();
         let general_limit = self.config.gaming_mode.overlay.fps_limit;
         let auto_park = self.config.gaming_mode.auto_park;
         for row in rows {
@@ -564,7 +584,11 @@ impl GamingModeTab {
                 .cloned()
                 .unwrap_or_default();
             let before = game.clone();
-            th::card(ui, &row.name, |ui| {
+            let (title, known_as) = game_title(&row, &library);
+            th::card(ui, &title, |ui| {
+                if let Some(known_as) = known_as {
+                    ui.weak(known_as);
+                }
                 match &row.status {
                     Some((true, detail)) => ui.label(detail),
                     Some((false, detail)) => ui.colored_label(th::Breeze::WARNING, detail),
@@ -1307,6 +1331,20 @@ impl GamingModeTab {
                 self.steam_picker = None;
             }
         }
+        if let Some(picker) = &mut self.profile_picker {
+            if let Some(result) = picker.show(ctx, opacity) {
+                // The picker just read the library: titles for new installs too.
+                self.steam_library = Some(std::mem::take(&mut picker.games));
+                if let Some((appid, _)) = result {
+                    let key = crate::config::steam_profile_key(&appid);
+                    // Shown until it has a setting of its own or the page is left.
+                    if !self.added_games.contains(&key) {
+                        self.added_games.push(key);
+                    }
+                }
+                self.profile_picker = None;
+            }
+        }
 
         // ── Lutris picker ─────────────────────────────────────────────────
         if let Some(ref mut picker) = self.lutris_picker {
@@ -1745,13 +1783,34 @@ mod launcher_tests {
 /// A game in the overlay section's list.
 #[derive(Debug, PartialEq)]
 struct GameRow {
+    /// The key of its profile: a process name, or `steam:<appid>`.
     name: String,
+    /// Its process name, for a Steam game that is running.
+    process: Option<String>,
     /// Whether its HUD is drawn and what its layer says, if it is running.
     status: Option<(bool, String)>,
 }
 
+/// A card's title, and what else the game is known as: a Steam game goes by
+/// its library name, with the app and its running process below.
+fn game_title(row: &GameRow, library: &[(String, String)]) -> (String, Option<String>) {
+    let Some(appid) = crate::config::steam_app_of(&row.name) else {
+        return (row.name.clone(), None);
+    };
+    let app = format!("Steam app {appid}");
+    let known_as = match &row.process {
+        Some(process) => format!("{app} · {process}"),
+        None => app.clone(),
+    };
+    match library.iter().find(|(id, _)| id == appid) {
+        Some((_, title)) => (title.clone(), Some(known_as)),
+        None => (app, row.process.clone()),
+    }
+}
+
 /// The games to list: those connected now, then those that only have a
-/// profile, then those just added by name; each name once.
+/// profile, then those just added; each once. A running Steam game is listed
+/// as the Steam game, unless its process name has a profile already.
 fn game_rows(
     clients: &[crate::monitor::OverlayClient],
     games: &std::collections::BTreeMap<String, crate::config::GameProfile>,
@@ -1761,14 +1820,23 @@ fn game_rows(
     for client in clients {
         // A game can hold several connections (one per process, or a
         // launcher beside it): the one that draws speaks for the name.
-        match rows.iter_mut().find(|row| row.name == client.name) {
+        let steam_key = client
+            .steam_app
+            .as_deref()
+            .filter(|_| !games.contains_key(&client.name))
+            .map(crate::config::steam_profile_key);
+        let process = steam_key.is_some().then(|| client.name.clone());
+        let name = steam_key.unwrap_or_else(|| client.name.clone());
+        match rows.iter_mut().find(|row| row.name == name) {
             Some(row) => {
                 if client.drawing && !matches!(row.status, Some((true, _))) {
                     row.status = Some((true, client.detail.clone()));
+                    row.process = process;
                 }
             }
             None => rows.push(GameRow {
-                name: client.name.clone(),
+                name,
+                process,
                 status: Some((client.drawing, client.detail.clone())),
             }),
         }
@@ -1778,6 +1846,7 @@ fn game_rows(
         if !rows.iter().any(|row| row.name == *name) {
             rows.push(GameRow {
                 name: name.clone(),
+                process: None,
                 status: None,
             });
         }
@@ -1825,6 +1894,7 @@ mod overlay_tests {
         .into();
         let row = |name: &str, status: Option<(bool, &str)>| GameRow {
             name: name.into(),
+            process: None,
             status: status.map(|(drawing, detail)| (drawing, detail.to_owned())),
         };
         let added = ["Zeta.exe".to_owned(), "New.exe".to_owned()];
@@ -1836,6 +1906,59 @@ mod overlay_tests {
                 row("Stored.exe", None),
                 row("New.exe", None),
             ]
+        );
+    }
+
+    /// A running Steam game is one card under its library title, where a
+    /// profile then covers all its processes.
+    #[test]
+    fn a_running_steam_game_is_listed_as_the_steam_game() {
+        use super::{game_rows, game_title, GameRow};
+        let client = crate::monitor::OverlayClient::for_test;
+        let clients = [
+            client("Game.exe", true, "HUD on").of_steam_app("620"),
+            // Its process name has a profile already: that one stays.
+            client("Own.exe", true, "HUD on").of_steam_app("400"),
+        ];
+        let games = [
+            ("Own.exe".to_owned(), Default::default()),
+            ("steam:10".to_owned(), Default::default()),
+        ]
+        .into();
+        let rows = game_rows(&clients, &games, &[]);
+        assert_eq!(
+            rows,
+            [
+                GameRow {
+                    name: "Own.exe".into(),
+                    process: None,
+                    status: Some((true, "HUD on".into())),
+                },
+                GameRow {
+                    name: "steam:620".into(),
+                    process: Some("Game.exe".into()),
+                    status: Some((true, "HUD on".into())),
+                },
+                GameRow {
+                    name: "steam:10".into(),
+                    process: None,
+                    status: None,
+                },
+            ]
+        );
+        let library = [("620".to_owned(), "Portal 2".to_owned())];
+        assert_eq!(game_title(&rows[0], &library), ("Own.exe".to_owned(), None));
+        assert_eq!(
+            game_title(&rows[1], &library),
+            (
+                "Portal 2".to_owned(),
+                Some("Steam app 620 · Game.exe".to_owned())
+            )
+        );
+        // No longer installed: the app number is all there is.
+        assert_eq!(
+            game_title(&rows[2], &library),
+            ("Steam app 10".to_owned(), None)
         );
     }
 

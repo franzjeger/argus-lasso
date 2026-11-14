@@ -328,8 +328,10 @@ mod ipc_server {
     pub struct OverlayClient {
         id: u64,
         pub pid: u32,
-        /// The process name, which is also the key of its own settings.
+        /// The process name, which its own settings can be stored under.
         pub name: String,
+        /// The Steam app it runs as, which they can be stored under too.
+        pub steam_app: Option<String>,
         pub drawing: bool,
         /// What the layer last said about its HUD.
         pub detail: String,
@@ -349,9 +351,15 @@ mod ipc_server {
                 id: name.bytes().map(u64::from).sum(),
                 pid: 0,
                 name: name.into(),
+                steam_app: None,
                 drawing,
                 detail: detail.into(),
             }
+        }
+
+        pub fn of_steam_app(mut self, appid: &str) -> Self {
+            self.steam_app = Some(appid.into());
+            self
         }
     }
 
@@ -379,10 +387,12 @@ mod ipc_server {
             self.telemetry_gen = self.telemetry_gen.wrapping_add(1).max(1);
         }
 
-        /// The settings as the game named `game` gets them.
-        fn config_for(&self, game: &str) -> Option<OverlayConfig> {
+        /// The settings as process `game` of Steam app `steam_app` gets them.
+        fn config_for(&self, game: &str, steam_app: Option<&str>) -> Option<OverlayConfig> {
             let general = self.config.as_ref()?;
-            Some(match self.games.get(game) {
+            let own = crate::config::profile_key(&self.games, game, steam_app)
+                .and_then(|key| self.games.get(&key));
+            Some(match own {
                 Some(own) => own.apply(general),
                 None => general.clone(),
             })
@@ -393,13 +403,14 @@ mod ipc_server {
         pub(super) fn next_packets(
             &self,
             game: &str,
+            steam_app: Option<&str>,
             sent_config: &mut u64,
             sent_telemetry: &mut u64,
         ) -> [Option<Vec<u8>>; 2] {
             let cfg = (self.config_gen != *sent_config)
                 .then(|| {
                     *sent_config = self.config_gen;
-                    let config = self.config_for(game)?;
+                    let config = self.config_for(game, steam_app)?;
                     argus_ipc::encode(&IpcMessage::Config(config)).ok()
                 })
                 .flatten();
@@ -485,6 +496,7 @@ mod ipc_server {
             return;
         }
         let name = client_name(pid);
+        let steam_app = crate::utils::steam_app_id(pid);
         clients
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -492,6 +504,7 @@ mod ipc_server {
                 id,
                 pid,
                 name: name.clone(),
+                steam_app: steam_app.clone(),
                 drawing: false,
                 detail: "Connected; the game has not created a swapchain yet".into(),
             });
@@ -507,7 +520,12 @@ mod ipc_server {
             while latest.config_gen == sent_config && latest.telemetry_gen == sent_telemetry {
                 latest = changed.wait(latest).unwrap_or_else(|e| e.into_inner());
             }
-            let packets = latest.next_packets(&name, &mut sent_config, &mut sent_telemetry);
+            let packets = latest.next_packets(
+                &name,
+                steam_app.as_deref(),
+                &mut sent_config,
+                &mut sent_telemetry,
+            );
             drop(latest);
             if packets
                 .iter()
@@ -857,28 +875,40 @@ enum Detected {
 
 /// What the game processes of a snapshot ask of Gaming Mode. A game is
 /// several processes (Steam's launchers, Proton, then the game itself); the
-/// first one with a profile of its own decides for all of them.
+/// first one with a profile decides for all of them. A profile stored under
+/// the Steam app already matches the launchers; one stored under a process
+/// name only matches once that process exists. `steam_app` gives the Steam
+/// app a pid runs as.
 fn detect_gaming<'a>(
     game_processes: impl Iterator<Item = (&'a str, u32)>,
     games: &std::collections::BTreeMap<String, crate::config::GameProfile>,
     auto_park: bool,
+    steam_app: impl Fn(u32) -> Option<String>,
 ) -> Detected {
+    let by_steam_app = games
+        .keys()
+        .any(|key| crate::config::steam_app_of(key).is_some());
     let mut first = None;
     for (name, pid) in game_processes {
         first.get_or_insert_with(|| format!("{name} ({pid})"));
-        let Some(profile) = games.get(name) else {
+        // Only read the process's environment if a profile could match it.
+        let app = if by_steam_app && !games.contains_key(name) {
+            steam_app(pid)
+        } else {
+            None
+        };
+        let Some(key) = crate::config::profile_key(games, name, app.as_deref()) else {
             continue;
         };
+        let profile = &games[&key];
         if profile.no_gaming_mode {
-            return Detected::Off {
-                profile: name.to_owned(),
-            };
+            return Detected::Off { profile: key };
         }
         return Detected::On {
             want: AutoGaming {
                 boost: !profile.no_boost,
                 park: profile.park.unwrap_or(auto_park),
-                profile: Some(name.to_owned()),
+                profile: Some(key),
             },
             game: first.unwrap_or_default(),
         };
@@ -1454,6 +1484,7 @@ impl Daemon {
                 .map(|p| (p.name.as_ref(), p.pid)),
             &self.config.gaming_mode.games,
             self.config.gaming_mode.auto_park,
+            utils::steam_app_id,
         );
         match detected {
             Detected::On { want, game } => {
@@ -1466,7 +1497,10 @@ impl Daemon {
                         "[Gaming Mode] Auto-enabled — game detected: {game}"
                     ));
                     if let Some(profile) = &want.profile {
-                        (self.log)(format!("[Gaming Mode] Using the profile for {profile}."));
+                        (self.log)(format!(
+                            "[Gaming Mode] Using the profile for {}.",
+                            crate::config::profile_label(profile)
+                        ));
                     }
                     // Detection turns Gaming Mode on even if parking fails:
                     // the priority boost still applies.
@@ -1487,7 +1521,10 @@ impl Daemon {
             Detected::Off { profile } => {
                 self.gaming.absent_snapshots = 0;
                 if self.gaming.auto && self.gaming.active {
-                    self.auto_disable(&format!("the profile for {profile} keeps it off"));
+                    self.auto_disable(&format!(
+                        "the profile for {} keeps it off",
+                        crate::config::profile_label(&profile)
+                    ));
                 }
             }
             Detected::NoGame => {
@@ -1530,7 +1567,10 @@ impl Daemon {
             profile: None,
         });
         match &want.profile {
-            Some(profile) => (self.log)(format!("[Gaming Mode] Using the profile for {profile}.")),
+            Some(profile) => (self.log)(format!(
+                "[Gaming Mode] Using the profile for {}.",
+                crate::config::profile_label(profile)
+            )),
             None => (self.log)("[Gaming Mode] Back to the general settings.".into()),
         }
         if want.park && !applied.park {
@@ -2831,14 +2871,14 @@ mod persistence_tests {
 
         // First wake-up sends both initial packets.
         assert_eq!(
-            latest.next_packets("game", &mut sent_cfg, &mut sent_tel),
+            latest.next_packets("game", None, &mut sent_cfg, &mut sent_tel),
             [config_packet(&config), Some(vec![4, 5, 6])]
         );
 
         // A 1 Hz telemetry update sends only the telemetry packet, not Config again.
         latest.set_telemetry(vec![7, 8, 9]);
         assert_eq!(
-            latest.next_packets("game", &mut sent_cfg, &mut sent_tel),
+            latest.next_packets("game", None, &mut sent_cfg, &mut sent_tel),
             [None, Some(vec![7, 8, 9])]
         );
 
@@ -2849,7 +2889,7 @@ mod persistence_tests {
         };
         latest.set_config(&dragged, &games);
         assert_eq!(
-            latest.next_packets("game", &mut sent_cfg, &mut sent_tel),
+            latest.next_packets("game", None, &mut sent_cfg, &mut sent_tel),
             [config_packet(&dragged), None]
         );
     }
@@ -2885,7 +2925,7 @@ mod persistence_tests {
         latest.set_config(&general, &games);
 
         let sent_to = |game: &str| {
-            let [config, _] = latest.next_packets(game, &mut 0, &mut 0);
+            let [config, _] = latest.next_packets(game, None, &mut 0, &mut 0);
             match argus_ipc::read_message(&mut config.unwrap().as_slice()).unwrap() {
                 IpcMessage::Config(config) => (config.fps_limit, config.show_overlay),
                 other => panic!("{other:?}"),
@@ -2895,6 +2935,74 @@ mod persistence_tests {
         assert_eq!(sent_to("Capped.exe"), (60, true));
         // Some(0) lifts the cap for that game; None would inherit it.
         assert_eq!(sent_to("Quiet.exe"), (0, false));
+    }
+
+    /// A profile chosen from the Steam library has no process name: it
+    /// matches whatever runs as that Steam app, launchers included.
+    #[test]
+    fn a_steam_games_profile_matches_every_process_of_the_app() {
+        use crate::config::GameProfile;
+        let games = std::collections::BTreeMap::from([
+            (
+                "steam:620".to_owned(),
+                GameProfile {
+                    park: Some(false),
+                    fps_limit: Some(60),
+                    ..Default::default()
+                },
+            ),
+            (
+                "Own.exe".to_owned(),
+                GameProfile {
+                    fps_limit: Some(30),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let app = |pid: u32| (pid < 10).then(|| "620".to_owned());
+        // The launcher already runs as the app: no wait for the game itself.
+        assert_eq!(
+            detect_gaming([("reaper", 7)].into_iter(), &games, true, app),
+            Detected::On {
+                want: AutoGaming {
+                    boost: true,
+                    park: false,
+                    profile: Some("steam:620".into()),
+                },
+                game: "reaper (7)".into(),
+            }
+        );
+        // Another Steam app is not it.
+        assert_eq!(
+            detect_gaming([("reaper", 70)].into_iter(), &games, true, app),
+            Detected::On {
+                want: AutoGaming {
+                    boost: true,
+                    park: true,
+                    profile: None,
+                },
+                game: "reaper (70)".into(),
+            }
+        );
+
+        let mut latest = ipc_server::Latest::default();
+        let general = argus_ipc::OverlayConfig {
+            fps_limit: 144,
+            ..Default::default()
+        };
+        latest.set_config(&general, &games);
+        let limit = |game: &str, steam_app: Option<&str>| {
+            let [config, _] = latest.next_packets(game, steam_app, &mut 0, &mut 0);
+            match argus_ipc::read_message(&mut config.unwrap().as_slice()).unwrap() {
+                argus_ipc::IpcMessage::Config(config) => config.fps_limit,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(limit("Game.exe", Some("620")), 60);
+        assert_eq!(limit("Game.exe", Some("400")), 144);
+        assert_eq!(limit("Game.exe", None), 144);
+        // A profile under the process name is the more specific one.
+        assert_eq!(limit("Own.exe", Some("620")), 30);
     }
 
     #[test]
@@ -2907,7 +3015,7 @@ mod persistence_tests {
         };
         let no_games = Default::default();
         assert_eq!(
-            detect_gaming([].into_iter(), &no_games, true),
+            detect_gaming([].into_iter(), &no_games, true, |_| None),
             Detected::NoGame
         );
         // Without a profile, detection does what it always did.
@@ -2915,7 +3023,8 @@ mod persistence_tests {
             detect_gaming(
                 [("reaper", 7), ("Game.exe", 9)].into_iter(),
                 &no_games,
-                true
+                true,
+                |_| None
             ),
             Detected::On {
                 want: general(true),
@@ -2950,7 +3059,12 @@ mod persistence_tests {
         .into();
         // The launcher's processes come first; the game's own profile decides.
         assert_eq!(
-            detect_gaming([("reaper", 7), ("Game.exe", 9)].into_iter(), &games, true),
+            detect_gaming(
+                [("reaper", 7), ("Game.exe", 9)].into_iter(),
+                &games,
+                true,
+                |_| None
+            ),
             Detected::On {
                 want: AutoGaming {
                     boost: false,
@@ -2962,14 +3076,19 @@ mod persistence_tests {
         );
         // Until the game's own process exists, the general settings apply.
         assert_eq!(
-            detect_gaming([("reaper", 7)].into_iter(), &games, false),
+            detect_gaming([("reaper", 7)].into_iter(), &games, false, |_| None),
             Detected::On {
                 want: general(false),
                 game: "reaper (7)".into()
             }
         );
         assert_eq!(
-            detect_gaming([("reaper", 7), ("Light.exe", 9)].into_iter(), &games, true),
+            detect_gaming(
+                [("reaper", 7), ("Light.exe", 9)].into_iter(),
+                &games,
+                true,
+                |_| None
+            ),
             Detected::Off {
                 profile: "Light.exe".into()
             }
@@ -2978,7 +3097,7 @@ mod persistence_tests {
         // general setting, either way.
         for auto_park in [true, false] {
             assert_eq!(
-                detect_gaming([("Capped.exe", 9)].into_iter(), &games, auto_park),
+                detect_gaming([("Capped.exe", 9)].into_iter(), &games, auto_park, |_| None),
                 Detected::On {
                     want: AutoGaming {
                         boost: true,

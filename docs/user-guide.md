@@ -206,11 +206,12 @@ The desktop app and game layer always run as the regular user. See
 
 ### Game profiles
 
-**Gaming → Games** holds what differs for one game. A game is known by its process
-name, as the Processes page shows it (`PathOfExileSteam.exe` for a Proton game).
-Games that show the overlay get a card while they run; any other game can be
-added by typing that name. A card whose settings are all back to the general
-ones is forgotten.
+**Gaming → Games** holds what differs for one game. **Steam library…** lists the
+installed Steam games; a profile made that way belongs to the Steam game and
+covers every process it starts, whatever the executable is called. Any other
+game is added by its process name, as the Processes page shows it. Games that
+show the overlay get a card while they run. A card whose settings are all back
+to the general ones is forgotten.
 
 When automatic detection finds the game:
 
@@ -220,14 +221,16 @@ When automatic detection finds the game:
   is set for this game: park the non-preferred CPUs, or do not park.
 - **Raise the priority of game processes** can be turned off for this game.
 
-A Steam game is several processes: Steam's launchers start first, the game's own
-a few seconds later. Until the game's own process exists the general settings
-apply, then its profile takes over; the log says `Using the profile for …`. With
-parking on in general and off for the game, the CPUs are therefore parked for
-those seconds and brought back.
+The log says `Using the profile for …` when a profile applies. A Steam game's
+profile applies from its first process. One stored under a process name applies
+once that process exists: Steam's launchers start a few seconds before it, and
+until then the general settings hold, so with parking on in general and off for
+the game the CPUs are parked for those seconds and brought back. A profile under
+the process name wins over the Steam game's.
 
 The same card has the game's overlay settings (its own frame rate limit, HUD
 hidden) and, while it runs, the state of its HUD; see
 [docs/overlay.md](overlay.md#games-and-their-hud-state).
 
-In `config.toml` a profile is a `[gaming_mode.games."<process name>"]` table.
+In `config.toml` a profile is a `[gaming_mode.games."<process name>"]` or
+`[gaming_mode.games."steam:<appid>"]` table.

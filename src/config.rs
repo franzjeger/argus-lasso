@@ -247,6 +247,40 @@ pub struct GameProfile {
     pub no_gaming_mode: bool,
 }
 
+/// The key a Steam game's profile is stored under: it covers every process
+/// of the game, whatever its executable is called.
+pub fn steam_profile_key(appid: &str) -> String {
+    format!("steam:{appid}")
+}
+
+/// The Steam app a profile key stands for, if it is one of those.
+pub fn steam_app_of(key: &str) -> Option<&str> {
+    key.strip_prefix("steam:")
+}
+
+/// The key of the profile for process `name` of Steam app `steam_app`: one
+/// stored under the process name is the more specific and wins.
+pub fn profile_key(
+    games: &std::collections::BTreeMap<String, GameProfile>,
+    name: &str,
+    steam_app: Option<&str>,
+) -> Option<String> {
+    if games.contains_key(name) {
+        return Some(name.to_owned());
+    }
+    steam_app
+        .map(steam_profile_key)
+        .filter(|key| games.contains_key(key))
+}
+
+/// A profile key as the log names it.
+pub fn profile_label(key: &str) -> String {
+    match steam_app_of(key) {
+        Some(appid) => format!("Steam app {appid}"),
+        None => key.to_owned(),
+    }
+}
+
 impl GameProfile {
     /// Nothing differs: the entry need not be kept.
     pub fn is_default(&self) -> bool {

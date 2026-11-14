@@ -21,7 +21,7 @@ current source, release and verification status, see [docs/status.md](docs/statu
   [docs/overlay.md](docs/overlay.md#frame-rate-limit).
 
 - Game profiles, on the new **Gaming → Games** page: what differs for one game,
-  by its process name. When the game is detected its profile decides whether
+  chosen from the Steam library or named by its process name. When the game is detected its profile decides whether
   Gaming Mode comes on, whether the non-preferred CPUs are parked and whether
   game processes get their priority raised; its overlay can have a frame rate
   limit of its own and the HUD hidden, applied at once. See
