@@ -16,7 +16,8 @@ use std::io::{self, Read, Write};
 /// of the wire types changes, as a reminder.
 ///
 /// 6: postcard instead of bincode 1, which is no longer maintained.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// 7: `OverlayConfig::fps_limit`.
+pub const PROTOCOL_VERSION: u32 = 7;
 pub const MAX_MESSAGE_SIZE: usize = 256 * 1024;
 pub const BUILD_ID: &str = env!("ARGUS_BUILD_ID");
 
@@ -376,6 +377,10 @@ pub struct OverlayConfig {
     pub section_dividers: bool,
     pub graph_hz: u32,
     pub graph_max_ms: u32,
+    /// Frame-rate cap the layer holds presents to, in frames per second.
+    /// 0 is no cap. A property of the layer rather than of the HUD: it
+    /// applies whether or not the HUD is shown.
+    pub fps_limit: u32,
 }
 impl Default for OverlayConfig {
     fn default() -> Self {
@@ -402,7 +407,22 @@ impl Default for OverlayConfig {
             section_dividers: true,
             graph_hz: 60,
             graph_max_ms: 33,
+            fps_limit: 0,
         }
+    }
+}
+
+/// The lowest and highest frame-rate caps: below, a game is unusable and a
+/// typo would look like a hang; above, the cap does nothing.
+pub const FPS_LIMIT_MIN: u32 = 10;
+pub const FPS_LIMIT_MAX: u32 = 1000;
+
+/// A frame-rate cap as it is applied: 0 (no cap) or within the limits.
+pub fn normalized_fps_limit(limit: u32) -> u32 {
+    if limit == 0 {
+        0
+    } else {
+        limit.clamp(FPS_LIMIT_MIN, FPS_LIMIT_MAX)
     }
 }
 
@@ -513,7 +533,7 @@ mod tests {
         }
         assert_eq!(
             (PROTOCOL_VERSION, hash),
-            (6, 0x2864_b8aa_e3e2_0389),
+            (7, 0xe5a8_8077_4c25_9bd2),
             "the wire encoding changed"
         );
     }

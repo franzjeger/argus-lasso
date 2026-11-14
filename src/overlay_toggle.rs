@@ -24,6 +24,8 @@ pub enum Control {
     ProBalance(bool),
     /// Replace the active rules with this saved profile.
     Profile(String),
+    /// Cap games' frame rate; 0 lifts the cap.
+    FpsLimit(u32),
 }
 
 impl Control {
@@ -33,6 +35,7 @@ impl Control {
             Control::Gaming(on) => format!("gaming {}", on_off(on)),
             Control::ProBalance(on) => format!("probalance {}", on_off(on)),
             Control::Profile(name) => format!("profile {name}"),
+            Control::FpsLimit(fps) => format!("fps-limit {fps}"),
         }
     }
 
@@ -46,6 +49,7 @@ impl Control {
         match verb {
             "gaming" => on_off(rest).map(Control::Gaming),
             "probalance" => on_off(rest).map(Control::ProBalance),
+            "fps-limit" => rest.parse().ok().map(Control::FpsLimit),
             // A profile name is free text and may hold spaces, but never a
             // line break: one request is one line.
             "profile" if !rest.is_empty() && !rest.contains(['\n', '\r']) => {
@@ -275,6 +279,8 @@ mod tests {
             Control::ProBalance(true),
             Control::ProBalance(false),
             Control::Profile("with  two spaces".into()),
+            Control::FpsLimit(0),
+            Control::FpsLimit(144),
         ] {
             assert_eq!(Control::parse(&control.encode()), Some(control));
         }

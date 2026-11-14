@@ -554,6 +554,8 @@ impl eframe::App for ArgusLassoApp {
             .sync_gaming_state(gaming_active, gaming_changes);
         self.gaming_mode_tab
             .follow_overlay_shown(config.gaming_mode.overlay.show_overlay);
+        self.gaming_mode_tab
+            .follow_fps_limit(config.gaming_mode.overlay.fps_limit);
 
         // Only push CPU bars + history when the daemon has emitted a new sample.
         // The hwmon temp scan (a full /sys/class/hwmon walk) also lives here —
@@ -712,8 +714,13 @@ impl ArgusLassoApp {
                             cfg.gaming_mode.overlay.show_overlay,
                             c.gaming_mode.overlay.show_overlay,
                         );
+                        let fps_limit = tab.fps_limit(
+                            cfg.gaming_mode.overlay.fps_limit,
+                            c.gaming_mode.overlay.fps_limit,
+                        );
                         c.gaming_mode = cfg.gaming_mode;
                         c.gaming_mode.overlay.show_overlay = shown;
+                        c.gaming_mode.overlay.fps_limit = fps_limit;
                         c.ui.global_overlay = cfg.ui.global_overlay;
                     });
                     self.pending_config_save.dirty = true;
@@ -726,6 +733,8 @@ impl ArgusLassoApp {
             self.update_config(|c| {
                 overlay.show_overlay =
                     tab.overlay_shown(overlay.show_overlay, c.gaming_mode.overlay.show_overlay);
+                overlay.fps_limit =
+                    tab.fps_limit(overlay.fps_limit, c.gaming_mode.overlay.fps_limit);
                 c.gaming_mode.overlay = overlay;
             });
             // The HUD follows every frame of a slider or colour drag through

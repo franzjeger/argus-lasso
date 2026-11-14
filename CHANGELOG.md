@@ -10,6 +10,22 @@ current source, release and verification status, see [docs/status.md](docs/statu
 
 ## [Unreleased]
 
+### Added
+
+- A frame rate limit for games that load the overlay layer: **Gaming → Overlay →
+  Limit frame rate**, or `argus-lasso fps-limit <fps>|off`. It applies at once to
+  running games, with or without the HUD shown, and is off by default.
+  `ARGUS_LASSO_FPS_LIMIT=<fps>` in a game's launch options gives that game its
+  own cap, and `0` exempts it. A game's own limiter gives lower input latency
+  and is the better choice where there is one. See
+  [docs/overlay.md](docs/overlay.md#frame-rate-limit).
+
+### Changed
+
+- The overlay protocol is 7 and its sockets are `overlay-v7.sock`. Restart
+  running games after updating; until then their HUD shows "Telemetry
+  disconnected".
+
 ### Fixed
 
 - The HUD is drawn in HDR games. It was left off every swapchain that was not

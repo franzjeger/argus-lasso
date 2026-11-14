@@ -410,6 +410,8 @@ fn load_from(path: &Path) -> (Config, Option<String>) {
         Ok(text) => match toml::from_str::<Config>(&text) {
             Ok(mut cfg) => {
                 cfg.probalance.normalize();
+                let overlay = &mut cfg.gaming_mode.overlay;
+                overlay.fps_limit = argus_ipc::normalized_fps_limit(overlay.fps_limit);
                 log::info!("Loaded config from {}", path.display());
                 return (cfg, None);
             }

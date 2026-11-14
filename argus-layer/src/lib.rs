@@ -14,7 +14,8 @@ mod activation;
 mod capture;
 pub mod font;
 pub mod hud;
-pub mod renderer;
+mod limiter;
+mod renderer;
 
 use argus_ipc::{IpcMessage, OverlayConfig, TelemetryFrame};
 use ash::vk;
@@ -1070,6 +1071,12 @@ pub unsafe extern "system" fn argus_vkQueuePresentKHR(
     guard(
         "vkQueuePresentKHR",
         std::panic::AssertUnwindSafe(|| {
+            if *ACTIVE {
+                // Before the recording's clock starts: a held frame is
+                // measured from when it is presented.
+                let limit = OVERLAY_CONFIG.read_or_recover().fps_limit;
+                limiter::wait(limit);
+            }
             let ticket = if *ACTIVE { capture::ticket() } else { 0 };
             let begin = (ticket != 0).then(Instant::now);
             let result = present_impl(queue, info);

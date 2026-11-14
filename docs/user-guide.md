@@ -142,6 +142,7 @@ from a keyboard shortcut, a script or a game launcher:
 ```bash
 argus-lasso gaming on|off        # as the tray's Gaming Mode checkbox
 argus-lasso probalance on|off    # the ProBalance switch; saved like a click
+argus-lasso fps-limit 120|off    # cap games' frame rate; see docs/overlay.md
 argus-lasso profile              # list the saved rule profiles
 argus-lasso profile "Work"       # replace the active rules with that profile
 ```
