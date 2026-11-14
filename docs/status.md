@@ -1,10 +1,30 @@
 # Project status
 
-Reviewed on **2026-11-11**. Version **1.6.0** is the current source: package
-version `1.6.0`, IPC protocol 6. Its release is tagged `v1.6.0`; the archives are
+Reviewed on **2026-11-14**. Version **1.7.0** is the current source: package
+version `1.7.0`, IPC protocol 8. Its release is tagged `v1.7.0`; the archives are
 published once the release run has been approved in the `release` environment.
-[v1.5.1](https://github.com/franzjeger/argus-lasso/releases/tag/v1.5.1) is the
+[v1.6.0](https://github.com/franzjeger/argus-lasso/releases/tag/v1.6.0) is the
 previous release.
+
+## Release candidate verification (1.7.0)
+
+Run on 2026-11-14 on the release branch:
+
+- `cargo fmt --all --check` and workspace Clippy (`--workspace --all-targets --locked -- -D warnings`) passed.
+- Workspace tests passed: **370 tests** (`309` in `argus-lasso`, `36` in `argus-layer`, `20` in `argus-ipc`, `5` in `argus-sensors`).
+- The read-only X11/Xvfb tour completed all 20 screens.
+- On the development host (NVIDIA, COSMIC on Wayland, Proton's Wayland driver)
+  with Path of Exile 2 in HDR10: the HUD is drawn, the game's Steam profile is
+  taken from the launcher's first process, and choosing a game in the Steam
+  picker and the overlay presets work.
+- The Launch button was run on a virtual display with a card of its own command
+  (`vkcube`): the process was found, the card's frame rate limit applied and
+  the exit noticed.
+- Not run: Launch for an actual Steam or Lutris game, and Gaming Mode going on
+  and off around such a launch; the frame rate limit together with DLSS or FSR
+  frame generation; the overlay shortcut of the GlobalShortcuts portal, which
+  the host's desktop does not offer; scRGB swapchains, whose conversion is
+  covered by unit tests only.
 
 ## Release candidate verification (1.6.0)
 
