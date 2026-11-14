@@ -391,10 +391,6 @@ impl ArgusLassoApp {
             Step::Log => self.active_tab = Tab::Log,
             Step::Settings => self.active_tab = Tab::Settings,
 
-            Step::GamingLauncher => {
-                self.active_tab = Tab::GamingMode;
-                self.gaming_mode_tab.section = crate::gui::gaming_mode_tab::GamingSection::Launcher;
-            }
             Step::GamingGames => {
                 self.active_tab = Tab::GamingMode;
                 self.gaming_mode_tab.section = crate::gui::gaming_mode_tab::GamingSection::Games;
