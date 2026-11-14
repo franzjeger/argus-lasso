@@ -199,8 +199,10 @@ impl Default for HwAlertConfig {
     }
 }
 
-/// A single gaming-mode profile (game launcher + CPU park settings).
+/// A launcher profile as versions up to 1.6 stored it. Only read, to turn
+/// it into a game on the Games page (see `adopt_launcher_profiles`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct GamingProfile {
     pub game_name: String,
     pub command: String,
@@ -213,6 +215,8 @@ pub struct GamingProfile {
 #[serde(default)]
 #[derive(Default)]
 pub struct GamingModeConfig {
+    /// The old launcher's profiles; empty once loaded, and not written.
+    #[serde(skip_serializing)]
     pub profiles: std::collections::HashMap<String, GamingProfile>,
     /// Auto-enable Gaming Mode when a running game is detected
     /// (Steam/Proton heuristics on the process cmdline).
@@ -222,9 +226,9 @@ pub struct GamingModeConfig {
     /// Vulkan overlay configuration
     #[serde(default)]
     pub overlay: argus_ipc::OverlayConfig,
-    /// What differs for one game, by its process name as the process table
-    /// shows it: the name its overlay layer connects under, and the one
-    /// game detection finds it by.
+    /// The games of the Games page and what differs for each. The key is a
+    /// process name as the process table shows it, `steam:<appid>` or
+    /// `lutris:<slug>`.
     pub games: std::collections::BTreeMap<String, GameProfile>,
 }
 
@@ -245,6 +249,11 @@ pub struct GameProfile {
     pub no_boost: bool,
     /// Detecting this game does not turn Gaming Mode on at all.
     pub no_gaming_mode: bool,
+    /// What the game is called, for one chosen from a library.
+    pub title: String,
+    /// What "Launch" runs. Empty for none, or for the one a Steam or Lutris
+    /// game has by itself.
+    pub command: String,
 }
 
 /// The key a Steam game's profile is stored under: it covers every process
@@ -258,35 +267,101 @@ pub fn steam_app_of(key: &str) -> Option<&str> {
     key.strip_prefix("steam:")
 }
 
-/// The key of the profile for process `name` of Steam app `steam_app`: one
-/// stored under the process name is the more specific and wins.
+/// The key of the profile for process `name` of Steam app `steam_app`,
+/// which Argus launched as the game `launched`: one stored under the process
+/// name is the most specific and wins, then the Steam game's.
 pub fn profile_key(
     games: &std::collections::BTreeMap<String, GameProfile>,
     name: &str,
     steam_app: Option<&str>,
+    launched: Option<&str>,
 ) -> Option<String> {
     if games.contains_key(name) {
         return Some(name.to_owned());
     }
     steam_app
         .map(steam_profile_key)
+        .or(launched.map(str::to_owned))
         .filter(|key| games.contains_key(key))
+}
+
+/// The key of a game chosen from the Lutris library.
+pub fn lutris_profile_key(slug: &str) -> String {
+    format!("lutris:{slug}")
+}
+
+pub fn lutris_slug_of(key: &str) -> Option<&str> {
+    key.strip_prefix("lutris:")
+}
+
+/// What "Launch" runs for the game stored under `key`: its own command, or
+/// the one Steam and Lutris games have by themselves.
+pub fn launch_command(key: &str, game: &GameProfile) -> Option<String> {
+    let own = game.command.trim();
+    if !own.is_empty() {
+        return Some(own.to_owned());
+    }
+    if let Some(appid) = steam_app_of(key) {
+        return Some(format!("steam -applaunch {appid}"));
+    }
+    lutris_slug_of(key).map(|slug| format!("lutris lutris:rungame/{slug}"))
+}
+
+/// Turn the old launcher's profiles into games: a Steam or Lutris one by
+/// what its command launched, any other under its game name with the command
+/// kept. A game that is there already keeps its settings. The profile's own
+/// choice of preferred CPUs has no counterpart and is dropped.
+pub fn adopt_launcher_profiles(gaming: &mut GamingModeConfig) {
+    let id_after = |command: &str, prefix: &str, allowed: fn(char) -> bool| {
+        let id: String = command
+            .trim()
+            .strip_prefix(prefix)?
+            .chars()
+            .take_while(|c| allowed(*c))
+            .collect();
+        (!id.is_empty()).then_some(id)
+    };
+    let mut profiles: Vec<_> = std::mem::take(&mut gaming.profiles).into_iter().collect();
+    profiles.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, profile) in profiles {
+        let steam = id_after(&profile.command, "steam -applaunch ", |c| {
+            c.is_ascii_digit()
+        });
+        let lutris = id_after(&profile.command, "lutris lutris:rungame/", |c| {
+            c.is_ascii_alphanumeric() || c == '-' || c == '_'
+        });
+        let (key, command) = match (steam, lutris) {
+            (Some(appid), _) => (steam_profile_key(&appid), String::new()),
+            (_, Some(slug)) => (lutris_profile_key(&slug), String::new()),
+            _ if !profile.game_name.trim().is_empty() => (
+                profile.game_name.trim().to_owned(),
+                profile.command.trim().to_owned(),
+            ),
+            _ => (name, profile.command.trim().to_owned()),
+        };
+        let library_game = command.is_empty();
+        gaming.games.entry(key).or_insert(GameProfile {
+            no_boost: !profile.elevate_nice,
+            title: match library_game {
+                true => profile.game_name.trim().trim_end_matches('"').to_owned(),
+                false => String::new(),
+            },
+            command,
+            ..Default::default()
+        });
+    }
 }
 
 /// A profile key as the log names it.
 pub fn profile_label(key: &str) -> String {
-    match steam_app_of(key) {
-        Some(appid) => format!("Steam app {appid}"),
-        None => key.to_owned(),
+    match (steam_app_of(key), lutris_slug_of(key)) {
+        (Some(appid), _) => format!("Steam app {appid}"),
+        (_, Some(slug)) => format!("Lutris game {slug}"),
+        _ => key.to_owned(),
     }
 }
 
 impl GameProfile {
-    /// Nothing differs: the entry need not be kept.
-    pub fn is_default(&self) -> bool {
-        *self == Self::default()
-    }
-
     /// The overlay settings as this game gets them.
     pub fn apply(&self, general: &argus_ipc::OverlayConfig) -> argus_ipc::OverlayConfig {
         let mut config = general.clone();
@@ -486,7 +561,7 @@ fn load_from(path: &Path) -> (Config, Option<String>) {
                 cfg.probalance.normalize();
                 let overlay = &mut cfg.gaming_mode.overlay;
                 overlay.fps_limit = argus_ipc::normalized_fps_limit(overlay.fps_limit);
-                cfg.gaming_mode.games.retain(|_, game| !game.is_default());
+                adopt_launcher_profiles(&mut cfg.gaming_mode);
                 log::info!("Loaded config from {}", path.display());
                 return (cfg, None);
             }
@@ -716,13 +791,75 @@ mod tests {
         assert!(cfg.rules.is_empty());
     }
 
+    /// What the Launcher page of 1.6 and earlier stored becomes games.
+    #[test]
+    fn the_old_launchers_profiles_become_games() {
+        let text = r#"
+[gaming_mode.profiles.rome]
+game_name = 'Total War: ROME II - Emperor Edition"'
+command = 'steam -applaunch 214950"'
+elevate_nice = true
+[gaming_mode.profiles.rome.cpu_states]
+17 = true
+
+[gaming_mode.profiles.witcher]
+game_name = "The Witcher 3"
+command = "lutris lutris:rungame/the-witcher-3"
+elevate_nice = false
+
+[gaming_mode.profiles.custom]
+game_name = "Game.exe"
+command = "/opt/game/run --fast"
+elevate_nice = true
+
+[gaming_mode.profiles.kept]
+game_name = "Portal 2"
+command = "steam -applaunch 620"
+
+[gaming_mode.games."steam:620"]
+fps_limit = 60
+"#;
+        let mut cfg: Config = toml::from_str(text).expect("parse");
+        adopt_launcher_profiles(&mut cfg.gaming_mode);
+        let games = &cfg.gaming_mode.games;
+        assert!(cfg.gaming_mode.profiles.is_empty());
+
+        let rome = &games["steam:214950"];
+        assert_eq!(rome.title, "Total War: ROME II - Emperor Edition");
+        assert_eq!(
+            launch_command("steam:214950", rome).as_deref(),
+            Some("steam -applaunch 214950")
+        );
+        assert!(!rome.no_boost);
+
+        let witcher = &games["lutris:the-witcher-3"];
+        assert!(witcher.no_boost);
+        assert_eq!(
+            launch_command("lutris:the-witcher-3", witcher).as_deref(),
+            Some("lutris lutris:rungame/the-witcher-3")
+        );
+
+        assert_eq!(
+            launch_command("Game.exe", &games["Game.exe"]).as_deref(),
+            Some("/opt/game/run --fast")
+        );
+        assert_eq!(launch_command("Other.exe", &GameProfile::default()), None);
+
+        // A game that was there already keeps its settings.
+        assert_eq!(games["steam:620"].fps_limit, Some(60));
+        assert_eq!(games.len(), 4);
+
+        // Written back, the old profiles are gone for good.
+        let text = toml::to_string_pretty(&cfg).expect("serialise");
+        assert!(!text.contains("profiles."), "{text}");
+    }
+
     #[test]
     fn a_games_own_overlay_settings_apply_over_the_general_ones() {
         let general = argus_ipc::OverlayConfig {
             fps_limit: 144,
             ..Default::default()
         };
-        assert!(GameProfile::default().is_default());
         assert_eq!(GameProfile::default().apply(&general), general);
 
         let own = GameProfile {

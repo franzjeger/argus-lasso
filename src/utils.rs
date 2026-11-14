@@ -649,11 +649,31 @@ pub fn steam_app_id(pid: u32) -> Option<String> {
 }
 
 fn steam_app_in(environ: &[u8]) -> Option<String> {
+    let id = env_value(environ, "SteamAppId")?;
+    // 0 is what a non-Steam shortcut gets.
+    (id != "0" && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
+}
+
+/// The variable the Games page's "Launch" sets on what it starts, holding
+/// the game's key: everything the launched command starts inherits it.
+pub const LAUNCHED_GAME_ENV: &str = "ARGUS_LASSO_GAME";
+
+/// The game `pid` was launched as from the Games page, with the Steam app
+/// it runs as: what its profile can be stored under besides its name.
+pub fn game_identity(pid: u32) -> (Option<String>, Option<String>) {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+    (
+        steam_app_in(&environ),
+        env_value(&environ, LAUNCHED_GAME_ENV),
+    )
+}
+
+/// A non-empty variable of a `/proc/<pid>/environ` block.
+fn env_value(environ: &[u8], name: &str) -> Option<String> {
     environ.split(|byte| *byte == 0).find_map(|var| {
-        let id = std::str::from_utf8(var.strip_prefix(b"SteamAppId=")?).ok()?;
-        // 0 is what a non-Steam shortcut gets.
-        (id != "0" && !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| id.to_owned())
+        let value = var.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
+        let value = std::str::from_utf8(value).ok()?;
+        (!value.is_empty()).then(|| value.to_owned())
     })
 }
 
