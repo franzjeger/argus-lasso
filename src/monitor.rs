@@ -312,7 +312,7 @@ pub fn shutdown_and_wait(state: &Arc<Mutex<AppState>>, cmd_tx: &Sender<DaemonCmd
 // ── Overlay IPC Server ────────────────────────────────────────────────────────
 
 mod ipc_server {
-    use crate::config::GameOverlay;
+    use crate::config::GameProfile;
     use argus_ipc::{IpcMessage, OverlayConfig};
     use std::collections::BTreeMap;
     use std::io::Write;
@@ -358,7 +358,7 @@ mod ipc_server {
     #[derive(Default)]
     pub(super) struct Latest {
         config: Option<OverlayConfig>,
-        games: BTreeMap<String, GameOverlay>,
+        games: BTreeMap<String, GameProfile>,
         telemetry: Option<Vec<u8>>,
         config_gen: u64,
         telemetry_gen: u64,
@@ -367,7 +367,7 @@ mod ipc_server {
         pub(super) fn set_config(
             &mut self,
             config: &OverlayConfig,
-            games: &BTreeMap<String, GameOverlay>,
+            games: &BTreeMap<String, GameProfile>,
         ) {
             self.config = Some(config.clone());
             self.games = games.clone();
@@ -620,7 +620,7 @@ mod ipc_server {
         }
         /// The overlay settings, and what differs per game; each client is
         /// sent its own.
-        pub fn set_config(&self, config: &OverlayConfig, games: &BTreeMap<String, GameOverlay>) {
+        pub fn set_config(&self, config: &OverlayConfig, games: &BTreeMap<String, GameProfile>) {
             let mut latest = self.latest.0.lock().unwrap_or_else(|e| e.into_inner());
             latest.set_config(config, games);
             self.latest.1.notify_all();
@@ -823,7 +823,77 @@ struct GamingState {
     /// The user turned Gaming Mode off while a game ran: detection must not
     /// turn it straight back on. Cleared once no game is detected.
     manual_off: bool,
+    /// What detection applied when it turned Gaming Mode on, to move from
+    /// when a profile takes over and to undo when the game exits.
+    applied: Option<AutoGaming>,
     launch_profiles: Vec<argus_ipc::LaunchProfile>,
+}
+
+/// What a detected game asks of Gaming Mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutoGaming {
+    /// Raise the priority of game processes.
+    boost: bool,
+    /// Park the non-preferred CPUs.
+    park: bool,
+    /// The game whose profile says so; None for the general settings.
+    profile: Option<String>,
+}
+
+/// What game detection found in a snapshot.
+#[derive(Debug, PartialEq, Eq)]
+enum Detected {
+    NoGame,
+    /// A game whose profile keeps Gaming Mode off.
+    Off {
+        profile: String,
+    },
+    On {
+        want: AutoGaming,
+        /// The first game process, for the log.
+        game: String,
+    },
+}
+
+/// What the game processes of a snapshot ask of Gaming Mode. A game is
+/// several processes (Steam's launchers, Proton, then the game itself); the
+/// first one with a profile of its own decides for all of them.
+fn detect_gaming<'a>(
+    game_processes: impl Iterator<Item = (&'a str, u32)>,
+    games: &std::collections::BTreeMap<String, crate::config::GameProfile>,
+    auto_park: bool,
+) -> Detected {
+    let mut first = None;
+    for (name, pid) in game_processes {
+        first.get_or_insert_with(|| format!("{name} ({pid})"));
+        let Some(profile) = games.get(name) else {
+            continue;
+        };
+        if profile.no_gaming_mode {
+            return Detected::Off {
+                profile: name.to_owned(),
+            };
+        }
+        return Detected::On {
+            want: AutoGaming {
+                boost: !profile.no_boost,
+                park: profile.park.unwrap_or(auto_park),
+                profile: Some(name.to_owned()),
+            },
+            game: first.unwrap_or_default(),
+        };
+    }
+    match first {
+        Some(game) => Detected::On {
+            want: AutoGaming {
+                boost: true,
+                park: auto_park,
+                profile: None,
+            },
+            game,
+        },
+        None => Detected::NoGame,
+    }
 }
 
 /// Everything the monitor thread keeps between passes. Each phase of a pass
@@ -1377,45 +1447,105 @@ impl Daemon {
 
     /// Auto Gaming Mode (Steam/Proton detection).
     fn detect_game(&mut self) {
-        let game = self.raw_snapshot.iter().find(|p| is_game_process(p));
-        let gaming = &mut self.gaming;
-        if let Some(game) = game {
-            gaming.absent_snapshots = 0;
-            if !gaming.active && !gaming.manual_off {
-                gaming.active = true;
-                gaming.elevate_nice = true;
-                gaming.auto = true;
-                (self.log)(format!(
-                    "[Gaming Mode] Auto-enabled — game detected: {} ({})",
-                    game.name, game.pid
-                ));
-                // Detection turns Gaming Mode on even if parking fails:
-                // the priority boost still applies.
-                if self.config.gaming_mode.auto_park {
-                    apply_gaming_parking(true, &Parking::NonPreferred, &self.log);
+        let detected = detect_gaming(
+            self.raw_snapshot
+                .iter()
+                .filter(|p| is_game_process(p))
+                .map(|p| (p.name.as_ref(), p.pid)),
+            &self.config.gaming_mode.games,
+            self.config.gaming_mode.auto_park,
+        );
+        match detected {
+            Detected::On { want, game } => {
+                self.gaming.absent_snapshots = 0;
+                if !self.gaming.active && !self.gaming.manual_off {
+                    self.gaming.active = true;
+                    self.gaming.elevate_nice = want.boost;
+                    self.gaming.auto = true;
+                    (self.log)(format!(
+                        "[Gaming Mode] Auto-enabled — game detected: {game}"
+                    ));
+                    if let Some(profile) = &want.profile {
+                        (self.log)(format!("[Gaming Mode] Using the profile for {profile}."));
+                    }
+                    // Detection turns Gaming Mode on even if parking fails:
+                    // the priority boost still applies.
+                    if want.park {
+                        apply_gaming_parking(true, &Parking::NonPreferred, &self.log);
+                    }
+                    self.gaming.applied = Some(want);
+                    publish_gaming_state(&self.state, true);
+                    // The game that turned it on is running already.
+                    self.boost_running();
+                } else if self.gaming.active
+                    && self.gaming.auto
+                    && self.gaming.applied.as_ref() != Some(&want)
+                {
+                    self.follow_profile(want);
                 }
-                publish_gaming_state(&self.state, true);
-                // The game that turned it on is running already.
-                self.boost_running();
             }
-        } else if std::mem::take(&mut gaming.manual_off) {
-            // The game ended: detection may turn Gaming Mode on again.
-        } else if gaming.auto && gaming.active {
-            // Require a couple of game-free snapshots before restoring,
-            // so a brief exec/restart doesn't bounce the CPUs.
-            gaming.absent_snapshots += 1;
-            if gaming.absent_snapshots >= 2 {
-                gaming.active = false;
-                gaming.auto = false;
-                gaming.absent_snapshots = 0;
-                (self.log)("[Gaming Mode] Auto-disabled — game exited.".into());
-                self.rule_state.end(Owner::Gaming, &self.log);
-                if self.config.gaming_mode.auto_park {
-                    apply_gaming_parking(false, &Parking::Keep, &self.log);
+            Detected::Off { profile } => {
+                self.gaming.absent_snapshots = 0;
+                if self.gaming.auto && self.gaming.active {
+                    self.auto_disable(&format!("the profile for {profile} keeps it off"));
                 }
-                publish_gaming_state(&self.state, false);
+            }
+            Detected::NoGame => {
+                if std::mem::take(&mut self.gaming.manual_off) {
+                    // The game ended: detection may turn Gaming Mode on again.
+                } else if self.gaming.auto && self.gaming.active {
+                    // Require a couple of game-free snapshots before restoring,
+                    // so a brief exec/restart doesn't bounce the CPUs.
+                    self.gaming.absent_snapshots += 1;
+                    if self.gaming.absent_snapshots >= 2 {
+                        self.auto_disable("game exited");
+                    }
+                }
             }
         }
+    }
+
+    /// Turn off the Gaming Mode detection turned on, undoing what it did.
+    fn auto_disable(&mut self, why: &str) {
+        let applied = self.gaming.applied.take();
+        self.gaming.active = false;
+        self.gaming.auto = false;
+        self.gaming.absent_snapshots = 0;
+        (self.log)(format!("[Gaming Mode] Auto-disabled — {why}."));
+        self.rule_state.end(Owner::Gaming, &self.log);
+        // What was parked when it came on, whatever the settings say now.
+        if applied.is_some_and(|applied| applied.park) {
+            apply_gaming_parking(false, &Parking::Keep, &self.log);
+        }
+        publish_gaming_state(&self.state, false);
+    }
+
+    /// Gaming Mode is on by detection, and what the running game asks of it
+    /// changed: its own process appeared after the launcher's, or its
+    /// profile was edited. Move from what was applied to `want`.
+    fn follow_profile(&mut self, want: AutoGaming) {
+        let applied = self.gaming.applied.take().unwrap_or(AutoGaming {
+            boost: self.gaming.elevate_nice,
+            park: false,
+            profile: None,
+        });
+        match &want.profile {
+            Some(profile) => (self.log)(format!("[Gaming Mode] Using the profile for {profile}.")),
+            None => (self.log)("[Gaming Mode] Back to the general settings.".into()),
+        }
+        if want.park && !applied.park {
+            apply_gaming_parking(true, &Parking::NonPreferred, &self.log);
+        } else if !want.park && applied.park && !utils::get_offline_cpus().is_empty() {
+            (self.log)("[Gaming Mode] Unparking all CPUs…".into());
+            cpu_park::unpark_all(&self.log);
+        }
+        self.gaming.elevate_nice = want.boost;
+        if want.boost && !applied.boost {
+            self.boost_running();
+        } else if !want.boost && applied.boost {
+            self.rule_state.end(Owner::Gaming, &self.log);
+        }
+        self.gaming.applied = Some(want);
     }
 
     /// Apply Gaming Mode's boost to the processes already running, as it is
@@ -2726,7 +2856,7 @@ mod persistence_tests {
 
     #[test]
     fn each_game_is_sent_the_settings_with_its_own_differences() {
-        use crate::config::GameOverlay;
+        use crate::config::GameProfile;
         use argus_ipc::{IpcMessage, OverlayConfig};
         let general = OverlayConfig {
             fps_limit: 144,
@@ -2735,16 +2865,18 @@ mod persistence_tests {
         let games = [
             (
                 "Capped.exe".to_owned(),
-                GameOverlay {
+                GameProfile {
                     fps_limit: Some(60),
                     hide_hud: false,
+                    ..Default::default()
                 },
             ),
             (
                 "Quiet.exe".to_owned(),
-                GameOverlay {
+                GameProfile {
                     fps_limit: Some(0),
                     hide_hud: true,
+                    ..Default::default()
                 },
             ),
         ]
@@ -2763,6 +2895,100 @@ mod persistence_tests {
         assert_eq!(sent_to("Capped.exe"), (60, true));
         // Some(0) lifts the cap for that game; None would inherit it.
         assert_eq!(sent_to("Quiet.exe"), (0, false));
+    }
+
+    #[test]
+    fn a_games_profile_decides_what_detection_asks_of_gaming_mode() {
+        use crate::config::GameProfile;
+        let general = |park| AutoGaming {
+            boost: true,
+            park,
+            profile: None,
+        };
+        let no_games = Default::default();
+        assert_eq!(
+            detect_gaming([].into_iter(), &no_games, true),
+            Detected::NoGame
+        );
+        // Without a profile, detection does what it always did.
+        assert_eq!(
+            detect_gaming(
+                [("reaper", 7), ("Game.exe", 9)].into_iter(),
+                &no_games,
+                true
+            ),
+            Detected::On {
+                want: general(true),
+                game: "reaper (7)".into()
+            }
+        );
+
+        let games = [
+            (
+                "Game.exe".to_owned(),
+                GameProfile {
+                    park: Some(false),
+                    no_boost: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "Light.exe".to_owned(),
+                GameProfile {
+                    no_gaming_mode: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "Capped.exe".to_owned(),
+                GameProfile {
+                    fps_limit: Some(60),
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into();
+        // The launcher's processes come first; the game's own profile decides.
+        assert_eq!(
+            detect_gaming([("reaper", 7), ("Game.exe", 9)].into_iter(), &games, true),
+            Detected::On {
+                want: AutoGaming {
+                    boost: false,
+                    park: false,
+                    profile: Some("Game.exe".into()),
+                },
+                game: "reaper (7)".into()
+            }
+        );
+        // Until the game's own process exists, the general settings apply.
+        assert_eq!(
+            detect_gaming([("reaper", 7)].into_iter(), &games, false),
+            Detected::On {
+                want: general(false),
+                game: "reaper (7)".into()
+            }
+        );
+        assert_eq!(
+            detect_gaming([("reaper", 7), ("Light.exe", 9)].into_iter(), &games, true),
+            Detected::Off {
+                profile: "Light.exe".into()
+            }
+        );
+        // A profile that only caps the frame rate leaves parking to the
+        // general setting, either way.
+        for auto_park in [true, false] {
+            assert_eq!(
+                detect_gaming([("Capped.exe", 9)].into_iter(), &games, auto_park),
+                Detected::On {
+                    want: AutoGaming {
+                        boost: true,
+                        park: auto_park,
+                        profile: Some("Capped.exe".into()),
+                    },
+                    game: "Capped.exe (9)".into()
+                }
+            );
+        }
     }
 
     #[test]

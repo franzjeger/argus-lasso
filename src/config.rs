@@ -222,23 +222,32 @@ pub struct GamingModeConfig {
     /// Vulkan overlay configuration
     #[serde(default)]
     pub overlay: argus_ipc::OverlayConfig,
-    /// What differs for one game, by the process name its layer connects
-    /// under (as the process table shows it).
-    pub games: std::collections::BTreeMap<String, GameOverlay>,
+    /// What differs for one game, by its process name as the process table
+    /// shows it: the name its overlay layer connects under, and the one
+    /// game detection finds it by.
+    pub games: std::collections::BTreeMap<String, GameProfile>,
 }
 
-/// One game's departures from the overlay settings.
+/// One game's departures from the general settings: how Gaming Mode
+/// treats it, and what its overlay layer is sent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct GameOverlay {
+pub struct GameProfile {
     /// This game's frame-rate cap instead of the general one; `Some(0)` is
     /// no cap for this game.
     pub fps_limit: Option<u32>,
     /// Never show the HUD in this game.
     pub hide_hud: bool,
+    /// Whether detecting this game parks the non-preferred CPUs, instead of
+    /// following `auto_park`.
+    pub park: Option<bool>,
+    /// Detecting this game does not raise the priority of game processes.
+    pub no_boost: bool,
+    /// Detecting this game does not turn Gaming Mode on at all.
+    pub no_gaming_mode: bool,
 }
 
-impl GameOverlay {
+impl GameProfile {
     /// Nothing differs: the entry need not be kept.
     pub fn is_default(&self) -> bool {
         *self == Self::default()
@@ -679,12 +688,13 @@ mod tests {
             fps_limit: 144,
             ..Default::default()
         };
-        assert!(GameOverlay::default().is_default());
-        assert_eq!(GameOverlay::default().apply(&general), general);
+        assert!(GameProfile::default().is_default());
+        assert_eq!(GameProfile::default().apply(&general), general);
 
-        let own = GameOverlay {
+        let own = GameProfile {
             fps_limit: Some(5),
             hide_hud: true,
+            ..Default::default()
         };
         let applied = own.apply(&general);
         // Brought into range like the general limit.
@@ -696,7 +706,7 @@ mod tests {
             show_overlay: false,
             ..general
         };
-        assert!(!GameOverlay::default().apply(&hidden).show_overlay);
+        assert!(!GameProfile::default().apply(&hidden).show_overlay);
     }
 
     #[test]
@@ -704,9 +714,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.gaming_mode.games.insert(
             "PathOfExileSteam.exe".into(),
-            GameOverlay {
+            GameProfile {
                 fps_limit: Some(120),
                 hide_hud: false,
+                ..Default::default()
             },
         );
         let text = toml::to_string(&cfg).unwrap();
