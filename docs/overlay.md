@@ -32,6 +32,25 @@ For a loaded layer without any HUD drawing:
 ARGUS_LASSO_HUD=1 ARGUS_LASSO_DRAW=0 %command%
 ```
 
+### HDR
+
+The HUD is drawn on HDR swapchains: HDR10 (PQ, BT.2020) and scRGB. Its colours
+are converted so that HUD white is 203 nits, the usual reference white, however
+bright the game's highlights are. Set another level, from 80 to 1000 nits, with:
+
+```text
+ARGUS_LASSO_HUD_NITS=300 %command%
+```
+
+Proton's Wayland driver (`PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1`) describes
+the image to the compositor itself and creates a *pass-through* swapchain that
+does not say what it holds. The layer then goes by the format: ten bits per
+channel is taken as HDR10, half-float as scRGB, anything else as sRGB. If a game
+uses a ten-bit swapchain for SDR, the HUD comes out dim; say what the swapchain
+holds with `ARGUS_LASSO_HUD_COLORSPACE=srgb` (or `hdr10`, `scrgb`). The variable
+only affects pass-through swapchains. Other colour spaces (Display P3, linear
+BT.2020 and so on) get no HUD; the layer's log line says which one it met.
+
 Keep the same daemon, policies, sensors, resolution, graphics settings and scene
 between comparisons. Disable unrelated overlays unless they are the consistent
 external measurement tool. Repeat and rotate cases; report the measurement window

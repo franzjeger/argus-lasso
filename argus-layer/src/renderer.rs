@@ -11,6 +11,8 @@ pub struct OverlayState {
     /// The device every resource below belongs to.
     pub device: vk::Device,
     pub format: vk::Format,
+    pub encoding: Encoding,
+    pub hud_nits: f32,
     pub extent: vk::Extent2D,
 
     pub command_pool: vk::CommandPool,
@@ -61,12 +63,94 @@ pub struct OverlayState {
     last_graph: Option<std::time::Instant>,
 }
 
+/// What the swapchain expects the HUD's colours to be written as. The
+/// discriminants are overlay.frag's `TARGET_ENCODING` values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum Encoding {
+    /// sRGB-encoded values, written as they are.
+    Srgb = 0,
+    /// Linear values; an `*_SRGB` format encodes them on write.
+    Linear = 1,
+    /// HDR10: BT.2020 primaries, PQ (ST 2084).
+    Pq = 2,
+    /// scRGB: linear BT.709 primaries, 1.0 = 80 nits.
+    ScRgb = 3,
+}
+
+/// HUD white on an HDR target: the BT.2408 reference white.
+pub const DEFAULT_HUD_NITS: f32 = 203.0;
+
 /// Whether writes to `format` are encoded to sRGB by the hardware.
 fn is_srgb(format: vk::Format) -> bool {
     matches!(
         format,
         vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB | vk::Format::A8B8G8R8_SRGB_PACK32
     )
+}
+
+fn is_10_bit(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::A2R10G10B10_UNORM_PACK32 | vk::Format::A2B10G10R10_UNORM_PACK32
+    )
+}
+
+/// How to write the HUD into a swapchain of this format and colour space, or
+/// `None` for one the HUD cannot be drawn on correctly.
+///
+/// `PASS_THROUGH` says nothing about the contents: the application describes
+/// them to the compositor itself (Wine's Wayland driver does this for HDR).
+/// The format is then the only evidence. Ten bits per channel is taken as
+/// HDR10 and half-float as scRGB; if that guess is wrong the HUD comes out
+/// dim, whereas sRGB values read as PQ would be far too bright.
+/// `forced` (`ARGUS_LASSO_HUD_COLORSPACE`) overrides the guess.
+pub fn target_encoding(
+    format: vk::Format,
+    color_space: vk::ColorSpaceKHR,
+    forced: Option<Encoding>,
+) -> Option<Encoding> {
+    let srgb = if is_srgb(format) {
+        Encoding::Linear
+    } else {
+        Encoding::Srgb
+    };
+    match color_space {
+        vk::ColorSpaceKHR::SRGB_NONLINEAR => Some(srgb),
+        vk::ColorSpaceKHR::HDR10_ST2084_EXT if !is_srgb(format) => Some(Encoding::Pq),
+        vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT
+            if format == vk::Format::R16G16B16A16_SFLOAT =>
+        {
+            Some(Encoding::ScRgb)
+        }
+        // An *_SRGB format encodes on write whatever the contents mean.
+        vk::ColorSpaceKHR::PASS_THROUGH_EXT if is_srgb(format) => Some(Encoding::Linear),
+        vk::ColorSpaceKHR::PASS_THROUGH_EXT => Some(forced.unwrap_or(match format {
+            f if is_10_bit(f) => Encoding::Pq,
+            vk::Format::R16G16B16A16_SFLOAT => Encoding::ScRgb,
+            _ => Encoding::Srgb,
+        })),
+        _ => None,
+    }
+}
+
+/// `ARGUS_LASSO_HUD_COLORSPACE`: what a pass-through swapchain holds.
+pub fn parse_encoding(value: &str) -> Option<Encoding> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "srgb" | "sdr" => Some(Encoding::Srgb),
+        "pq" | "hdr10" => Some(Encoding::Pq),
+        "scrgb" => Some(Encoding::ScRgb),
+        _ => None,
+    }
+}
+
+/// `ARGUS_LASSO_HUD_NITS`: HUD white on an HDR target, kept to a range that
+/// is neither invisible nor blinding.
+pub fn parse_nits(value: Option<&str>) -> f32 {
+    value
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|n| n.is_finite())
+        .map_or(DEFAULT_HUD_NITS, |n| n.clamp(80.0, 1000.0))
 }
 
 unsafe fn create_shader_module(device: &ash::Device, spv: &[u8]) -> Option<vk::ShaderModule> {
@@ -103,8 +187,9 @@ impl OverlayState {
         queue_family_index: u32,
         images: &[vk::Image],
         format: vk::Format,
+        encoding: Encoding,
+        hud_nits: f32,
         extent: vk::Extent2D,
-        _transform: vk::SurfaceTransformFlagsKHR,
     ) -> Option<Self> {
         if images.is_empty() {
             return None;
@@ -113,6 +198,8 @@ impl OverlayState {
             swapchain: vk::SwapchainKHR::null(),
             device: device.handle(),
             format,
+            encoding,
+            hud_nits,
             extent,
             command_pool: vk::CommandPool::null(),
             command_buffers: Vec::new(),
@@ -422,15 +509,24 @@ impl OverlayState {
         vert_module: vk::ShaderModule,
         frag_module: vk::ShaderModule,
     ) -> Option<vk::Pipeline> {
-        // overlay.frag's TARGET_IS_SRGB (constant_id 0), a 32-bit bool.
-        let target_is_srgb = vk::Bool32::from(is_srgb(self.format));
-        let specialization_entry = vk::SpecializationMapEntry::default()
-            .constant_id(0)
-            .offset(0)
-            .size(std::mem::size_of::<vk::Bool32>());
+        // overlay.frag's TARGET_ENCODING (constant_id 0, int) and HUD_NITS
+        // (constant_id 1, float), four bytes each.
+        let mut constants = [0u8; 8];
+        constants[..4].copy_from_slice(&(self.encoding as i32).to_ne_bytes());
+        constants[4..].copy_from_slice(&self.hud_nits.to_ne_bytes());
+        let specialization_entries = [
+            vk::SpecializationMapEntry::default()
+                .constant_id(0)
+                .offset(0)
+                .size(4),
+            vk::SpecializationMapEntry::default()
+                .constant_id(1)
+                .offset(4)
+                .size(4),
+        ];
         let specialization = vk::SpecializationInfo::default()
-            .map_entries(std::slice::from_ref(&specialization_entry))
-            .data(bytemuck::bytes_of(&target_is_srgb));
+            .map_entries(&specialization_entries)
+            .data(&constants);
         let shader_stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
@@ -841,5 +937,111 @@ impl OverlayState {
             self.uploaded = Some(image);
         }
         Some(cb)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vk::ColorSpaceKHR as Cs;
+    use vk::Format as F;
+
+    #[test]
+    fn srgb_swapchains_are_written_as_before() {
+        assert_eq!(
+            target_encoding(F::B8G8R8A8_UNORM, Cs::SRGB_NONLINEAR, None),
+            Some(Encoding::Srgb)
+        );
+        assert_eq!(
+            target_encoding(F::B8G8R8A8_SRGB, Cs::SRGB_NONLINEAR, None),
+            Some(Encoding::Linear)
+        );
+        // A ten-bit SDR swapchain says so, and is not mistaken for HDR.
+        assert_eq!(
+            target_encoding(F::A2B10G10R10_UNORM_PACK32, Cs::SRGB_NONLINEAR, None),
+            Some(Encoding::Srgb)
+        );
+    }
+
+    #[test]
+    fn declared_hdr_swapchains_get_their_own_encoding() {
+        assert_eq!(
+            target_encoding(F::A2B10G10R10_UNORM_PACK32, Cs::HDR10_ST2084_EXT, None),
+            Some(Encoding::Pq)
+        );
+        assert_eq!(
+            target_encoding(F::R16G16B16A16_SFLOAT, Cs::EXTENDED_SRGB_LINEAR_EXT, None),
+            Some(Encoding::ScRgb)
+        );
+    }
+
+    #[test]
+    fn a_pass_through_swapchain_is_judged_by_its_format() {
+        // What Proton's Wayland driver creates for an HDR10 game.
+        assert_eq!(
+            target_encoding(F::A2R10G10B10_UNORM_PACK32, Cs::PASS_THROUGH_EXT, None),
+            Some(Encoding::Pq)
+        );
+        assert_eq!(
+            target_encoding(F::R16G16B16A16_SFLOAT, Cs::PASS_THROUGH_EXT, None),
+            Some(Encoding::ScRgb)
+        );
+        assert_eq!(
+            target_encoding(F::B8G8R8A8_UNORM, Cs::PASS_THROUGH_EXT, None),
+            Some(Encoding::Srgb)
+        );
+    }
+
+    #[test]
+    fn the_override_applies_to_pass_through_only() {
+        assert_eq!(
+            target_encoding(
+                F::A2R10G10B10_UNORM_PACK32,
+                Cs::PASS_THROUGH_EXT,
+                Some(Encoding::Srgb)
+            ),
+            Some(Encoding::Srgb)
+        );
+        assert_eq!(
+            target_encoding(F::B8G8R8A8_UNORM, Cs::SRGB_NONLINEAR, Some(Encoding::Pq)),
+            Some(Encoding::Srgb)
+        );
+        // The hardware encodes an *_SRGB target regardless.
+        assert_eq!(
+            target_encoding(F::B8G8R8A8_SRGB, Cs::PASS_THROUGH_EXT, Some(Encoding::Pq)),
+            Some(Encoding::Linear)
+        );
+    }
+
+    #[test]
+    fn unknown_colour_spaces_get_no_hud() {
+        assert_eq!(
+            target_encoding(F::A2B10G10R10_UNORM_PACK32, Cs::BT2020_LINEAR_EXT, None),
+            None
+        );
+        assert_eq!(
+            target_encoding(F::B8G8R8A8_UNORM, Cs::DISPLAY_P3_NONLINEAR_EXT, None),
+            None
+        );
+        // scRGB needs a float format to hold values above 1.0.
+        assert_eq!(
+            target_encoding(F::B8G8R8A8_UNORM, Cs::EXTENDED_SRGB_LINEAR_EXT, None),
+            None
+        );
+    }
+
+    #[test]
+    fn the_environment_values_are_parsed_leniently_and_bounded() {
+        assert_eq!(parse_encoding(" HDR10 "), Some(Encoding::Pq));
+        assert_eq!(parse_encoding("srgb"), Some(Encoding::Srgb));
+        assert_eq!(parse_encoding("scRGB"), Some(Encoding::ScRgb));
+        assert_eq!(parse_encoding("rec709"), None);
+
+        assert_eq!(parse_nits(None), DEFAULT_HUD_NITS);
+        assert_eq!(parse_nits(Some("nonsense")), DEFAULT_HUD_NITS);
+        assert_eq!(parse_nits(Some("NaN")), DEFAULT_HUD_NITS);
+        assert_eq!(parse_nits(Some("300")), 300.0);
+        assert_eq!(parse_nits(Some("5")), 80.0);
+        assert_eq!(parse_nits(Some("10000")), 1000.0);
     }
 }
