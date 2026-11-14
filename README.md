@@ -71,8 +71,9 @@ field choices update live. See [overlay setup and limitations](docs/overlay.md).
 ## Game recording
 
 Use **Gaming → Recording** to start/stop a capture and choose an automatic stop
-from 5 to 600 seconds. Set up the desktop-authorized global shortcut there
-(suggested **Shift+F2**), or use:
+from 5 to 600 seconds. Set up the desktop-authorized global shortcuts there
+(suggested **Shift+F2** to record, **Shift+F3** to show or hide the overlay), or
+use:
 
 ```bash
 argus-lasso record --seconds 60

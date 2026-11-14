@@ -255,7 +255,9 @@ impl GamingModeTab {
             overlay_install_status: String::new(),
             overlay_settings_open: false,
             sensor_access: Default::default(),
-            benchmark: Default::default(),
+            benchmark: crate::game_benchmark::GameBenchmark::default().with_overlay_toggle(|| {
+                crate::overlay_toggle::request(&crate::config::config_dir())
+            }),
             events: Vec::new(),
         };
         tab.refresh_helper_status();

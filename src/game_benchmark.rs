@@ -30,7 +30,11 @@ pub struct GameBenchmark {
     disk_bytes: u64,
     /// The recording whose "Delete…" was clicked, awaiting confirmation.
     confirm_delete: Option<PathBuf>,
+    /// Shows or hides the in-game overlay; with it the desktop is also asked
+    /// for a shortcut that does.
+    toggle_overlay: Option<ToggleOverlay>,
 }
+type ToggleOverlay = fn() -> std::io::Result<()>;
 impl Default for GameBenchmark {
     fn default() -> Self {
         Self {
@@ -51,10 +55,16 @@ impl Default for GameBenchmark {
             graph_error: String::new(),
             disk_bytes: 0,
             confirm_delete: None,
+            toggle_overlay: None,
         }
     }
 }
 impl GameBenchmark {
+    pub fn with_overlay_toggle(mut self, toggle: ToggleOverlay) -> Self {
+        self.toggle_overlay = Some(toggle);
+        self
+    }
+
     /// Compare the two latest recordings: A the earlier, B the later, so
     /// "Change B vs A" reads as what changed since.
     pub fn compare_recent(&mut self) -> bool {
@@ -175,17 +185,17 @@ impl GameBenchmark {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        ui.label(theme::bold(ui, "Keyboard shortcut", tokens::FONT_HEADING));
+        ui.label(theme::bold(ui, "Keyboard shortcuts", tokens::FONT_HEADING));
         ui.horizontal_wrapped(|ui| {
             let registered = self.shortcut_live.load(Ordering::Relaxed);
             if ui
-                .add_enabled(!registered, egui::Button::new("Set up recording shortcut…"))
+                .add_enabled(!registered, egui::Button::new("Set up shortcuts…"))
                 .clicked()
             {
                 self.register();
             }
             if ui
-                .add_enabled(registered, egui::Button::new("Disable shortcut"))
+                .add_enabled(registered, egui::Button::new("Disable shortcuts"))
                 .clicked()
             {
                 self.stop.store(true, Ordering::Relaxed);
@@ -193,7 +203,8 @@ impl GameBenchmark {
         });
         theme::help_text(
             ui,
-            "Suggested: Shift+F2. Your desktop confirms the actual shortcut.",
+            "Suggested: Shift+F2 to start or stop a recording, Shift+F3 to show or hide \
+             the overlay. Your desktop confirms the actual keys.",
         );
         if !self.error.is_empty() {
             ui.colored_label(theme::sem(ui).negative, &self.error);
@@ -381,8 +392,10 @@ impl GameBenchmark {
         let stop = self.stop.clone();
         let live = self.shortcut_live.clone();
         let duration = self.duration.clone();
+        let toggle_overlay = self.toggle_overlay;
         std::thread::spawn(move || {
-            if let Err(e) = async_io::block_on(shortcut_loop(stop, duration, tx.clone())) {
+            let shortcuts = shortcut_loop(stop, duration, toggle_overlay, tx.clone());
+            if let Err(e) = async_io::block_on(shortcuts) {
                 let _ = tx.send(format!(
                     "Shortcut unavailable: {e}. Recording buttons and CLI remain available."
                 ));
@@ -394,6 +407,7 @@ impl GameBenchmark {
 async fn shortcut_loop(
     stop: Arc<AtomicBool>,
     duration: Arc<AtomicU32>,
+    toggle_overlay: Option<ToggleOverlay>,
     tx: mpsc::Sender<String>,
 ) -> Result<(), String> {
     use ashpd::desktop::global_shortcuts::{GlobalShortcuts, NewShortcut};
@@ -424,27 +438,33 @@ async fn shortcut_loop(
         .to_owned();
     let events = proxy.receive_activated().await.map_err(|e| e.to_string())?;
     futures_util::pin_mut!(events);
+    let mut wanted = vec![
+        NewShortcut::new(RECORD_SHORTCUT, "Start / stop Argus game benchmark")
+            .preferred_trigger("SHIFT+F2"),
+    ];
+    if toggle_overlay.is_some() {
+        wanted.push(
+            NewShortcut::new(OVERLAY_SHORTCUT, "Show / hide the Argus in-game overlay")
+                .preferred_trigger("SHIFT+F3"),
+        );
+    }
     let binding = proxy
-        .bind_shortcuts(
-            &session,
-            &[
-                NewShortcut::new("record-benchmark", "Start / stop Argus game benchmark")
-                    .preferred_trigger("SHIFT+F2"),
-            ],
-            None,
-            Default::default(),
-        )
+        .bind_shortcuts(&session, &wanted, None, Default::default())
         .await
         .map_err(|e| e.to_string())?
         .response()
         .map_err(|e| e.to_string())?;
-    let actual = binding
-        .shortcuts()
-        .iter()
-        .find(|s| s.id() == "record-benchmark")
-        .map(|s| s.trigger_description())
-        .ok_or("The desktop did not bind the recording shortcut")?;
-    let _ = tx.send(format!("Recording shortcut: {actual}"));
+    let bound = |id: &str| {
+        binding
+            .shortcuts()
+            .iter()
+            .find(|s| s.id() == id)
+            .map(|s| s.trigger_description().to_owned())
+    };
+    let _ = tx.send(shortcut_status(
+        bound(RECORD_SHORTCUT).as_deref(),
+        bound(OVERLAY_SHORTCUT).as_deref(),
+    )?);
     let mut last = Instant::now() - Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
         match select(
@@ -454,21 +474,25 @@ async fn shortcut_loop(
         .await
         {
             Either::Left((Some(event), _))
-                if event.shortcut_id() == "record-benchmark"
-                    && event.session_handle().as_str() == session_path
+                if event.session_handle().as_str() == session_path
                     && last.elapsed() > Duration::from_millis(300) =>
             {
-                last = Instant::now();
-                let message = match capture::toggle(duration.load(Ordering::Relaxed)) {
-                    Ok(c) => {
-                        if c.active {
-                            "Recording started".into()
-                        } else {
-                            "Recording stopped".into()
-                        }
-                    }
-                    Err(e) => e.to_string(),
+                let message = match event.shortcut_id() {
+                    RECORD_SHORTCUT => match capture::toggle(duration.load(Ordering::Relaxed)) {
+                        Ok(c) if c.active => "Recording started".into(),
+                        Ok(_) => "Recording stopped".into(),
+                        Err(e) => e.to_string(),
+                    },
+                    // The monitor thread owns the overlay's visibility; it
+                    // takes the request on its next tick, as from the CLI.
+                    OVERLAY_SHORTCUT => match toggle_overlay.map(|toggle| toggle()) {
+                        Some(Ok(())) => "Overlay toggled".into(),
+                        Some(Err(e)) => format!("Could not toggle the overlay: {e}"),
+                        None => continue,
+                    },
+                    _ => continue,
                 };
+                last = Instant::now();
                 let _ = tx.send(message);
             }
             Either::Left((None, _)) => break,
@@ -476,8 +500,24 @@ async fn shortcut_loop(
         }
     }
     session.close().await.map_err(|e| e.to_string())?;
-    let _ = tx.send("Recording shortcut released".into());
+    let _ = tx.send("Shortcuts released".into());
     Ok(())
+}
+
+const RECORD_SHORTCUT: &str = "record-benchmark";
+const OVERLAY_SHORTCUT: &str = "toggle-overlay";
+
+/// What the desktop bound, for the status line. A desktop may bind either
+/// shortcut, both or neither; none at all is the failure.
+fn shortcut_status(record: Option<&str>, overlay: Option<&str>) -> Result<String, String> {
+    match (record, overlay) {
+        (Some(record), Some(overlay)) => {
+            Ok(format!("Shortcuts: recording {record}, overlay {overlay}"))
+        }
+        (Some(record), None) => Ok(format!("Recording shortcut: {record}")),
+        (None, Some(overlay)) => Ok(format!("Overlay shortcut: {overlay}")),
+        (None, None) => Err("The desktop did not bind the shortcuts".into()),
+    }
 }
 
 /// Read at most `MAX_ERROR_FILE_BYTES` of a text file, on failure or an
@@ -750,6 +790,21 @@ fn draw_comparison(ui: &mut egui::Ui, graphs: &Graphs) {
 #[cfg(test)]
 mod comparison_tests {
     use super::*;
+
+    /// A desktop may bind one shortcut and not the other; the status says
+    /// which keys work, and only binding nothing is a failure.
+    #[test]
+    fn the_status_names_the_shortcuts_the_desktop_bound() {
+        assert_eq!(
+            shortcut_status(Some("Shift+F2"), Some("Shift+F3")).unwrap(),
+            "Shortcuts: recording Shift+F2, overlay Shift+F3"
+        );
+        assert_eq!(
+            shortcut_status(None, Some("Shift+F3")).unwrap(),
+            "Overlay shortcut: Shift+F3"
+        );
+        assert!(shortcut_status(None, None).is_err());
+    }
 
     fn run(name: &str, session: &str, frames: usize) -> (PathBuf, Summary) {
         let summary = Summary {

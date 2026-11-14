@@ -42,7 +42,8 @@ impl eframe::App for Preview {
     }
 }
 fn main() -> eframe::Result {
-    let mut bench = game_benchmark::GameBenchmark::default();
+    // The preview has no overlay to show or hide; its shortcut only reports.
+    let mut bench = game_benchmark::GameBenchmark::default().with_overlay_toggle(|| Ok(()));
     if std::env::args().any(|a| a == "--shortcut") {
         bench.register();
     }

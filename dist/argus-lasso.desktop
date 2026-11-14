@@ -8,3 +8,8 @@ Type=Application
 Categories=System;Monitor;
 StartupNotify=false
 StartupWMClass=argus-lasso
+Actions=toggle-overlay;
+
+[Desktop Action toggle-overlay]
+Name=Show or hide the in-game overlay
+Exec=argus-lasso toggle-overlay

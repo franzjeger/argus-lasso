@@ -122,8 +122,19 @@ Limits of this first version:
 
 ## Rendering and update rates
 
-Run `argus-lasso toggle-overlay` to queue a visibility toggle, for example from
-a desktop keyboard shortcut. Each invocation queues a separate request; two
+There are four ways to show or hide the HUD while a game runs, besides the
+checkbox on **Gaming → Overlay**:
+
+- the tray menu's **In-game overlay** checkbox;
+- the portal shortcut set up on **Gaming → Recording** (suggested Shift+F3), on
+  desktops whose portal offers GlobalShortcuts, such as KDE Plasma and GNOME;
+- a key you bind to `argus-lasso toggle-overlay` in the desktop's own shortcut
+  settings, which works on every desktop, COSMIC included;
+- the app icon's **Show or hide the in-game overlay** action, in launchers and
+  docks that list an application's actions.
+
+They all queue the same request as `argus-lasso toggle-overlay`. Each
+invocation queues a separate request; two
 toggles cancel each other. The running monitor consumes requests on its next
 tick and saves the resulting visibility. If Argus is stopped, requests wait
 until it starts. A successful CLI exit confirms queuing, not application.

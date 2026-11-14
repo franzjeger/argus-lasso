@@ -73,7 +73,9 @@ pub fn show(ui: &mut Ui, config: &mut OverlayConfig, open: &mut bool, _cpu_count
     }
     super::theme::help_text(
         ui,
-        "Choose readings, colors and layout in Customize overlay.",
+        "Choose readings, colors and layout in Customize overlay. To show or hide it \
+         while playing, use the tray menu's In-game overlay, or bind a key to \
+         `argus-lasso toggle-overlay` in your desktop's shortcut settings.",
     );
     changed
 }

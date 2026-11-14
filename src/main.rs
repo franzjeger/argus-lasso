@@ -115,8 +115,17 @@ impl ksni::Tray for ArgusLassoTray {
         gui::request_main_window(&self.state, &self.context);
     }
 
+    /// Implemented so the menu is read afresh each time it opens: Gaming
+    /// Mode and the overlay also change outside the tray, from detection,
+    /// the CLI and a shortcut, and the checkmarks would otherwise go stale.
+    fn menu_about_to_show(&mut self) {}
+
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        let gaming_active = self.state.lock().map(|s| s.gaming_active).unwrap_or(false);
+        let (gaming_active, overlay_shown) = self
+            .state
+            .lock()
+            .map(|s| (s.gaming_active, s.config.gaming_mode.overlay.show_overlay))
+            .unwrap_or((false, false));
 
         vec![
             ksni::MenuItem::Standard(ksni::menu::StandardItem {
@@ -137,6 +146,18 @@ impl ksni::Tray for ArgusLassoTray {
                         elevate_nice: true,
                         parking: monitor::Parking::NonPreferred,
                     });
+                }),
+                ..Default::default()
+            }),
+            ksni::MenuItem::Checkmark(ksni::menu::CheckmarkItem {
+                label: "In-game overlay".into(),
+                checked: overlay_shown,
+                // As `argus-lasso toggle-overlay`: the monitor thread owns
+                // the value and takes the request on its next tick.
+                activate: Box::new(|_: &mut Self| {
+                    if let Err(e) = overlay_toggle::request(&config::config_dir()) {
+                        log::warn!("Could not toggle the overlay from the tray: {e}");
+                    }
                 }),
                 ..Default::default()
             }),
@@ -1045,6 +1066,40 @@ mod tests {
                 kill_cli_pid(bad_pid, true).is_err(),
                 "expected refusal for force-kill PID {bad_pid}"
             );
+        }
+    }
+
+    /// The tray's overlay checkbox shows the overlay's visibility as it is
+    /// now, whoever changed it.
+    #[test]
+    fn the_tray_shows_whether_the_overlay_is_on() {
+        use super::{monitor::AppState, ArgusLassoTray};
+        use ksni::Tray as _;
+        use std::sync::{Arc, Mutex};
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+        let tray = ArgusLassoTray {
+            state: Arc::clone(&state),
+            cmd_tx,
+            context: Default::default(),
+        };
+        let overlay_checked = |tray: &ArgusLassoTray| {
+            tray.menu().into_iter().find_map(|item| match item {
+                ksni::MenuItem::Checkmark(item) if item.label == "In-game overlay" => {
+                    Some(item.checked)
+                }
+                _ => None,
+            })
+        };
+        for shown in [false, true] {
+            state
+                .lock()
+                .unwrap()
+                .config_mut()
+                .gaming_mode
+                .overlay
+                .show_overlay = shown;
+            assert_eq!(overlay_checked(&tray), Some(shown));
         }
     }
 
