@@ -77,6 +77,12 @@ The overlay protocol changed: restart running games after updating.
   judged by their format; `ARGUS_LASSO_HUD_COLORSPACE` overrides the guess. See
   [docs/overlay.md](docs/overlay.md#hdr).
 
+### Security
+
+- `rustix` is updated to 1.1.6 for RUSTSEC-2026-0486, an unsoundness in its
+  extended-attribute functions. Argus-Lasso does not call them; the update keeps
+  the dependency audit clean.
+
 ## [1.6.0] — 2026-11-11
 
 Command-line control of the running instance, a history of what ProBalance
