@@ -71,8 +71,9 @@ field choices update live. See [overlay setup and limitations](docs/overlay.md).
 ## Game recording
 
 Use **Gaming → Recording** to start/stop a capture and choose an automatic stop
-from 5 to 600 seconds. Set up the desktop-authorized global shortcut there
-(suggested **Shift+F2**), or use:
+from 5 to 600 seconds. Set up the desktop-authorized global shortcuts there
+(suggested **Shift+F2** to record, **Shift+F3** to show or hide the overlay), or
+use:
 
 ```bash
 argus-lasso record --seconds 60
@@ -163,6 +164,7 @@ argus-lasso install-helpers          # CPU control helpers; asks for authenticat
 argus-lasso gaming on                # Gaming Mode in the running instance; off to undo
 argus-lasso probalance off           # ProBalance in the running instance; on to undo
 argus-lasso fps-limit 120            # cap games' frame rate through the layer; off to lift
+argus-lasso overlay-preset medium    # what the HUD shows: minimal, medium, full or next
 argus-lasso profile "Work"           # load a saved rule profile; no name lists them
 argus-lasso set-affinity 1234 '0-7'   # Linux logical CPU IDs
 argus-lasso kill 1234                # SIGTERM; --force uses SIGKILL

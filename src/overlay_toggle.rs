@@ -26,6 +26,8 @@ pub enum Control {
     Profile(String),
     /// Cap games' frame rate; 0 lifts the cap.
     FpsLimit(u32),
+    /// Show this choice of readings in the HUD; None steps to the next one.
+    OverlayPreset(Option<argus_ipc::OverlayPreset>),
 }
 
 impl Control {
@@ -36,6 +38,12 @@ impl Control {
             Control::ProBalance(on) => format!("probalance {}", on_off(on)),
             Control::Profile(name) => format!("profile {name}"),
             Control::FpsLimit(fps) => format!("fps-limit {fps}"),
+            Control::OverlayPreset(preset) => {
+                format!(
+                    "overlay-preset {}",
+                    preset.map_or(NEXT_PRESET, |p| p.name())
+                )
+            }
         }
     }
 
@@ -50,6 +58,9 @@ impl Control {
             "gaming" => on_off(rest).map(Control::Gaming),
             "probalance" => on_off(rest).map(Control::ProBalance),
             "fps-limit" => rest.parse().ok().map(Control::FpsLimit),
+            "overlay-preset" if rest == NEXT_PRESET => Some(Control::OverlayPreset(None)),
+            "overlay-preset" => argus_ipc::OverlayPreset::from_name(rest)
+                .map(|preset| Control::OverlayPreset(Some(preset))),
             // A profile name is free text and may hold spaces, but never a
             // line break: one request is one line.
             "profile" if !rest.is_empty() && !rest.contains(['\n', '\r']) => {
@@ -59,6 +70,9 @@ impl Control {
         }
     }
 }
+
+/// In place of a preset's name: the one after the current.
+pub const NEXT_PRESET: &str = "next";
 
 pub fn request_control(config_dir: &Path, control: &Control) -> io::Result<()> {
     let queue = config_dir.join(CONTROL_DIR);
@@ -281,6 +295,8 @@ mod tests {
             Control::Profile("with  two spaces".into()),
             Control::FpsLimit(0),
             Control::FpsLimit(144),
+            Control::OverlayPreset(None),
+            Control::OverlayPreset(Some(argus_ipc::OverlayPreset::Medium)),
         ] {
             assert_eq!(Control::parse(&control.encode()), Some(control));
         }

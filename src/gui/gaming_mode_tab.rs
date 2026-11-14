@@ -119,6 +119,8 @@ pub struct GamingModeTab {
     overlay_clients: Vec<crate::monitor::OverlayClient>,
     /// The shared frame-rate cap as last taken, likewise.
     fps_limit_seen: u32,
+    /// What the HUD shows, as last taken from the shared configuration.
+    overlay_content_seen: argus_ipc::OverlayContent,
     /// The cap the checkbox turns on: the last one used, or 60.
     fps_limit_choice: u32,
     pub topo: Option<CpuTopology>,
@@ -217,6 +219,7 @@ impl GamingModeTab {
             steam_library: None,
             overlay_clients: Vec::new(),
             fps_limit_seen: config.gaming_mode.overlay.fps_limit,
+            overlay_content_seen: config.gaming_mode.overlay.content(),
             fps_limit_choice: match config.gaming_mode.overlay.fps_limit {
                 0 => 60,
                 fps => fps,
@@ -255,7 +258,9 @@ impl GamingModeTab {
             overlay_install_status: String::new(),
             overlay_settings_open: false,
             sensor_access: Default::default(),
-            benchmark: Default::default(),
+            benchmark: crate::game_benchmark::GameBenchmark::default().with_overlay_toggle(|| {
+                crate::overlay_toggle::request(&crate::config::config_dir())
+            }),
             events: Vec::new(),
         };
         tab.refresh_helper_status();
@@ -529,6 +534,29 @@ impl GamingModeTab {
         self.fps_limit_seen = shared;
         if shared != 0 {
             self.fps_limit_choice = shared;
+        }
+    }
+
+    /// What the HUD shows also changes outside this tab, when the tray or the
+    /// CLI picks a preset; see `follow_overlay_shown`.
+    pub fn follow_overlay_content(&mut self, shared: &argus_ipc::OverlayConfig) {
+        let shared = shared.content();
+        if self.overlay_content_seen != shared {
+            self.config.gaming_mode.overlay.set_content(shared.clone());
+            self.overlay_content_seen = shared;
+        }
+    }
+
+    /// The readings to store with a config this tab sent; see `overlay_shown`.
+    pub fn overlay_content(
+        &self,
+        sent: &argus_ipc::OverlayConfig,
+        shared: &argus_ipc::OverlayConfig,
+    ) -> argus_ipc::OverlayContent {
+        if sent.content() != self.overlay_content_seen {
+            sent.content()
+        } else {
+            shared.content()
         }
     }
 
@@ -1941,6 +1969,31 @@ mod overlay_tests {
         assert!(tab.overlay_shown(false, true));
         // The user switching it on in this tab wins over the shared value.
         assert!(tab.overlay_shown(true, false));
+    }
+
+    /// A preset chosen in the tray reaches this tab, and a later edit here
+    /// of something else does not put the old readings back.
+    #[test]
+    fn a_preset_chosen_elsewhere_survives_the_next_overlay_edit() {
+        use argus_ipc::OverlayPreset;
+        let mut tab = GamingModeTab::new(crate::config::Config::default());
+        let mut shared = tab.config.gaming_mode.overlay.clone();
+        shared.set_content(OverlayPreset::Minimal.content());
+
+        tab.follow_overlay_content(&shared);
+        let own = tab.config.gaming_mode.overlay.clone();
+        assert_eq!(OverlayPreset::of(&own), Some(OverlayPreset::Minimal));
+
+        // The tray picks another one before this tab's next edit is stored.
+        shared.set_content(OverlayPreset::Full.content());
+        assert_eq!(
+            tab.overlay_content(&own, &shared),
+            OverlayPreset::Full.content()
+        );
+        // A reading switched in this tab wins over the shared choice.
+        let mut edited = own.clone();
+        edited.fields.average_fps = true;
+        assert_eq!(tab.overlay_content(&edited, &shared), edited.content());
     }
 
     #[test]

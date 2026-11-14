@@ -115,8 +115,25 @@ impl ksni::Tray for ArgusLassoTray {
         gui::request_main_window(&self.state, &self.context);
     }
 
+    /// Implemented so the menu is read afresh each time it opens: Gaming
+    /// Mode and the overlay also change outside the tray, from detection,
+    /// the CLI and a shortcut, and the checkmarks would otherwise go stale.
+    fn menu_about_to_show(&mut self) {}
+
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-        let gaming_active = self.state.lock().map(|s| s.gaming_active).unwrap_or(false);
+        let (gaming_active, overlay_shown, preset) = self
+            .state
+            .lock()
+            .map(|s| {
+                let overlay = &s.config.gaming_mode.overlay;
+                (
+                    s.gaming_active,
+                    overlay.show_overlay,
+                    argus_ipc::OverlayPreset::of(overlay),
+                )
+            })
+            .unwrap_or((false, false, None));
+        let presets = argus_ipc::OverlayPreset::ALL;
 
         vec![
             ksni::MenuItem::Standard(ksni::menu::StandardItem {
@@ -138,6 +155,47 @@ impl ksni::Tray for ArgusLassoTray {
                         parking: monitor::Parking::NonPreferred,
                     });
                 }),
+                ..Default::default()
+            }),
+            ksni::MenuItem::Checkmark(ksni::menu::CheckmarkItem {
+                label: "In-game overlay".into(),
+                checked: overlay_shown,
+                // As `argus-lasso toggle-overlay`: the monitor thread owns
+                // the value and takes the request on its next tick.
+                activate: Box::new(|_: &mut Self| {
+                    if let Err(e) = overlay_toggle::request(&config::config_dir()) {
+                        log::warn!("Could not toggle the overlay from the tray: {e}");
+                    }
+                }),
+                ..Default::default()
+            }),
+            ksni::MenuItem::SubMenu(ksni::menu::SubMenu {
+                label: "Overlay shows".into(),
+                submenu: vec![ksni::MenuItem::RadioGroup(ksni::menu::RadioGroup {
+                    // With readings chosen by hand no preset is selected.
+                    selected: presets
+                        .iter()
+                        .position(|p| Some(*p) == preset)
+                        .unwrap_or(presets.len()),
+                    select: Box::new(move |_: &mut Self, chosen| {
+                        let Some(preset) = presets.get(chosen) else {
+                            return;
+                        };
+                        let control = overlay_toggle::Control::OverlayPreset(Some(*preset));
+                        if let Err(e) =
+                            overlay_toggle::request_control(&config::config_dir(), &control)
+                        {
+                            log::warn!("Could not set the overlay preset from the tray: {e}");
+                        }
+                    }),
+                    options: presets
+                        .iter()
+                        .map(|preset| ksni::menu::RadioItem {
+                            label: preset.label().into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                })],
                 ..Default::default()
             }),
             ksni::MenuItem::Separator,
@@ -166,6 +224,23 @@ impl ksni::Tray for ArgusLassoTray {
 enum Switch {
     On,
     Off,
+}
+
+/// A preset by name, or None for "next".
+fn parse_overlay_preset(word: &str) -> Result<Option<argus_ipc::OverlayPreset>, String> {
+    if word == overlay_toggle::NEXT_PRESET {
+        return Ok(None);
+    }
+    argus_ipc::OverlayPreset::from_name(word)
+        .map(Some)
+        .ok_or_else(|| {
+            let names = argus_ipc::OverlayPreset::ALL.map(|preset| preset.name());
+            format!(
+                "'{word}' is not an overlay preset; choose {} or {}.",
+                names.join(", "),
+                overlay_toggle::NEXT_PRESET
+            )
+        })
 }
 
 /// Hand a command to the running instance. It only makes sense for one that
@@ -257,6 +332,9 @@ enum Cmd {
     /// Cap the frame rate of games showing the overlay layer: a number of
     /// frames per second, or "off". Applies at once to running games.
     FpsLimit { limit: String },
+    /// Choose what the overlay HUD shows: minimal, medium or full, or
+    /// "next" to step through them. Applies at once to running games.
+    OverlayPreset { preset: String },
     /// Replace the active rules with a saved rule profile in the running
     /// instance. Without a name, list the saved profiles.
     Profile { name: Option<String> },
@@ -490,6 +568,12 @@ fn run_command(cmd: Cmd) {
             exit_with(parse_fps_limit(&limit).and_then(|fps| {
                 send_control(&overlay_toggle::Control::FpsLimit(fps))
                     .map(|()| format!("{} requested.", monitor::fps_limit_words(fps)))
+            }));
+        }
+        Cmd::OverlayPreset { preset } => {
+            exit_with(parse_overlay_preset(&preset).and_then(|choice| {
+                send_control(&overlay_toggle::Control::OverlayPreset(choice))
+                    .map(|()| format!("Overlay preset {preset} requested."))
             }));
         }
         Cmd::Profile { name } => {
@@ -1045,6 +1129,40 @@ mod tests {
                 kill_cli_pid(bad_pid, true).is_err(),
                 "expected refusal for force-kill PID {bad_pid}"
             );
+        }
+    }
+
+    /// The tray's overlay checkbox shows the overlay's visibility as it is
+    /// now, whoever changed it.
+    #[test]
+    fn the_tray_shows_whether_the_overlay_is_on() {
+        use super::{monitor::AppState, ArgusLassoTray};
+        use ksni::Tray as _;
+        use std::sync::{Arc, Mutex};
+        let state = Arc::new(Mutex::new(AppState::default()));
+        let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+        let tray = ArgusLassoTray {
+            state: Arc::clone(&state),
+            cmd_tx,
+            context: Default::default(),
+        };
+        let overlay_checked = |tray: &ArgusLassoTray| {
+            tray.menu().into_iter().find_map(|item| match item {
+                ksni::MenuItem::Checkmark(item) if item.label == "In-game overlay" => {
+                    Some(item.checked)
+                }
+                _ => None,
+            })
+        };
+        for shown in [false, true] {
+            state
+                .lock()
+                .unwrap()
+                .config_mut()
+                .gaming_mode
+                .overlay
+                .show_overlay = shown;
+            assert_eq!(overlay_checked(&tray), Some(shown));
         }
     }
 

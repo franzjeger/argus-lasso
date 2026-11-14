@@ -427,6 +427,185 @@ impl Default for OverlayConfig {
     }
 }
 
+/// What the HUD shows, apart from how it looks and where it sits: the part
+/// of the configuration a preset replaces.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlayContent {
+    pub show_cores: bool,
+    pub show_gpu: bool,
+    pub show_cpu: bool,
+    pub show_ram: bool,
+    pub show_fps: bool,
+    pub show_graph: bool,
+    pub fields: OverlayFields,
+}
+
+impl OverlayConfig {
+    pub fn content(&self) -> OverlayContent {
+        OverlayContent {
+            show_cores: self.show_cores,
+            show_gpu: self.show_gpu,
+            show_cpu: self.show_cpu,
+            show_ram: self.show_ram,
+            show_fps: self.show_fps,
+            show_graph: self.show_graph,
+            fields: self.fields.clone(),
+        }
+    }
+
+    /// Replace what the HUD shows; its position, size, colours, the CPUs
+    /// chosen for the thread list and the frame-rate cap stay as they are.
+    pub fn set_content(&mut self, content: OverlayContent) {
+        self.show_cores = content.show_cores;
+        self.show_gpu = content.show_gpu;
+        self.show_cpu = content.show_cpu;
+        self.show_ram = content.show_ram;
+        self.show_fps = content.show_fps;
+        self.show_graph = content.show_graph;
+        self.fields = content.fields;
+    }
+}
+
+/// A ready-made choice of what the HUD shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayPreset {
+    /// The frame rate and frametime, nothing else.
+    Minimal,
+    /// Frame statistics with the graph, and load, temperature, power and
+    /// memory of the GPU, CPU and RAM.
+    Medium,
+    /// Every reading, the per-thread list included.
+    Full,
+}
+
+impl OverlayPreset {
+    pub const ALL: [Self; 3] = [Self::Minimal, Self::Medium, Self::Full];
+
+    /// As written on the command line and shown in the menus.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Medium => "medium",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Minimal => "Minimal",
+            Self::Medium => "Medium",
+            Self::Full => "Full",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|preset| preset.name() == name)
+    }
+
+    pub fn content(self) -> OverlayContent {
+        let all = |on: bool| OverlayFields {
+            gpu_name: on,
+            gpu_usage: on,
+            gpu_temp: on,
+            gpu_power: on,
+            gpu_core_clock: on,
+            gpu_mem_clock: on,
+            gpu_fan: on,
+            vram: on,
+            cpu_name: on,
+            cpu_usage: on,
+            cpu_temp: on,
+            cpu_power: on,
+            cpu_frequency: on,
+            thread_usage: on,
+            thread_frequency: on,
+            physical_core_id: on,
+            ram_usage: on,
+            ram_speed: on,
+            fps: on,
+            frametime: on,
+            average_fps: on,
+            low_1: on,
+            parked: on,
+            argus_mode: on,
+            // Every preset keeps saying why a reading or the HUD's
+            // telemetry is missing.
+            unavailable_reason: true,
+            game_name: on,
+            game_profile: on,
+            game_affinity: on,
+            game_priority: on,
+            probalance: on,
+        };
+        match self {
+            Self::Minimal => OverlayContent {
+                show_cores: false,
+                show_gpu: false,
+                show_cpu: false,
+                show_ram: false,
+                show_fps: true,
+                show_graph: false,
+                fields: OverlayFields {
+                    fps: true,
+                    frametime: true,
+                    ..all(false)
+                },
+            },
+            Self::Medium => OverlayContent {
+                show_cores: false,
+                show_gpu: true,
+                show_cpu: true,
+                show_ram: true,
+                show_fps: true,
+                show_graph: true,
+                fields: OverlayFields {
+                    fps: true,
+                    frametime: true,
+                    average_fps: true,
+                    low_1: true,
+                    gpu_usage: true,
+                    gpu_temp: true,
+                    gpu_power: true,
+                    vram: true,
+                    cpu_usage: true,
+                    cpu_temp: true,
+                    cpu_power: true,
+                    ram_usage: true,
+                    ..all(false)
+                },
+            },
+            Self::Full => OverlayContent {
+                show_cores: true,
+                show_gpu: true,
+                show_cpu: true,
+                show_ram: true,
+                show_fps: true,
+                show_graph: true,
+                fields: all(true),
+            },
+        }
+    }
+
+    /// The preset this configuration shows exactly, if any: None once a
+    /// reading has been switched by hand.
+    pub fn of(config: &OverlayConfig) -> Option<Self> {
+        let content = config.content();
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.content() == content)
+    }
+
+    /// The preset after this one, for a single key that steps through them:
+    /// from the fullest, and from a hand-made choice, back to the smallest.
+    pub fn after(current: Option<Self>) -> Self {
+        match current {
+            Some(Self::Minimal) => Self::Medium,
+            Some(Self::Medium) => Self::Full,
+            Some(Self::Full) | None => Self::Minimal,
+        }
+    }
+}
+
 /// The lowest and highest frame-rate caps: below, a game is unusable and a
 /// typo would look like a hang; above, the cap does nothing.
 pub const FPS_LIMIT_MIN: u32 = 10;
@@ -452,6 +631,45 @@ impl OverlayConfig {
 
 #[cfg(test)]
 mod tests {
+    /// A preset changes what the HUD shows and nothing else, is recognised
+    /// afterwards, and stops being one when a reading is switched by hand.
+    #[test]
+    fn a_preset_replaces_the_readings_and_leaves_the_rest() {
+        let custom = OverlayConfig {
+            font_px: 18,
+            anchor: 3,
+            fps_limit: 120,
+            hidden_cpu_ids: vec![4, 5],
+            show_overlay: false,
+            ..OverlayConfig::default()
+        };
+        for preset in OverlayPreset::ALL {
+            let mut config = custom.clone();
+            config.set_content(preset.content());
+            assert_eq!(OverlayPreset::of(&config), Some(preset));
+            assert_eq!(OverlayPreset::from_name(preset.name()), Some(preset));
+            assert!(config.fields.fps && config.fields.unavailable_reason);
+            config.set_content(custom.content());
+            assert_eq!(config, custom);
+        }
+        let mut config = custom.clone();
+        config.set_content(OverlayPreset::Minimal.content());
+        assert!(!config.show_gpu && !config.show_graph && !config.fields.average_fps);
+        config.fields.average_fps = true;
+        assert_eq!(OverlayPreset::of(&config), None);
+        // One key steps through them and gets back to the smallest.
+        assert_eq!(OverlayPreset::after(None), OverlayPreset::Minimal);
+        let mut preset = OverlayPreset::Minimal;
+        for expected in [
+            OverlayPreset::Medium,
+            OverlayPreset::Full,
+            OverlayPreset::Minimal,
+        ] {
+            preset = OverlayPreset::after(Some(preset));
+            assert_eq!(preset, expected);
+        }
+    }
+
     use super::*;
     #[test]
     fn wire_roundtrip_and_reject_wrong_version() {

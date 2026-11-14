@@ -40,6 +40,8 @@ as a successful disk write.
 **Close to tray** (Settings → Startup & updates) keeps Argus running when its
 window is closed: rules, ProBalance and Gaming Mode carry on, and the window
 comes back from the tray icon, its **Open Argus-Lasso** item or the app menu.
+The tray menu's **Gaming Mode** and **In-game overlay** checkboxes switch those
+on and off without opening the window, and **Overlay shows** picks a preset.
 **Quit** in the tray menu stops Argus and restores CPUs and priorities. Without a
 tray icon (`--no-tray`, or a desktop without a tray) the setting is unavailable
 and closing the window quits.
@@ -143,6 +145,7 @@ from a keyboard shortcut, a script or a game launcher:
 argus-lasso gaming on|off        # as the tray's Gaming Mode checkbox
 argus-lasso probalance on|off    # the ProBalance switch; saved like a click
 argus-lasso fps-limit 120|off    # cap games' frame rate; see docs/overlay.md
+argus-lasso overlay-preset minimal|medium|full|next   # what the HUD shows
 argus-lasso profile              # list the saved rule profiles
 argus-lasso profile "Work"       # replace the active rules with that profile
 ```
@@ -187,9 +190,10 @@ process. See [overlay troubleshooting and metric definitions](overlay.md).
 Changing loading conditions or installing a new layer requires restarting a game;
 ordinary visibility, color and layout edits apply while it runs.
 
-**Gaming → Recording** records CPU present intervals from loaded layers. The
-GlobalShortcuts portal suggests Shift+F2; your desktop confirms the actual key.
-The registration lasts for the Argus session. A desktop without a compatible
+**Gaming → Recording** records CPU present intervals from loaded layers. **Set up
+shortcuts…** asks the GlobalShortcuts portal for two keys: Shift+F2 to start or
+stop a recording and Shift+F3 to show or hide the overlay; your desktop confirms
+the actual keys. The registration lasts for the Argus session. A desktop without a compatible
 portal can use the recording button or `argus-lasso record --seconds 60`.
 
 Recent recordings show executable name, local date/time, duration and completeness.

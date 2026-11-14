@@ -1240,6 +1240,21 @@ impl Daemon {
                 let _ = self.handle(DaemonCmd::ConfigChanged);
                 persist_config(&self.state);
             }
+            Control::OverlayPreset(preset) => {
+                use argus_ipc::OverlayPreset;
+                let Ok(mut s) = self.state.lock() else {
+                    return;
+                };
+                let overlay = &mut s.config_mut().gaming_mode.overlay;
+                let preset =
+                    preset.unwrap_or_else(|| OverlayPreset::after(OverlayPreset::of(overlay)));
+                overlay.set_content(preset.content());
+                drop(s);
+                (self.log)(format!("[CLI] Overlay preset {} requested.", preset.name()));
+                // Sends it to the games' layers.
+                let _ = self.handle(DaemonCmd::ConfigChanged);
+                persist_config(&self.state);
+            }
         }
     }
 
